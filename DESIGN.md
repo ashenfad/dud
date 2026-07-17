@@ -336,6 +336,42 @@ dev, note it in the tool primer.
 > (macOS `AF_UNIX` `sun_path` ≤ 104 chars), and the guest kernel must
 > be uncompressed (`Image`, not `Image.gz`) for the VZ Linux
 > bootloader.
+>
+> **Rootfs pipeline proven (stage 4-2, 2026-07-18).** `dud.images`
+> pulls `python:3.12-slim` (arm64) with a dependency-free registry-v2
+> client (anonymous token → OCI index → arch manifest → digest-verified
+> blobs, cached under `~/.dud/blobs`), flattens the layers with OCI
+> whiteout semantics, injects the pure-stdlib `dud` runtime into the
+> image's `site-packages`, and emits a root-owned `newc` cpio initramfs
+> **entirely in Python** — no skopeo, no `mke2fs`, no touching the
+> case-insensitive host FS. Cached by spec hash (image digest + guest
+> code + workspace). vfkit then boots that exact 43 MB rootfs:
+> `kernel → /init (python shebang) → dud.guest.init mounts + vsock dial
+> → Supervisor` — **boot to init to power-off in ~0.45 s**. Findings
+> that shape the vfkit backend (4-3):
+>
+> - **vsock direction is host-listens / guest-connects.** vfkit's
+>   `virtio-vsock,port=N,socketURL=unix://…` listens on the *host* unix
+>   socket and bridges an inbound guest `connect(cid=2, N)` to it. So
+>   the backend `listen()`s on a short-path unix socket before boot; the
+>   guest dials out (`dud.guest.init` default `mode=connect`, `cid=2`).
+> - **Entropy at preinit.** CPython aborts at interpreter init
+>   (`_Py_HashRandomization_Init`) because the microVM has no entropy
+>   that early and `/dev` isn't mounted yet. Fix without a rootfs
+>   change: pass `PYTHONHASHSEED=0` on the kernel cmdline — the kernel
+>   forwards unknown `k=v` tokens to init as environment, and a set
+>   `PYTHONHASHSEED` makes CPython skip the startup `getrandom()`. A
+>   proper `virtio-rng`/kernel-RNG path is a later polish; this unblocks
+>   the rung. (The puipui kernel here lacks the virtio-rng driver.)
+> - **Kernel is a bundled asset, not from the image.** `python:slim`
+>   ships no kernel; the rootfs pipeline owns only the rootfs half. The
+>   arch-matched uncompressed `Image` (with virtio + vsock) is bundled
+>   by dud and reused across every rootfs.
+> - **Initramfs, not ext4, for the rung.** `cpio.gz` needs only present
+>   tooling and sidesteps ext4 creation on macOS; the whole rootfs lives
+>   in guest RAM (give the VM ~2 GB). ext4-on-a-disk is the scale path
+>   if large images make the RAM cost bite; 4-4's overlay `/workspace`
+>   staging is independent of the root medium.
 
 sandtrap's fail-closed pattern transplants directly: requesting a rung
 the platform can't provide **raises** (`IsolationUnavailable`-style),
