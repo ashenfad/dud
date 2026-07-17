@@ -313,13 +313,29 @@ product.
 | rung | platform | isolation | role |
 |---|---|---|---|
 | `subprocess` | any OS | none — guest runtime as a host process in a scratch dir | dev / CI / demo floor; `pip install dud` works everywhere with zero artifacts |
-| `libkrun` (or Virtualization.framework) | macOS (HVF) + Linux (KVM) | real Linux microVM | local dev with a real boundary; libkrun bundles its guest kernel |
+| `vfkit` (Virtualization.framework) | macOS (HVF) | real Linux microVM | local dev with a real boundary |
 | `firecracker` | Linux + KVM | microVM + jailer | prod fleet; snapshots, density |
 
 macOS dev is therefore **not mimicry** — rungs 2–3 run identical
 guests; only the VMM differs. Skew concentrates entirely in rung 1
 (BSD userland: agents write GNU-isms like `sed -i`) — accept it for
 dev, note it in the tool primer.
+
+> **VMM choice (stage-4 update).** The plan named `libkrun` for the
+> macOS rung — one VMM bridging macOS-dev and Linux-prod. In practice
+> libkrun isn't installable on macOS (no Homebrew formula; building it
+> on Darwin is painful), so the macOS rung is **vfkit** (Apple's
+> Virtualization.framework CLI: bottled, carries the
+> `com.apple.security.virtualization` entitlement, native HVF). The
+> cost is three VMMs instead of two — but the invariant holds: same
+> guest supervisor, same rootfs, same vsock wire protocol; only the
+> VMM driver differs. **Boot feasibility is proven** (2026-07-18): from
+> this sandboxed environment, vfkit boots an arm64 puipui microVM to a
+> login prompt with `PF_VSOCK` registered in the guest kernel. Two
+> constraints found: host vsock sockets must sit under a short path
+> (macOS `AF_UNIX` `sun_path` ≤ 104 chars), and the guest kernel must
+> be uncompressed (`Image`, not `Image.gz`) for the VZ Linux
+> bootloader.
 
 sandtrap's fail-closed pattern transplants directly: requesting a rung
 the platform can't provide **raises** (`IsolationUnavailable`-style),
