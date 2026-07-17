@@ -36,6 +36,24 @@ def test_cache_delete(session):
     assert r.outputs["hit"] is False
 
 
+def test_cache_readonly_blocks_writes():
+    with Session() as s:
+        s.python("cache['seed'] = 1")
+        r = s.python(
+            "read = cache['seed']\n"
+            "try:\n"
+            "    cache['x'] = 2\n"
+            "    wrote = True\n"
+            "except PermissionError:\n"
+            "    wrote = False\n",
+            cache_readonly=True,
+        )
+        assert r.ok, r.error
+        assert r.outputs["read"] == 1  # reads still work
+        assert r.outputs["wrote"] is False  # writes raise
+        assert "x" not in s.cache  # nothing leaked to the host
+
+
 def test_cache_missing_key_raises(session):
     r = session.python("try:\n    cache['nope']\nexcept KeyError:\n    caught = True")
     assert r.outputs["caught"] is True

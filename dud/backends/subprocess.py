@@ -141,6 +141,7 @@ class Session:
         inputs: dict[str, Any] | None = None,
         timeout: float = 30.0,
         caps: dict[str, int] | None = None,
+        cache_readonly: bool = False,
     ) -> PythonResult:
         enc_inputs = {}
         if inputs:
@@ -149,7 +150,8 @@ class Session:
         body, _ = self._ch.request(
             "exec_python",
             {"code": code, "inputs": enc_inputs, "timeout": timeout,
-             "caps": caps or {}, "host_objects": sorted(self.host_objects)},
+             "caps": caps or {}, "host_objects": sorted(self.host_objects),
+             "cache_readonly": cache_readonly},
         )
         if body.get("ok"):
             for k, b64 in body.get("cache_writes", {}).items():

@@ -41,10 +41,15 @@ _RUNNER_FILE = "<session>"
 class CacheView(MutableMapping):
     """dict-like over the host cache: lazy read-through, local
     write-back. Pickling happens only here, guest-side; the host
-    stores opaque bytes."""
+    stores opaque bytes.
 
-    def __init__(self, channel: Channel):
+    ``readonly`` (a GET app handler's cache view — structural REST):
+    writes and deletes raise ``PermissionError`` instead of buffering,
+    matching the host-side read-only cache. Reads are unaffected."""
+
+    def __init__(self, channel: Channel, readonly: bool = False):
         self._ch = channel
+        self._readonly = readonly
         self._local: dict[str, Any] = {}
         self._deleted: set[str] = set()
         self._known_missing: set[str] = set()
@@ -63,11 +68,15 @@ class CacheView(MutableMapping):
         return value
 
     def __setitem__(self, key: str, value: Any) -> None:
+        if self._readonly:
+            raise PermissionError("cache is read-only in GET handlers")
         self._local[key] = value
         self._deleted.discard(key)
         self._known_missing.discard(key)
 
     def __delitem__(self, key: str) -> None:
+        if self._readonly:
+            raise PermissionError("cache is read-only in GET handlers")
         found = key in self._local
         if not found:
             try:
@@ -227,7 +236,7 @@ def run(channel: Channel, req: dict) -> dict:
     g: dict[str, Any] = {"__name__": "__dud__", "__builtins__": __builtins__}
     injected = {"__name__", "__builtins__", "print", "cache", "emit"}
     g["print"] = prints.print_fn
-    cache = CacheView(channel)
+    cache = CacheView(channel, readonly=bool(req.get("cache_readonly")))
     g["cache"] = cache
 
     def emit(name: str, value: Any = None) -> None:
