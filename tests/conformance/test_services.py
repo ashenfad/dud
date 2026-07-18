@@ -4,7 +4,6 @@ import pickle
 
 import pytest
 
-from dud import Session
 
 
 def test_cache_write_then_read_across_execs(session):
@@ -36,8 +35,8 @@ def test_cache_delete(session):
     assert r.outputs["hit"] is False
 
 
-def test_cache_readonly_blocks_writes():
-    with Session() as s:
+def test_cache_readonly_blocks_writes(make_session):
+    with make_session() as s:
         s.python("cache['seed'] = 1")
         r = s.python(
             "read = cache['seed']\n"
@@ -75,25 +74,25 @@ class FakeDb:
         raise AssertionError("private must never be callable")
 
 
-def test_hostcall_roundtrip():
+def test_hostcall_roundtrip(make_session):
     db = FakeDb()
-    with Session(host_objects={"db": db}, allow={"db": {"query"}}) as s:
+    with make_session(host_objects={"db": db}, allow={"db": {"query"}}) as s:
         r = s.python("rows = db.query(filter='x')\nn = len(rows)")
         assert r.ok, r.error
         assert r.outputs["n"] == 1 and r.outputs["rows"] == [{"id": 1, "name": "ada"}]
         assert db.log == [("query", "x")]
 
 
-def test_hostcall_denied_method():
+def test_hostcall_denied_method(make_session):
     db = FakeDb()
-    with Session(host_objects={"db": db}, allow={"db": {"query"}}) as s:
+    with make_session(host_objects={"db": db}, allow={"db": {"query"}}) as s:
         r = s.python("db.drop_all()")
         assert not r.ok and "not allowlisted" in r.error.message
 
 
-def test_hostcall_private_always_denied():
+def test_hostcall_private_always_denied(make_session):
     db = FakeDb()
-    with Session(host_objects={"db": db}) as s:
+    with make_session(host_objects={"db": db}) as s:
         r = s.python("getattr(db, '_secret')()")
         assert not r.ok
 
@@ -115,12 +114,12 @@ def test_emit_rejects_unrepresentable(session):
 
 
 @pytest.mark.parametrize("value", [42, "text", [1, 2], {"k": "v"}, None])
-def test_hostcall_arg_types(value):
+def test_hostcall_arg_types(value, make_session):
     class EchoObj:
         def echo(self, v):
             return v
 
-    with Session(host_objects={"echo": EchoObj()}) as s:
+    with make_session(host_objects={"echo": EchoObj()}) as s:
         r = s.python("out = echo.echo(v)", inputs={"v": value})
         assert r.ok, r.error
         assert r.outputs.get("out") == value

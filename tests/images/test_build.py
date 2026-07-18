@@ -70,8 +70,24 @@ def test_force_rebuilds(tmp_path, stub_image):
     assert r.rootfs_path.exists()
 
 
-def test_spec_hash_tracks_workspace_and_code():
-    base = buildmod._spec_hash("sha256:x", "/workspace")
-    assert base != buildmod._spec_hash("sha256:x", "/data")
-    assert base != buildmod._spec_hash("sha256:y", "/workspace")
-    assert base == buildmod._spec_hash("sha256:x", "/workspace")
+def test_spec_hash_tracks_workspace_medium_and_code():
+    base = buildmod._spec_hash("sha256:x", "/workspace", "initramfs")
+    assert base != buildmod._spec_hash("sha256:x", "/data", "initramfs")
+    assert base != buildmod._spec_hash("sha256:y", "/workspace", "initramfs")
+    assert base != buildmod._spec_hash("sha256:x", "/workspace", "ext4")
+    assert base == buildmod._spec_hash("sha256:x", "/workspace", "initramfs")
+
+
+def test_meta_records_medium(tmp_path, stub_image):
+    import json
+
+    r = buildmod.build("python:3.12-slim", home=tmp_path / "home")
+    meta = json.loads(r.meta_path.read_text())
+    assert meta["medium"] == "initramfs"
+    assert meta["artifact"] == "rootfs.cpio.gz"
+    assert r.medium == "initramfs"
+
+
+def test_unknown_medium_rejected(tmp_path, stub_image):
+    with pytest.raises(ValueError):
+        buildmod.build("python:3.12-slim", home=tmp_path / "home", medium="btrfs")

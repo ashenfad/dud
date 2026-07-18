@@ -372,6 +372,28 @@ dev, note it in the tool primer.
 >   in guest RAM (give the VM ~2 GB). ext4-on-a-disk is the scale path
 >   if large images make the RAM cost bite; 4-4's overlay `/workspace`
 >   staging is independent of the root medium.
+>
+> **vfkit backend green (stage 4-3, 2026-07-18).** `dud.backends.vfkit`
+> boots the rootfs and the guest supervisor serves the *unchanged* wire
+> protocol over vsock; the **full conformance suite (48 tests) passes on
+> the VM rung** exactly as on subprocess. The protocol logic now lives in
+> a shared `HostSession` base both rungs subclass, so they cannot drift.
+> Exact vsock recipe (three wrong guesses cost real boots — recording it):
+> the device is `virtio-vsock,port=N,socketURL=<BARE_PATH>` with vfkit's
+> **default `listen`** semantics — the *host* listens on the unix socket,
+> the *guest* connects to CID 2. Two footguns: `socketURL` must be a bare
+> path (a `unix://` scheme gets treated as part of the path, so vfkit
+> bridges to the wrong socket and the guest's dial is dropped), and the
+> `connect` qualifier is the opposite direction (host→guest). The medium
+> is read from `meta.json` (a `_medium_boot_args` seam picks the device
+> flags), so ext4/virtiofs stay additive. Timings: steady-state
+> boot+vsock-connect ≈ **3 s** (kernel→init is ~0.45 s; the rest is the
+> guest retrying its dial until vfkit's bridge is ready), `exec_python`
+> ≈ 0.03 s. The kernel resolves from an explicit arg, then `$DUD_KERNEL`,
+> then `~/.dud/kernels/<arch>/Image`; absent, the rung fails closed
+> (`IsolationUnavailable`). Still open: workspace lands in the initramfs
+> RAM dir (4-4 gives it overlay staging), and the ~2.5 s dial retry is
+> worth trimming (vfkit readiness signal) later.
 
 sandtrap's fail-closed pattern transplants directly: requesting a rung
 the platform can't provide **raises** (`IsolationUnavailable`-style),
