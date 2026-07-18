@@ -91,3 +91,17 @@ def test_python_cwd_follows_shell(session):
     session.python("open('here.txt', 'w').write('x')")
     r = session.shell("ls")
     assert "here.txt" in r.transcript
+
+
+def test_root_imports_survive_cwd_changes(session):
+    """Filesystem modules resolve from the workspace ROOT regardless of
+    the shell's cwd (the VFS executors' documented contract). Regression:
+    a session whose agent `cd app`'d broke every `from app... import` in
+    later execs and app handlers."""
+    session.shell(
+        "mkdir -p pkg/sub && echo 'X = 41' > rootmod.py && "
+        "printf 'from rootmod import X\\nY = X + 1\\n' > pkg/mod.py && cd pkg/sub"
+    )
+    r = session.python("import rootmod\nfrom pkg import mod\nv = mod.Y")
+    assert r.ok, r.error
+    assert r.outputs["v"] == 42

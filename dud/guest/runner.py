@@ -250,6 +250,14 @@ def run(channel: Channel, req: dict) -> dict:
     entry_cap = int(caps.get("entry", 2_000))
     max_entries = int(caps.get("entries", 200))
 
+    # Workspace-root imports, cwd-independent: filesystem modules resolve
+    # from the workspace root (`import app.api...` works after `cd app`),
+    # matching the VFS executors' documented contract ("imports resolve
+    # from '/'"). The runner's cwd stays on sys.path behind it.
+    workspace = os.environ.get("DUD_WORKSPACE")
+    if workspace and workspace not in sys.path:
+        sys.path.insert(0, workspace)
+
     stdout_buf = io.StringIO()
     prints = PrintCapture(stdout_buf, entry_cap, max_entries)
 
