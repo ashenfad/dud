@@ -25,6 +25,7 @@ from __future__ import annotations
 import ast
 import base64
 import io
+import os
 import pickle
 import sys
 import traceback
@@ -223,6 +224,25 @@ def _clean_traceback(exc: BaseException) -> str:
     return "".join(out) if keep else "".join(parts[:1] + parts[-1:])
 
 
+def _flatten_ui(g: dict) -> None:
+    """Materialize rich ``ui`` values to ``/ui`` files in the workspace.
+
+    The ``ui = {...}`` convention: rich live objects (plotly/pandas/etc.)
+    can't cross the codec, so serialize them guest-side into workspace
+    files (adopted by the host), and drop them from ``ui`` so the
+    representable remainder still harvests through to the host renderer.
+    """
+    ui = g.get("ui")
+    if not isinstance(ui, dict) or not ui:
+        return
+    from .ui import flatten_rich
+
+    workspace = os.environ.get("DUD_WORKSPACE") or os.getcwd()
+    handled = flatten_rich(ui, workspace)
+    if handled:
+        g["ui"] = {k: v for k, v in ui.items() if k not in handled}
+
+
 def run(channel: Channel, req: dict) -> dict:
     code = req["code"]
     caps = req.get("caps", {})
@@ -273,6 +293,7 @@ def run(channel: Channel, req: dict) -> dict:
 
     outputs, skipped = ({}, {})
     if ok:
+        _flatten_ui(g)
         harvest = {
             k: v for k, v in g.items()
             if not k.startswith("_") and k not in injected
