@@ -105,6 +105,15 @@ class VfkitSession(HostSession):
         super().__init__(host_objects, allow, cache, on_emit)
         if platform.system() != "Darwin":
             raise IsolationUnavailable("vfkit rung requires macOS (HVF)")
+        # Pooling hooks (see backends/pool.py): when a pool owns this VM,
+        # close() parks it there instead of powering off; _pool_kwargs is
+        # the boot fingerprint source.
+        self._pool: Any = None
+        self._pool_kwargs = {
+            "image": image, "arch": arch, "workspace": workspace,
+            "kernel": kernel, "memory_mib": memory_mib, "cpus": cpus,
+            "home": home, "packages": packages,
+        }
         home = Path(home) if home else dud_home()
         arch = arch or _host_arch()
 
@@ -190,6 +199,11 @@ class VfkitSession(HostSession):
         if self._closed:
             return
         self._closed = True
+        if self._pool is not None:
+            # Pooled: park the warm VM for the next session (the pool
+            # resets the guest; a failed reset tears the VM down).
+            self._pool.release(self)
+            return
         # shutdown verb -> supervisor stops serving -> init powers the VM off.
         try:
             self._ch.request("shutdown")

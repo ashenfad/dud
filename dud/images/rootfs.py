@@ -112,18 +112,24 @@ def _site_packages(fs: FileSet) -> str:
     return "opt/dud"
 
 
-def _dud_package_files() -> dict[str, bytes]:
-    """The guest runtime's .py files, keyed by path relative to the package.
+# Host-only code the guest never imports: excluded from injection so
+# edits to it don't bust the rootfs cache (the spec hash covers exactly
+# the injected set). dud/__init__ pulls backends.subprocess -> base, so
+# those two stay; the VMM driver and pool are pure host machinery.
+_HOST_ONLY = {
+    ("dud", "images"),
+    ("dud", "backends", "vfkit.py"),
+    ("dud", "backends", "pool.py"),
+}
 
-    Excludes ``dud.images`` — the host-side build pipeline never runs in
-    the guest, so injecting it would only bloat the rootfs and couple its
-    cache key to build-tool edits.
-    """
+
+def _dud_package_files() -> dict[str, bytes]:
+    """The guest runtime's .py files, keyed by path relative to the package."""
     pkg_root = Path(__file__).resolve().parent.parent  # .../dud
     out: dict[str, bytes] = {}
     for py in sorted(pkg_root.rglob("*.py")):
         rel = py.relative_to(pkg_root.parent)  # dud/....py
-        if rel.parts[:2] == ("dud", "images"):
+        if any(rel.parts[:len(x)] == x for x in _HOST_ONLY):
             continue
         out[str(rel)] = py.read_bytes()
     return out
