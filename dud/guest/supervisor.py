@@ -102,9 +102,16 @@ class Supervisor:
         restore the boot-time shell state, and — on the VM rung, where the
         supervisor is PID 1 — kill every other process, so one session's
         exports, files, and stray daemons never reach the next. NOT the
-        same as reset_stage (a rollback within one session)."""
-        diffscan.clear_tree(self.work)
-        diffscan.clear_tree(self.baseline)
+        same as reset_stage (a rollback within one session).
+
+        ``keep_tree`` parks the workspace in place (state-affinity
+        pooling: the tree is tagged with its provider commit and a
+        matching session resumes without a push). Env and process
+        hygiene still apply; a mismatched consumer is safe regardless,
+        because push_tree wipes before extracting."""
+        if not body.get("keep_tree"):
+            diffscan.clear_tree(self.work)
+            diffscan.clear_tree(self.baseline)
         self.shell = ShellState(cwd=str(self.work), env=dict(self._boot_env))
         if os.getpid() == 1:  # VM rung only: we own the machine
             for entry in os.listdir("/proc"):

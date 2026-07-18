@@ -107,8 +107,13 @@ class VfkitSession(HostSession):
             raise IsolationUnavailable("vfkit rung requires macOS (HVF)")
         # Pooling hooks (see backends/pool.py): when a pool owns this VM,
         # close() parks it there instead of powering off; _pool_kwargs is
-        # the boot fingerprint source.
+        # the boot fingerprint source. park_state (stamped by the owner
+        # before close) tags the parked tree's content identity;
+        # resumed=True on acquire means the tree already matches and the
+        # owner may skip its push.
         self._pool: Any = None
+        self.park_state: str | None = None
+        self.resumed = False
         self._pool_kwargs = {
             "image": image, "arch": arch, "workspace": workspace,
             "kernel": kernel, "memory_mib": memory_mib, "cpus": cpus,

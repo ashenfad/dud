@@ -73,20 +73,37 @@ class VmPool:
 
     # ---- lifecycle ----------------------------------------------------
 
-    def acquire(self, **kwargs: Any) -> VfkitSession:
+    def acquire(self, state: str | None = None, **kwargs: Any) -> VfkitSession:
+        """Hand out a VM for this config; prefer one parked with tag
+        ``state`` (content-addressed workspace identity, e.g. a kvgit
+        commit). On a tag match the returned session has
+        ``resumed=True`` — its tree already IS that state, so the caller
+        skips the push and just continues. Any other VM (or a fresh
+        boot) comes back ``resumed=False``."""
         key = _fingerprint(kwargs)
         binding = {k: kwargs.get(k) for k in _BINDING_KEYS}
         while True:
+            matched = False
             with self._lock:
                 self._expire_locked()
                 bucket = self._idle.get(key) or []
-                parked = bucket.pop() if bucket else None
+                parked = None
+                if bucket:
+                    if state is not None:
+                        for i, (_, tag, _s) in enumerate(bucket):
+                            if tag == state:
+                                parked = bucket.pop(i)
+                                matched = True
+                                break
+                    if parked is None:
+                        parked = bucket.pop()  # oldest first
             if parked is None:
                 self._maybe_refill(key)  # replace what we're about to boot
                 session = VfkitSession(**kwargs)
                 session._pool = self  # close() -> release
+                session.resumed = False
                 return session
-            _, session = parked
+            _, _, session = parked
             try:
                 session.ping()
             except Exception:
@@ -94,6 +111,7 @@ class VmPool:
                 continue  # dead while parked: boot fresh next loop
             self._maybe_refill(key)  # top the level back up in background
             self._rebind(session, binding)
+            session.resumed = matched
             return session
 
     def prewarm(self, n: int, background: bool = True, **kwargs: Any) -> None:
@@ -147,16 +165,25 @@ class VmPool:
                 session._pool = self
                 with self._lock:
                     self._idle.setdefault(key, []).insert(
-                        0, (time.monotonic(), session)
+                        0, (time.monotonic(), None, session)
                     )
         finally:
             with self._lock:
                 self._filling.discard(key)
 
     def release(self, session: VfkitSession) -> None:
-        """Reset the guest and park; a VM that fails reset is torn down."""
+        """Reset the guest and park; a VM that fails reset is torn down.
+
+        If the releasing owner stamped ``session.park_state`` (the
+        content hash its tree corresponds to — dud never computes this,
+        the layer above owns state identity), the tree is kept in place
+        and parked under that tag for a same-state resume. Env/process
+        hygiene runs either way; a mismatched later consumer is safe
+        because push_tree wipes before extracting."""
+        state = getattr(session, "park_state", None)
+        session.park_state = None  # tags never survive a park cycle
         try:
-            session._ch.request("reset_guest")
+            session._ch.request("reset_guest", {"keep_tree": bool(state)})
         except Exception:
             self._teardown(session)
             return
@@ -164,18 +191,18 @@ class VmPool:
         with self._lock:
             self._expire_locked()
             bucket = self._idle.setdefault(key, [])
-            bucket.insert(0, (time.monotonic(), session))
+            bucket.insert(0, (time.monotonic(), state, session))
             limit = max(self.max_idle, self._targets.get(key, (0, None))[0])
             overflow = bucket[limit:]
             del bucket[limit:]
-        for _, s in overflow:
+        for _, _, s in overflow:
             self._teardown(s)
 
     def close(self) -> None:
         with self._lock:
             buckets, self._idle = self._idle, {}
         for bucket in buckets.values():
-            for _, s in bucket:
+            for _, _, s in bucket:
                 self._teardown(s)
 
     # ---- internals ----------------------------------------------------
@@ -208,9 +235,11 @@ class VmPool:
             # exact first-touch boot prewarming exists to kill.
             floor = self._targets.get(key, (0, None))[0]
             keep, stale = [], []
-            for t, s in bucket:  # newest first
-                (keep if (t >= cutoff or len(keep) < floor) else stale).append((t, s))
-            expired.extend(s for _, s in stale)
+            for t, tag, s in bucket:  # newest first
+                (keep if (t >= cutoff or len(keep) < floor) else stale).append(
+                    (t, tag, s)
+                )
+            expired.extend(s for _, _, s in stale)
             self._idle[key] = keep
         if expired:
             # teardown outside the lock is nicer, but expiry is rare and

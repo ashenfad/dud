@@ -30,6 +30,9 @@ class FakeVM:
         self.emits = []
         self._closed = False
         self.requests: list[str] = []
+        self.bodies: list[dict] = []
+        self.park_state = None
+        self.resumed = False
         self.dead = False
         self.torn_down = False
         outer = self
@@ -39,6 +42,7 @@ class FakeVM:
                 if outer.dead:
                     raise ConnectionError("vm died")
                 outer.requests.append(verb)
+                outer.bodies.append(body or {})
                 return {}, []
 
         self._ch = Ch()
@@ -206,3 +210,62 @@ def test_acquire_kicks_background_refill(monkeypatch):
     p.prewarm(1, background=False, image="x")
     p.acquire(image="x")
     assert kicks == [_key(image="x")]
+
+
+def test_state_affinity_resume_skips_wipe(monkeypatch):
+    """Park tagged with a state -> a same-state acquire gets the SAME
+    tree (keep_tree reset) and resumed=True; the owner skips its push."""
+    p = _no_auto(_pool(monkeypatch))
+    a = p.acquire(image="x")
+    a.park_state = "commit-abc"
+    a.close()
+    assert a.requests == ["reset_guest"]
+    assert a.bodies == [{"keep_tree": True}]  # tree kept in place
+    assert a.park_state is None  # tags never survive a park cycle
+
+    b = p.acquire(image="x", state="commit-abc")
+    assert b is a and b.resumed is True
+
+
+def test_state_mismatch_falls_back_untagged(monkeypatch):
+    p = _no_auto(_pool(monkeypatch))
+    a = p.acquire(image="x")
+    a.park_state = "commit-abc"
+    a.close()
+    b = p.acquire(image="x", state="commit-OTHER")
+    assert b is a  # still reused (push_tree will wipe+load)
+    assert b.resumed is False
+
+
+def test_untagged_park_wipes_and_never_resumes(monkeypatch):
+    p = _no_auto(_pool(monkeypatch))
+    a = p.acquire(image="x")
+    a.close()  # no park_state stamped
+    assert a.bodies == [{"keep_tree": False}]
+    b = p.acquire(image="x", state="commit-abc")
+    assert b is a and b.resumed is False
+
+
+def test_affinity_prefers_match_over_older_vm(monkeypatch):
+    p = _no_auto(_pool(monkeypatch, max_idle=2))
+    a = p.acquire(image="x")
+    b = p.acquire(image="x")
+    a.park_state = "commit-A"
+    a.close()
+    b.park_state = "commit-B"
+    b.close()  # b parked newest; a is the older entry
+    got = p.acquire(image="x", state="commit-A")
+    assert got is a and got.resumed is True
+
+
+def test_reset_guest_keep_tree_over_real_guest():
+    """keep_tree parks the workspace in place; env/cwd hygiene still runs."""
+    from dud import Session
+
+    with Session() as s:
+        s.shell("export LEAKY=secret && echo keepme > f.txt && cd /")
+        s._ch.request("reset_guest", {"keep_tree": True})
+        r = s.shell("echo ${LEAKY:-unset}; cat f.txt; pwd")
+        assert "unset" in r.transcript  # env reset
+        assert "keepme" in r.transcript  # tree survived
+        assert r.cwd.endswith("/work")  # cwd reset
