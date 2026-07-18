@@ -23,9 +23,14 @@ from pathlib import Path
 
 from .cpio import FileSet
 
+# The guest base (python:slim = Debian bookworm) has glibc 2.36, so
+# declare manylinux_2_28: the generic `*-unknown-linux-gnu` target
+# assumes ancient glibc (manylinux_2_17) and silently resolves YEARS-old
+# versions of packages whose current wheels need 2_26/2_28 (that skew
+# broke cross-executor cache unpickles before versions were pinned).
 _PLATFORM = {
-    "arm64": "aarch64-unknown-linux-gnu",
-    "amd64": "x86_64-unknown-linux-gnu",
+    "arm64": "aarch64-manylinux_2_28",
+    "amd64": "x86_64-manylinux_2_28",
 }
 
 
