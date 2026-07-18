@@ -80,14 +80,26 @@ initramfs, big → ext4) once both exist.
 
 Cheap, high-value, mostly host-side:
 
+- ~~**Cross-session reuse**~~ **shipped**: `VmPool` keys warm VMs by
+  boot fingerprint; same-spec sessions reopen in ~0 s (guest reset +
+  tree push) instead of booting. Hygiene on release (`reset_guest`:
+  trees wiped, boot env restored, stray guest processes killed);
+  out-of-workspace residue survives by design within one user's
+  studio. In-process only — a parked VM still dies with the server.
+- **Restart survival**: the companion piece pooling exposes — detached
+  VMs + guest reconnect-on-EOF (today the guest powers off when the
+  channel drops) + deterministic socket paths, so warm VMs outlive
+  studio restarts. Needs a small vfkit re-bridge spike.
 - **Idle eviction**: studio holds a warm VM per open session forever
-  (2–4 GB each). Evict after idle; state is all in kvgit, so revival
-  is a ~3 s boot + tree push.
+  (2–4 GB each). Evict after idle; with the pool, eviction is just
+  early release — revival is a tree push.
 - **Death recovery**: a dead VM currently means dead-session errors
   until reopen. The disposable thesis makes auto-reboot trivial —
   detect channel loss, boot, re-push, retry the call once.
 - **Boot latency**: ~2.5 s of the 3 s is the guest retrying its vsock
   dial until vfkit's bridge is ready. Find or add a readiness signal.
+  Matters less per-session now that reuse skips boots, but still paid
+  on pool misses and first opens.
 
 ### 4. Dogfood gate, now with real walls
 
