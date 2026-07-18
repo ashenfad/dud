@@ -1,7 +1,8 @@
 """The guest supervisor: one process per session, serving the wire verbs.
 
-Owns the workspace pair (``work/`` mutable, ``baseline/`` pristine —
-see diffscan), the shell session state, and the runner lifecycle. On
+Owns the workspace staging (overlayfs on VM rungs, baseline-copy
+scan-diff elsewhere — see :mod:`dud.guest.staging`), the shell session
+state, and the runner lifecycle. On
 ``exec_python`` it spawns a fresh runner process (script model: one
 interpreter per exec, killed on timeout) and pumps: runner requests
 (cache/hostcall/emit) forward upstream to the host, whose own
@@ -26,9 +27,11 @@ import sys
 import time
 from pathlib import Path
 
+from contextlib import nullcontext
+
 from ..proto import Channel, ChannelClosed, RemoteError, shutdown_served
-from .. import diffscan
 from .shell import ShellOutcome, ShellState, run_shell
+from .staging import make_stage
 
 _RUNNER_DEFAULT_TIMEOUT = 30.0
 _SHELL_DEFAULT_TIMEOUT = 30.0
@@ -38,10 +41,11 @@ class Supervisor:
     def __init__(self, channel: Channel, root: Path):
         self.channel = channel
         self.root = root
-        self.work = root / "work"
-        self.baseline = root / "baseline"
-        self.work.mkdir(parents=True, exist_ok=True)
-        self.baseline.mkdir(parents=True, exist_ok=True)
+        # Staging strategy (overlay on VM rungs, scan-diff otherwise)
+        # owns the trees; the supervisor only knows the mutable work
+        # dir and the wire verbs.
+        self.stage = make_stage(root)
+        self.work = self.stage.work
         self.shell = ShellState(cwd=str(self.work))
         # Boot-time env snapshot: reset_guest restores this, so exports
         # from one pooled session never leak into the next.
@@ -59,16 +63,14 @@ class Supervisor:
     # ---- verbs -------------------------------------------------------
 
     def do_ping(self, body, bins):
-        return {"pong": True, "workspace": str(self.work)}, []
+        return {"pong": True, "workspace": str(self.work),
+                "staging": self.stage.kind}, []
 
     def do_shutdown(self, body, bins):
         shutdown_served()
 
     def do_push_tree(self, body, bins):
-        diffscan.clear_tree(self.work)
-        if bins and bins[0]:
-            diffscan.extract_tar(bins[0], self.work)
-        diffscan.sync_copy(self.work, self.baseline)
+        self.stage.push(bins[0] if bins and bins[0] else None)
         self.shell.cwd = str(self.work)
         return {}, []
 
@@ -87,14 +89,11 @@ class Supervisor:
         }, []
 
     def do_pull_diff(self, body, bins):
-        writes, deletes = diffscan.scan_diff(self.work, self.baseline)
-        tar = diffscan.make_tar(self.work, writes)
-        if body.get("rebase"):
-            diffscan.sync_copy(self.work, self.baseline)
+        writes, deletes, tar = self.stage.diff(bool(body.get("rebase")))
         return {"writes": writes, "deletes": deletes}, [tar]
 
     def do_reset_stage(self, body, bins):
-        diffscan.sync_copy(self.baseline, self.work)
+        self.stage.reset_stage()
         return {}, []
 
     def do_reset_guest(self, body, bins):
@@ -109,46 +108,54 @@ class Supervisor:
         matching session resumes without a push). Env and process
         hygiene still apply; a mismatched consumer is safe regardless,
         because push_tree wipes before extracting."""
-        if not body.get("keep_tree"):
-            diffscan.clear_tree(self.work)
-            diffscan.clear_tree(self.baseline)
-        self.shell = ShellState(cwd=str(self.work), env=dict(self._boot_env))
         if os.getpid() == 1:  # VM rung only: we own the machine
+            # Kill strays BEFORE touching the trees — a leftover daemon
+            # with its cwd inside the workspace would pin the overlay
+            # mount we're about to cycle.
             for entry in os.listdir("/proc"):
                 if entry.isdigit() and entry != "1":
                     try:
                         os.kill(int(entry), signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
+        self.stage.reset_guest(bool(body.get("keep_tree")))
+        self.shell = ShellState(cwd=str(self.work), env=dict(self._boot_env))
         return {}, []
 
     def do_exec_python(self, body, bins):
         timeout = float(body.get("timeout", _RUNNER_DEFAULT_TIMEOUT))
         run_body = {k: v for k, v in body.items() if k != "timeout"}
 
+        # fs_readonly (view execs): on overlay staging this is a REAL
+        # read-only remount for the exec's duration; scan staging can't
+        # enforce it (rung-1 documented gap — consumers keep their
+        # post-hoc diff check there).
+        guard = (self.stage.readonly() if body.get("fs_readonly")
+                 else nullcontext())
         parent, child = socketlib.socketpair()
         env = dict(self.shell.env)
         env["DUD_WORKSPACE"] = str(self.work)
         cwd = self.shell.cwd if os.path.isdir(self.shell.cwd) else str(self.work)
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "dud.guest.runner", str(child.fileno())],
-            pass_fds=(child.fileno(),),
-            cwd=cwd,
-            env=env,
-            start_new_session=True,
-        )
-        child.close()
-        rchan = Channel(parent)
-        rchan._next_id += 1
-        rid = rchan._next_id
-        rchan._send_msg(
-            {"id": rid, "kind": "req", "verb": "run", "body": run_body}, []
-        )
-        try:
-            result = self._pump_runner(rchan, rid, proc, timeout)
-        finally:
-            rchan.close()
-            self._reap(proc)
+        with guard:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "dud.guest.runner", str(child.fileno())],
+                pass_fds=(child.fileno(),),
+                cwd=cwd,
+                env=env,
+                start_new_session=True,
+            )
+            child.close()
+            rchan = Channel(parent)
+            rchan._next_id += 1
+            rid = rchan._next_id
+            rchan._send_msg(
+                {"id": rid, "kind": "req", "verb": "run", "body": run_body}, []
+            )
+            try:
+                result = self._pump_runner(rchan, rid, proc, timeout)
+            finally:
+                rchan.close()
+                self._reap(proc)
         return result, []
 
     # ---- runner pump -------------------------------------------------

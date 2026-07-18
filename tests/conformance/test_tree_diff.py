@@ -1,5 +1,11 @@
 """Conformance: push_tree / pull_diff / reset — the state seam."""
 
+import os
+
+import pytest
+
+_BACKEND = os.environ.get("DUD_BACKEND", "subprocess")
+
 
 def _seed(tmp_path, files):
     for rel, content in files.items():
@@ -63,3 +69,67 @@ def test_fresh_push_resets_everything(session, tmp_path):
     assert "two.txt" in r.transcript
     assert "one.txt" not in r.transcript and "extra.txt" not in r.transcript
     assert session.diff().empty
+
+
+def test_staging_matches_backend(session):
+    """No silent fallback: the VM rung must actually run overlay."""
+    expected = {"subprocess": "scan", "vfkit": "overlay"}[_BACKEND]
+    assert session.ping().get("staging") == expected
+
+
+def test_directory_delete_reports_per_file_deletes(session, tmp_path):
+    session.push_dir(_seed(tmp_path / "t", {
+        "d/a.txt": "a", "d/sub/b.txt": "b", "top.txt": "t",
+    }))
+    session.shell("rm -rf d")
+    d = session.diff()
+    assert not d.writes
+    assert sorted(d.deletes) == ["d/a.txt", "d/sub/b.txt"]
+
+
+def test_create_then_delete_is_a_noop_diff(session, tmp_path):
+    session.push_dir(_seed(tmp_path / "t", {"base.txt": "b"}))
+    session.shell("echo tmp > scratch.txt && rm scratch.txt")
+    assert session.diff().empty
+
+
+def test_identical_rewrite_is_not_a_write(session, tmp_path):
+    session.push_dir(_seed(tmp_path / "t", {"same.txt": "stable\n"}))
+    session.shell("printf 'stable\\n' > same.txt && touch same.txt")
+    assert session.diff().empty
+
+
+def test_dir_replaced_by_file_and_back(session, tmp_path):
+    session.push_dir(_seed(tmp_path / "t", {"thing/inner.txt": "i"}))
+    session.shell("rm -rf thing && echo flat > thing")
+    d = session.diff(rebase=True)
+    assert d.writes.get("thing") == b"flat\n"
+    assert d.deletes == ["thing/inner.txt"]
+    session.shell("rm thing && mkdir thing && echo back > thing/inner.txt")
+    d2 = session.diff()
+    assert d2.writes.get("thing/inner.txt") == b"back\n"
+    assert d2.deletes == ["thing"]
+
+
+@pytest.mark.skipif(
+    _BACKEND == "subprocess",
+    reason="rung-1 documented gap: no fs isolation to enforce read-only",
+)
+def test_fs_readonly_exec_blocks_writes(session, tmp_path):
+    session.push_dir(_seed(tmp_path / "t", {"data.txt": "d"}))
+    r = session.python(
+        "try:\n"
+        "    open('evil.txt', 'w').write('x')\n"
+        "    blocked = False\n"
+        "except OSError:\n"
+        "    blocked = True\n"
+        "readable = open('data.txt').read()",
+        fs_readonly=True,
+    )
+    assert r.ok and r.outputs["blocked"] is True
+    assert r.outputs["readable"] == "d"
+    assert session.diff().empty
+    # The window closes with the exec: normal writes work again.
+    r2 = session.python("open('after.txt', 'w').write('fine')")
+    assert r2.ok
+    assert session.diff().writes.get("after.txt") == b"fine"

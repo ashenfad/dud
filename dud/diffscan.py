@@ -1,10 +1,10 @@
-"""Rung-1 workspace staging: baseline copy + content-hash scan diff.
+"""Tree-diff primitives: content-hash scan, tar shapes, tree ops.
 
-macOS has no overlayfs, so the subprocess backend keeps a pristine
-``baseline/`` beside the mutable ``work/`` tree and diffs by content
-hash (PLAN.md decision #1). The wire format is producer-agnostic — a
-tar of changed/added files plus an explicit delete list — so the
-overlayfs rungs emit the identical shape from their upperdir.
+The scan path (``index_tree``/``scan_diff``) backs rung 1's
+baseline-copy staging — macOS has no overlayfs. The wire format is
+producer-agnostic — a tar of changed/added files plus an explicit
+delete list — and the VM rungs' overlay staging emits the identical
+shape from its upperdir (see :mod:`dud.guest.staging`).
 
 Copies are cheap at agent-workspace scale (MBs). Symlinks are not
 followed and not preserved (v0); empty directories do not round-trip
@@ -62,8 +62,11 @@ def scan_diff(work: Path, baseline: Path) -> tuple[list[str], list[str]]:
 
 
 def make_tar(root: Path, paths: list[str]) -> bytes:
+    # Plain tar, matching the host push writers: the wire is a local
+    # socket, gzip only burns CPU (measured 4:1 on push at 200 MB).
+    # Consumers extract with r:* so compressed producers stay valid.
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+    with tarfile.open(fileobj=buf, mode="w") as tf:
         for rel in paths:
             tf.add(root / rel, arcname=rel, recursive=False)
     return buf.getvalue()

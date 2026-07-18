@@ -55,13 +55,22 @@ survive Docker Hub rate limits and work offline.
 
 Unblocked and now actionable:
 
-- **Overlay `/workspace` at the root** (the deferred stage 4-4):
-  lower = pushed snapshot ro, upper = the diff, harvested directly —
-  O(changes) diffs instead of O(tree) scan, a *true* read-only mount
-  for GET views (today: post-hoc diff check + reset), and the
-  workspace mounted at `/` — which also fixes the absolute-path
-  fidelity gap (a handler writing `/app/x` today lands in the VM's
-  throwaway root, silently outside the diff).
+- ~~**Overlay workspace staging**~~ **shipped** (stage 4-4's diff
+  half): on VM rungs `work/` is an overlayfs mount — lower = pushed
+  snapshot, upper = the diff, harvested directly with scan-diff parity
+  (per-file delete expansion, identical-copy-up suppression, one
+  conformance corpus over both producers; `ping` reports the live
+  staging so tests refuse silent fallback). Measured on a 210 MB tree:
+  diff-with-one-change 0.13 s → **0.001 s**, `reset_stage` → **~0 s**,
+  and baseline RAM cost drops from 2x tree to 1x + changes.
+  `fs_readonly` exec windows are a *true* r/o remount on this rung
+  (rung 1 keeps the documented post-hoc gap).
+- **Workspace at `/`** — the deferred other half of 4-4: mounting the
+  workspace at the root to close the absolute-path fidelity gap (a
+  handler writing `/app/x` lands outside the diff today). Deferred
+  because it changes guest path/cwd semantics that nontainer and
+  studio observe (`__cwd__` persistence, sandtrap parity) — needs the
+  surface layers at the table, not a dud-only decision.
 - **virtiofs lowerdir**: large workspaces mounted from the host
   instead of tarred over vsock every session.
 

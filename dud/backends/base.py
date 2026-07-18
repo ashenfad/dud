@@ -143,7 +143,16 @@ class HostSession:
         timeout: float = 30.0,
         caps: dict[str, int] | None = None,
         cache_readonly: bool = False,
+        fs_readonly: bool = False,
     ) -> PythonResult:
+        """Execute code in a fresh guest runner.
+
+        ``fs_readonly`` asks the guest for a read-only workspace window
+        for this exec (view semantics). On overlay staging (VM rungs)
+        that's a real remount — writes fail inside the exec; on scan
+        staging it's unenforced (rung-1 documented gap), so consumers
+        should keep a post-hoc diff check where it matters.
+        """
         enc_inputs = {}
         if inputs:
             for k, v in inputs.items():
@@ -152,7 +161,7 @@ class HostSession:
             "exec_python",
             {"code": code, "inputs": enc_inputs, "timeout": timeout,
              "caps": caps or {}, "host_objects": sorted(self.host_objects),
-             "cache_readonly": cache_readonly},
+             "cache_readonly": cache_readonly, "fs_readonly": fs_readonly},
         )
         if body.get("ok"):
             for k, b64 in body.get("cache_writes", {}).items():
