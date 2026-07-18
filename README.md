@@ -6,11 +6,14 @@ Versioning belongs to the layer above (e.g.
 [nontainer](https://github.com/ashenfad/nontainer)'s providers) — dud
 is deliberately storage-blind.
 
-> **Status: pre-alpha, rung 1 only.** The subprocess backend works
-> (real bash, real Python, zero isolation — own-agent-own-laptop
-> posture). The microVM rungs (libkrun on macOS/Linux, Firecracker on
-> Linux) are designed but not built. See [DESIGN.md](DESIGN.md) for
-> the full rationale and [PLAN.md](PLAN.md) for staging.
+> **Status: pre-alpha, rungs 1–2.** The subprocess backend (real
+> bash, real Python, zero isolation — own-agent-own-laptop posture)
+> and the vfkit microVM backend (macOS, real isolation, ~3 s boot,
+> full conformance suite green over vsock) both work, including
+> OCI-image workspaces with pip-layered packages. Firecracker (Linux)
+> is designed but not built. See [DESIGN.md](DESIGN.md) for the full
+> rationale, [PLAN.md](PLAN.md) for the original staging, and
+> [ROADMAP.md](ROADMAP.md) for what's next from here.
 
 ## Quick look
 
@@ -53,7 +56,7 @@ substrate hardens:
 | rung | platform | isolation |
 |---|---|---|
 | `subprocess` (today) | any OS | none — dev/CI floor |
-| `libkrun` (planned) | macOS + Linux | real Linux microVM |
+| `vfkit` (today) | macOS (HVF) | real Linux microVM |
 | `firecracker` (planned) | Linux/KVM | microVM + jailer, snapshots |
 
 The conformance suite in `tests/conformance/` is the contract: a
