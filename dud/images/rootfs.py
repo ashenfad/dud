@@ -118,6 +118,7 @@ def _site_packages(fs: FileSet) -> str:
 # those two stay; the VMM driver and pool are pure host machinery.
 _HOST_ONLY = {
     ("dud", "images"),
+    ("dud", "kernels.py"),
     ("dud", "backends", "vfkit.py"),
     ("dud", "backends", "pool.py"),
 }

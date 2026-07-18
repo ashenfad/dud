@@ -2,9 +2,10 @@
 
 A minimal Docker Registry v2 / OCI client: anonymous bearer-token auth,
 manifest-index platform selection, digest-verified blob download into a
-content-addressed cache. Enough to flatten a public base image
-(``python:3.12-slim``) into a rootfs — deliberately *not* a general
-registry library.
+content-addressed cache, and a per-(reference, arch) resolution cache
+so already-pulled images survive registry outages and rate limits.
+Enough to flatten a public base image (``python:3.12-slim``) into a
+rootfs — deliberately *not* a general registry library.
 
 Scope: Docker Hub and any registry that speaks the v2 token flow. A
 bare name (``python``) resolves to ``library/python`` on Docker Hub; a
@@ -162,6 +163,18 @@ class Registry:
 
     # ---- manifests ---------------------------------------------------
 
+    def _resolution_path(self, ref: ImageRef, arch: str) -> Path:
+        key = hashlib.sha256(f"{ref}|{arch}".encode()).hexdigest()
+        return self.cache_dir / "manifests" / f"{key}.json"
+
+    def _resolve(self, ref: ImageRef, arch: str) -> tuple[dict, str]:
+        """Network resolution: reference -> (platform manifest, digest)."""
+        manifest, digest = self._manifest(ref, ref.reference)
+        if manifest.get("mediaType") in _INDEX_TYPES or "manifests" in manifest:
+            plat_digest = self._select_platform(manifest, arch)
+            manifest, digest = self._manifest(ref, plat_digest)
+        return manifest, digest
+
     def _manifest(self, ref: ImageRef, reference: str) -> tuple[dict, str]:
         with self._get(ref, f"manifests/{reference}", _MANIFEST_ACCEPT) as r:
             raw = r.read()
@@ -205,13 +218,30 @@ class Registry:
     # ---- public ------------------------------------------------------
 
     def pull(self, ref: str | ImageRef, arch: str | None = None) -> PulledImage:
-        """Resolve a reference to one platform and fetch its blobs."""
+        """Resolve a reference to one platform and fetch its blobs.
+
+        Resolution is cached per (reference, arch): a successful resolve
+        refreshes the cache; an unreachable or rate-limiting registry
+        falls back to the last-known resolution, so images whose blobs
+        are already cached keep working offline. The fallback pins a
+        mutable tag to whatever it meant last time — the same tradeoff
+        every local image store makes.
+        """
         r = ref if isinstance(ref, ImageRef) else ImageRef.parse(ref)
         arch = arch or _host_arch()
-        manifest, digest = self._manifest(r, r.reference)
-        if manifest.get("mediaType") in _INDEX_TYPES or "manifests" in manifest:
-            plat_digest = self._select_platform(manifest, arch)
-            manifest, digest = self._manifest(r, plat_digest)
+        cache = self._resolution_path(r, arch)
+        try:
+            manifest, digest = self._resolve(r, arch)
+        except RegistryError:
+            if not cache.exists():
+                raise
+            cached = json.loads(cache.read_text())
+            manifest, digest = cached["manifest"], cached["digest"]
+        else:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache.with_suffix(".part")
+            tmp.write_text(json.dumps({"digest": digest, "manifest": manifest}))
+            tmp.rename(cache)
         config_path = self._blob(r, manifest["config"]["digest"])
         config = json.loads(config_path.read_bytes())
         layers = [self._blob(r, lyr["digest"]) for lyr in manifest["layers"]]

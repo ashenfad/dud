@@ -363,10 +363,16 @@ dev, note it in the tool primer.
 >   `PYTHONHASHSEED` makes CPython skip the startup `getrandom()`. A
 >   proper `virtio-rng`/kernel-RNG path is a later polish; this unblocks
 >   the rung. (The puipui kernel here lacks the virtio-rng driver.)
+>   *Since resolved: the pinned kernel has virtio-rng built in and the
+>   cmdline workaround is retired.*
 > - **Kernel is a bundled asset, not from the image.** `python:slim`
 >   ships no kernel; the rootfs pipeline owns only the rootfs half. The
 >   arch-matched uncompressed `Image` (with virtio + vsock) is bundled
->   by dud and reused across every rootfs.
+>   by dud and reused across every rootfs. *Since formalized: the kernel
+>   is a versioned, digest-pinned asset fetched by `dud.kernels` — today
+>   the Kata Containers release kernel (6.18, overlayfs + virtiofs +
+>   virtio-rng all built in), the same kernel Apple's containerization
+>   stack recommends for Virtualization.framework guests.*
 > - **Initramfs, not ext4, for the rung.** `cpio.gz` needs only present
 >   tooling and sidesteps ext4 creation on macOS; the whole rootfs lives
 >   in guest RAM (give the VM ~2 GB). ext4-on-a-disk is the scale path

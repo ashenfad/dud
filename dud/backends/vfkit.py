@@ -11,10 +11,10 @@ Boot facts settled by the stage-4 spikes (see DESIGN.md):
     (``dud.mode=connect``) and the vsock device's ``connect`` qualifier
     makes vfkit forward that to the unix socket the host listens on.
     (vfkit's default is host->guest and drops a guest-initiated dial.)
-  - ``PYTHONHASHSEED=0`` on the kernel cmdline dodges CPython's
-    entropy-at-preinit crash (the kernel forwards ``k=v`` to init's env).
-  - the kernel is a bundled dud asset (arch-matched uncompressed ``Image``
-    with virtio + vsock), not shipped by the image.
+  - the kernel is a versioned dud asset (arch-matched uncompressed
+    ``Image``; see :mod:`dud.kernels`), not shipped by the image. The
+    pinned kernel has virtio-rng built in, so entropy is real — the
+    old puipui kernel needed a ``PYTHONHASHSEED=0`` cmdline workaround.
   - rootfs medium comes from ``meta.json`` — only ``initramfs`` is wired;
     ``ext4`` (virtio-blk) is the additive large-image path.
 
@@ -60,8 +60,9 @@ def _resolve_kernel(kernel: str | Path | None, arch: str, home: Path) -> Path:
             if p.is_file():
                 return p
     raise IsolationUnavailable(
-        f"no guest kernel for {arch}: pass kernel=, set $DUD_KERNEL, or place "
-        f"an uncompressed Image at {home / 'kernels' / arch / 'Image'}"
+        f"no guest kernel for {arch}: run `python -m dud.kernels` to fetch "
+        f"the pinned one, pass kernel=, set $DUD_KERNEL, or place an "
+        f"uncompressed Image at {home / 'kernels' / arch / 'Image'}"
     )
 
 
@@ -144,7 +145,7 @@ class VfkitSession(HostSession):
         self._srv.listen(1)
 
         cmdline = (
-            f"console=hvc0 random.trust_cpu=on PYTHONHASHSEED=0 "
+            f"console=hvc0 random.trust_cpu=on "
             f"dud.mode=connect dud.cid={_HOST_CID} dud.port={_VSOCK_PORT} "
             f"dud.root={workspace}"
         )

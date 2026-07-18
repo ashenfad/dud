@@ -41,13 +41,19 @@ here; nontainer `executor-seam`+`dud-executor` are merged to nxt,
 Ordered by unblock-value, not strict sequence. The kernel spike is the
 lynchpin — three deferred items all trace back to it.
 
-### 1. Guest kernel with `CONFIG_OVERLAY_FS` (+ virtiofs, virtio-rng)
+### 1. ~~Guest kernel with `CONFIG_OVERLAY_FS` (+ virtiofs, virtio-rng)~~ shipped
 
-The current kernel is puipui — a minimal VZ-test kernel that proved
-boot but can't grow with us: no overlayfs (probed live: both 5.15.71
-and 6.11.5 lack it), no virtio-rng driver (hence the `PYTHONHASHSEED=0`
-cmdline workaround), no virtiofs. One kernel spike (source or build an
-arm64 `Image` with those three) unblocks:
+The kernel spike landed without a build: the **Kata Containers release
+kernel** (6.18, arm64 `Image`, the same kernel Apple's containerization
+stack recommends for Virtualization.framework guests) has everything
+`=y` — overlayfs (mount-verified in-guest), virtiofs, virtio-rng
+(`PYTHONHASHSEED=0` workaround retired), vsock/blk/console, ext4.
+`dud.kernels` makes it a versioned, digest-pinned, fetched-and-cached
+asset (`python -m dud.kernels`; needs `zstd` at fetch time only), and
+the registry client now caches manifest resolution so cached images
+survive Docker Hub rate limits and work offline.
+
+Unblocked and now actionable:
 
 - **Overlay `/workspace` at the root** (the deferred stage 4-4):
   lower = pushed snapshot ro, upper = the diff, harvested directly —
@@ -58,11 +64,11 @@ arm64 `Image` with those three) unblocks:
   throwaway root, silently outside the diff).
 - **virtiofs lowerdir**: large workspaces mounted from the host
   instead of tarred over vsock every session.
-- **Real entropy**: retire the hash-seed workaround.
 
-Also owed here: a kernel *distribution* story — today the kernel is a
-hand-placed file at `~/.dud/kernels/<arch>/Image`; it should be a
-versioned, fetched-and-cached dud asset per arch.
+Remaining polish: the fetch rides Kata's full 664 MB static tarball to
+extract an 18 MB kernel — hosting the extracted `Image` as a dud
+release asset (license: GPL-2.0, point at Kata's source) would cut the
+download 97% and drop the `zstd` dependency.
 
 ### 2. ext4 rootfs medium (demand-paged images)
 
