@@ -152,3 +152,57 @@ def test_reset_guest_over_real_guest():
         assert "unset" in r.transcript
         assert "f.txt" not in r.transcript
         assert r.cwd.endswith("/work")
+
+
+def _no_auto(p):
+    """Disable async auto-refill so boot counts are deterministic."""
+    p._maybe_refill = lambda key: None
+    return p
+
+
+def _key(**kwargs):
+    from dud.backends.pool import _fingerprint
+    return _fingerprint(kwargs)
+
+
+def test_prewarm_boots_and_parks(monkeypatch):
+    p = _no_auto(_pool(monkeypatch))
+    p.prewarm(2, background=False, image="x")
+    assert FakeVM.booted == 2
+    a = p.acquire(image="x")
+    assert FakeVM.booted == 2  # served warm, no boot
+    assert a.requests == []  # prewarmed VMs are pristine, no reset needed
+
+
+def test_prewarm_refills_after_drain(monkeypatch):
+    p = _no_auto(_pool(monkeypatch))
+    p.prewarm(1, background=False, image="x")
+    a = p.acquire(image="x")  # drains the warm level
+    p._refill(_key(image="x"))  # what auto-refill runs in the background
+    assert FakeVM.booted == 2  # a's replacement is parked
+    b = p.acquire(image="x")
+    assert b is not a and FakeVM.booted == 2  # warm again
+
+
+def test_prewarm_target_survives_ttl(monkeypatch):
+    p = _no_auto(_pool(monkeypatch, ttl=0.0))
+    p.prewarm(1, background=False, image="x")
+    b = p.acquire(image="x")  # ttl=0 would have expired an untargeted VM
+    assert FakeVM.booted == 1  # served the prewarmed VM, no fresh boot
+    assert b.requests == []
+
+
+def test_prewarm_target_raises_release_limit(monkeypatch):
+    p = _no_auto(_pool(monkeypatch, max_idle=1))
+    p.prewarm(3, background=False, image="x")
+    assert FakeVM.booted == 3  # target beats max_idle for its own key
+
+
+def test_acquire_kicks_background_refill(monkeypatch):
+    """The auto-refill hook fires on drain (thread mechanics faked out)."""
+    p = _pool(monkeypatch)
+    kicks = []
+    p._maybe_refill = lambda key: kicks.append(key)
+    p.prewarm(1, background=False, image="x")
+    p.acquire(image="x")
+    assert kicks == [_key(image="x")]
