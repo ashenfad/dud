@@ -65,10 +65,14 @@ Unblocked and now actionable:
 - **virtiofs lowerdir**: large workspaces mounted from the host
   instead of tarred over vsock every session.
 
-Remaining polish: the fetch rides Kata's full 664 MB static tarball to
-extract an 18 MB kernel — hosting the extracted `Image` as a dud
-release asset (license: GPL-2.0, point at Kata's source) would cut the
-download 97% and drop the `zstd` dependency.
+The kernel is rehosted as a dud release asset
+([kernel-kata-3.32.0](https://github.com/ashenfad/dud/releases/tag/kernel-kata-3.32.0),
+provenance + GPL source pointers in the notes): an 18 MB direct
+download instead of Kata's 664 MB tarball, no `zstd` needed for the
+pinned path. While the repo is private, anonymous downloads 404 and
+the fetcher falls back to the authenticated `gh` CLI — making the repo
+public (already implied by the PyPI ship-track item) lets anonymous
+fetch just work.
 
 ### 2. ext4 rootfs medium (demand-paged images)
 

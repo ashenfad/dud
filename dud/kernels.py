@@ -16,10 +16,11 @@ Install layout under ``~/.dud/kernels/<arch>/``:
   ``meta.json``  — provenance: spec name, kernel version, source URL,
                    digests
 
-Fetching costs a large download (the kernel rides inside Kata's static
-release tarball); both the tarball and the extracted kernel are
-digest-verified. Extraction shells out to ``zstd`` (``brew install
-zstd``) — the one extra host tool, needed only at fetch time.
+The pinned kernel downloads directly as a dud GitHub release asset
+(18 MB, digest-verified; while the repo is private the fetch falls
+back to an authenticated ``gh`` CLI). Archive-shaped specs (kernel
+inside a ``.tar.zst``) are also supported; those shell out to ``zstd``
+(``brew install zstd``) at fetch time only.
 
 CLI: ``python -m dud.kernels [--arch ...] [--force]``.
 """
@@ -29,6 +30,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -47,28 +49,33 @@ class KernelFetchError(Exception):
 
 @dataclass(frozen=True)
 class KernelSpec:
-    """A pinned prebuilt kernel and where to get it."""
+    """A pinned prebuilt kernel and where to get it.
 
-    name: str            # spec identity, e.g. "kata-3.32.0"
-    kernel: str          # kernel version inside, e.g. "6.18.35"
-    url: str             # source archive (tar.zst)
-    archive_sha256: str  # pin for the archive
-    member: str          # path of the kernel inside the archive
-    image_sha256: str    # pin for the extracted kernel
+    Two source shapes: a direct download of the ``Image`` itself
+    (``member=None``), or an archive the kernel is extracted from
+    (``member`` = path inside a ``.tar.zst``, ``archive_sha256`` pins
+    the archive). Either way ``image_sha256`` pins the installed bytes.
+    """
+
+    name: str                        # spec identity, e.g. "kata-3.32.0"
+    kernel: str                      # kernel version inside, e.g. "6.18.35"
+    url: str                         # Image (direct) or archive (.tar.zst)
+    image_sha256: str                # pin for the installed Image
+    member: str | None = None        # kernel's path inside the archive
+    archive_sha256: str | None = None  # pin for the archive
 
 
+# The pinned kernel is the Kata Containers release kernel, rehosted as
+# a dud release asset (18 MB direct download vs Kata's 664 MB static
+# tarball; provenance + GPL source pointers in the release notes).
 KERNELS: dict[str, KernelSpec] = {
     "arm64": KernelSpec(
         name="kata-3.32.0",
         kernel="6.18.35",
         url=(
-            "https://github.com/kata-containers/kata-containers/releases/"
-            "download/3.32.0/kata-static-3.32.0-arm64.tar.zst"
+            "https://github.com/ashenfad/dud/releases/download/"
+            "kernel-kata-3.32.0/Image-arm64-kata-3.32.0"
         ),
-        archive_sha256=(
-            "8736c054d9223974735394f822000823baef509e1c33405ec798240fa9b6e4b5"
-        ),
-        member="./opt/kata/share/kata-containers/vmlinux-6.18.35-197",
         image_sha256=(
             "f437320bab94f19105d12b932aa29735f0d54d2588218872254367f312c1027c"
         ),
@@ -96,14 +103,43 @@ def installed(arch: str, home: Path | None = None) -> KernelSpec | None:
 
 
 def _download(url: str, dest: Path, progress) -> None:
-    with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        done = 0
-        while chunk := r.read(1 << 20):
-            f.write(chunk)
-            done += len(chunk)
-            if progress and total:
-                progress(f"download {done // (1 << 20)}/{total // (1 << 20)} MiB")
+    try:
+        with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
+            total = int(r.headers.get("Content-Length") or 0)
+            done = 0
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(
+                        f"download {done // (1 << 20)}/{total // (1 << 20)} MiB"
+                    )
+    except urllib.error.URLError as e:
+        if _gh_download(url, dest):
+            return
+        raise KernelFetchError(f"download failed: {url}: {e}") from e
+
+
+def _gh_download(url: str, dest: Path) -> bool:
+    """Fetch a GitHub release asset via an authenticated ``gh`` CLI.
+
+    Anonymous downloads 404 while the repo is private; anyone with
+    ``gh`` access (i.e. the developers) still gets the asset. Quietly
+    declines when the URL isn't a release asset or ``gh`` is absent.
+    """
+    m = re.fullmatch(
+        r"https://github\.com/([^/]+/[^/]+)/releases/download/([^/]+)/([^/]+)",
+        url,
+    )
+    gh = shutil.which("gh")
+    if not m or not gh:
+        return False
+    proc = subprocess.run(
+        [gh, "release", "download", m[2], "-R", m[1], "-p", m[3],
+         "-O", str(dest), "--clobber"],
+        capture_output=True,
+    )
+    return proc.returncode == 0 and dest.is_file()
 
 
 def _sha256(path: Path) -> str:
@@ -166,19 +202,23 @@ def install(
 
     d.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=d) as tmp:
-        archive = Path(tmp) / "archive.tar.zst"
+        image = Path(tmp) / "Image"
         if progress:
             progress(f"fetching {spec.url}")
-        _download(spec.url, archive, progress)
-        got = _sha256(archive)
-        if got != spec.archive_sha256:
-            raise KernelFetchError(
-                f"archive digest mismatch: got {got}, want {spec.archive_sha256}"
-            )
-        if progress:
-            progress(f"extracting {spec.member}")
-        image = Path(tmp) / "Image"
-        _extract_member(archive, spec.member, image)
+        if spec.member is None:
+            _download(spec.url, image, progress)
+        else:
+            archive = Path(tmp) / "archive.tar.zst"
+            _download(spec.url, archive, progress)
+            got = _sha256(archive)
+            if got != spec.archive_sha256:
+                raise KernelFetchError(
+                    f"archive digest mismatch: got {got}, "
+                    f"want {spec.archive_sha256}"
+                )
+            if progress:
+                progress(f"extracting {spec.member}")
+            _extract_member(archive, spec.member, image)
         got = _sha256(image)
         if got != spec.image_sha256:
             raise KernelFetchError(

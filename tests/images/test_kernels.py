@@ -122,6 +122,72 @@ def test_unpinned_arch_raises(tmp_path):
         install("mips", home=tmp_path)
 
 
+def test_direct_download_spec_skips_extraction(tmp_path, monkeypatch):
+    """member=None: the URL is the Image itself — no archive, no zstd."""
+    spec = KernelSpec(
+        name="direct-1",
+        kernel="0.0",
+        url="https://example.invalid/Image",
+        image_sha256=hashlib.sha256(_KERNEL_BYTES).hexdigest(),
+    )
+    monkeypatch.setitem(kernels.KERNELS, "testarch", spec)
+    monkeypatch.setattr(
+        kernels, "_download",
+        lambda url, dest, progress: dest.write_bytes(_KERNEL_BYTES),
+    )
+    monkeypatch.setattr(
+        kernels, "_extract_member",
+        lambda *a: pytest.fail("direct spec must not extract"),
+    )
+    home = tmp_path / "home"
+    path = install("testarch", home=home)
+    assert path.read_bytes() == _KERNEL_BYTES
+    assert installed("testarch", home) == spec
+
+
+def test_direct_download_digest_mismatch_raises(tmp_path, monkeypatch):
+    spec = KernelSpec(
+        name="direct-1", kernel="0.0",
+        url="https://example.invalid/Image", image_sha256="0" * 64,
+    )
+    monkeypatch.setitem(kernels.KERNELS, "testarch", spec)
+    monkeypatch.setattr(
+        kernels, "_download",
+        lambda url, dest, progress: dest.write_bytes(_KERNEL_BYTES),
+    )
+    with pytest.raises(KernelFetchError, match="kernel digest"):
+        install("testarch", home=tmp_path / "home")
+
+
+def test_gh_download_declines_non_release_urls(tmp_path):
+    assert not kernels._gh_download("https://example.com/f", tmp_path / "f")
+    assert not kernels._gh_download(
+        "https://github.com/o/r/archive/main.tar.gz", tmp_path / "f"
+    )
+
+
+def test_download_falls_back_to_gh(tmp_path, monkeypatch):
+    """Anonymous 404 on a private release asset -> gh CLI path."""
+    url = "https://github.com/o/r/releases/download/tag/Image-x"
+
+    def anon_fails(*a, **k):
+        raise __import__("urllib.error", fromlist=["HTTPError"]).HTTPError(
+            url, 404, "Not Found", None, None
+        )
+
+    monkeypatch.setattr(kernels.urllib.request, "urlopen", anon_fails)
+
+    def fake_gh(u, dest):
+        assert u == url
+        dest.write_bytes(_KERNEL_BYTES)
+        return True
+
+    monkeypatch.setattr(kernels, "_gh_download", fake_gh)
+    dest = tmp_path / "Image"
+    kernels._download(url, dest, None)
+    assert dest.read_bytes() == _KERNEL_BYTES
+
+
 def _spec_replace(spec: KernelSpec, **overrides) -> KernelSpec:
     from dataclasses import asdict
 
