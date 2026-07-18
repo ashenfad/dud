@@ -92,6 +92,15 @@ def test_writes_resolve_through_absolute_symlink(make_layer):
     assert fs.nodes["usr/lib/x"].data == b"hi"
 
 
+def test_dir_entry_does_not_clobber_symlink(make_layer):
+    """A layer's ./lib dir entry keeps an existing lib -> usr/lib."""
+    l1 = make_layer("l1", dirs=["usr/lib"], symlinks={"lib": "usr/lib"})
+    l2 = make_layer("l2", dirs=["lib"], files={"lib/x": "hi"})
+    fs = rootfs.flatten_layers([l1, l2])
+    assert fs.nodes["lib"].data == b"usr/lib"  # still a symlink
+    assert fs.nodes["usr/lib/x"].data == b"hi"
+
+
 def test_symlink_loop_drops_entry(make_layer):
     l1 = make_layer("l1", symlinks={"a": "b", "b": "a"})
     l2 = make_layer("l2", files={"a/x": "hi"})

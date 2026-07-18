@@ -123,6 +123,13 @@ def _collect_entry(
 ) -> None:
     perm = m.mode & 0o7777
     if m.isdir():
+        existing = _lookup(fs, dst, path)
+        if existing is not None and is_symlink(existing.mode):
+            # A dir entry over an existing symlink keeps the symlink
+            # (tar semantics on merged-usr trees: ./sbin in a payload
+            # must not clobber sbin -> usr/sbin); descendants resolve
+            # through it via _resolve_parents.
+            return
         dst[path] = Node(mode=S_IFDIR | (perm or 0o755))
     elif m.issym():
         dst[path] = Node(mode=S_IFLNK | 0o777, data=m.linkname.encode())

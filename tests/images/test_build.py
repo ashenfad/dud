@@ -117,3 +117,48 @@ def test_build_layers_packages(tmp_path, stub_image, monkeypatch):
 def test_unknown_medium_rejected(tmp_path, stub_image):
     with pytest.raises(ValueError):
         buildmod.build("python:3.12-slim", home=tmp_path / "home", medium="btrfs")
+
+
+def test_fileset_tar_round_trips_modes_and_symlinks(tmp_path):
+    import io
+    import tarfile
+
+    from dud.images.builder import _fileset_tar
+    from dud.images.cpio import FileSet
+
+    fs = FileSet()
+    fs.add_file("usr/local/bin/tool", b"#!x", perm=0o755)
+    fs.add_file("etc/conf", b"c", perm=0o644)
+    fs.add_symlink("etc/rel", "conf")
+    fs.add_symlink("etc/abs", "/proc/self/mounts")  # absolute -> relative
+    tar = _fileset_tar(fs, prefix="src")
+    with tarfile.open(fileobj=io.BytesIO(tar)) as tf:
+        m = {i.name: i for i in tf.getmembers()}
+        assert m["src/usr/local/bin/tool"].mode & 0o111
+        assert m["src/etc/rel"].linkname == "conf"
+        assert m["src/etc/abs"].linkname == "../proc/self/mounts"
+        assert m["src/usr"].isdir()
+    # extraction-safe under the strict filter used by push_tree
+    with tarfile.open(fileobj=io.BytesIO(tar)) as tf:
+        tf.extractall(tmp_path, filter="data")
+    assert (tmp_path / "src/etc/conf").read_bytes() == b"c"
+
+
+def test_resolve_medium_auto(tmp_path):
+    from dud.images.builder import _resolve_medium
+
+    class Img:
+        def __init__(self, sizes):
+            self.layer_paths = []
+            for i, size in enumerate(sizes):
+                p = tmp_path / f"l{i}"
+                p.write_bytes(b"\0" * size)
+                self.layer_paths.append(p)
+
+    small = Img([10_000_000])
+    big = Img([90_000_000, 60_000_000])
+    assert _resolve_medium("auto", small, ()) == "initramfs"
+    assert _resolve_medium("auto", big, ()) == "erofs"
+    assert _resolve_medium("auto", small, ("pandas",)) == "erofs"
+    assert _resolve_medium("initramfs", big, ("pandas",)) == "initramfs"
+    assert _resolve_medium("erofs", small, ()) == "erofs"

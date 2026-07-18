@@ -83,17 +83,52 @@ the fetcher falls back to the authenticated `gh` CLI — making the repo
 public (already implied by the PyPI ship-track item) lets anonymous
 fetch just work.
 
-### 2. ext4 rootfs medium (demand-paged images)
+### 2. ~~erofs rootfs medium + self-hosted builder~~ shipped
+
+Wired end to end: `medium="erofs"` (or `"auto"`: packages present or
+base > 100 MB compressed → erofs) builds the fileset, bakes it inside
+a builder VM (slim + erofs-utils via pinned debs), and boots it as a
+demand-paged read-only root (`root=/dev/vda`; an empty initrd appeases
+vfkit's CLI flag-group; the kernel falls through to the block root).
+Each VM attaches a per-boot APFS CoW clone — VZ exclusively locks r/w
+attachments and vfkit's virtio-blk exposes no readOnly flag despite
+the VZ API having one (upstream PR opportunity; would also restore
+cross-VM page-cache sharing). Measured on the DS image, warm caches:
+boot 1.8 s → **0.9 s**, guest RAM at boot 600 MB → **79 MB**, after
+importing the full DS stack 636 MB → **167 MB**. Conformance: 56/56
+on both media. Studio still defaults to initramfs — flipping to
+`auto` is a one-arg decision bundled with the eager-warming work.
+Known ceiling: the self-hosted build transiently holds the fileset,
+its tar, the extracted guest tree, and the returned image (~several
+GB total for very large images) — fine at DS scale; streaming the
+push from disk and the virtiofs lowerdir both shrink it when needed.
+
+### (original notes)
 
 The DS initramfs costs ~400 MB of guest RAM per VM because the whole
 rootfs is RAM-resident. The medium seam is already in place
-(`meta.json` + spec hash + `_medium_boot_args`), so ext4-on-virtio-blk
-is additive: host page cache shared across VMs of the same image, RAM
-proportional to pages touched. Build strategy is the open question —
-no `mke2fs` on macOS; the self-hosting option (boot a dud VM, build
-the ext4 image *inside it*) is now viable and keeps the
-zero-host-dependency property. Size-based auto-selection (small →
-initramfs, big → ext4) once both exist.
+(`meta.json` + spec hash + `_medium_boot_args`), so a block-device
+medium is additive: host page cache shared across VMs of the same
+image, RAM proportional to pages touched.
+
+The format is **erofs, not ext4** (decided 2026-07-18): the root is
+immutable by thesis, and erofs is read-only *structurally* — no write
+path to misuse — smaller (compressed images stay page-cache-shared),
+built into the pinned kernel, and where the prior art converged
+(Kata/nydus/composefs). ext4's one differentiator, writability, is a
+non-goal; it re-enters only if a disk-backed *writable* layer is ever
+needed — additive through the same seam.
+
+Build strategy: **self-hosted** — no `mkfs.erofs` on macOS, so boot a
+dud VM whose image carries `erofs-utils` (guests have no network; the
+tool arrives via pinned-.deb layering, the wheels trick for system
+packages), push content in, build inside, pull the image back through
+the diff. One investment, three payouts: erofs rootfs images, frozen
+published-app workspace artifacts (the stage-6 read-only dispatch
+substrate — a VM fleet demand-paging one content-addressed file per
+app, immutability physical rather than procedural), and any future
+format without host tooling. Size-based auto-selection (small →
+initramfs, big → erofs) once both exist.
 
 ### 3. VM lifecycle hardening
 

@@ -111,6 +111,19 @@ def test_dir_replaced_by_file_and_back(session, tmp_path):
     assert d2.deletes == ["thing"]
 
 
+def test_symlink_shadowing_file_reports_delete(session, tmp_path):
+    """A symlink covering a pushed file hides it from the merged index:
+    both producers must report the delete (and no write — symlinks
+    don't round-trip in v0)."""
+    session.push_dir(_seed(tmp_path / "t", {
+        "data.txt": "d", "target.txt": "t",
+    }))
+    session.shell("ln -sf target.txt data.txt")
+    d = session.diff()
+    assert not d.writes
+    assert d.deletes == ["data.txt"]
+
+
 @pytest.mark.skipif(
     _BACKEND == "subprocess",
     reason="rung-1 documented gap: no fs isolation to enforce read-only",

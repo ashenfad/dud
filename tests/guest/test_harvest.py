@@ -161,3 +161,39 @@ def test_nested_opaque_within_opaque_no_double_deletes(tree):
     tree.opaque("a/b")
     writes, deletes = tree.harvest()
     assert writes == [] and deletes == ["a/b/deep.txt"]
+
+
+def _upper_symlink(tree, rel, target="wherever"):
+    p = tree.upper / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.symlink_to(target)
+
+
+def test_symlink_shadowing_lower_file_reports_delete(tree):
+    """scan-diff sees the lower file vanish from the merged index."""
+    tree.snap_file("data.txt")
+    _upper_symlink(tree, "data.txt")
+    writes, deletes = tree.harvest()
+    assert writes == [] and deletes == ["data.txt"]
+
+
+def test_symlink_shadowing_lower_dir_expands_deletes(tree):
+    tree.snap_file("d/a.txt")
+    tree.snap_file("d/b.txt")
+    _upper_symlink(tree, "d")
+    writes, deletes = tree.harvest()
+    assert writes == [] and deletes == ["d/a.txt", "d/b.txt"]
+
+
+def test_symlink_with_no_lower_counterpart_is_silent(tree):
+    _upper_symlink(tree, "fresh-link")
+    writes, deletes = tree.harvest()
+    assert writes == [] and deletes == []
+
+
+def test_symlink_over_lower_symlink_is_silent(tree):
+    """Lower symlinks were never in the baseline index — no delete."""
+    (tree.snap / "ln").symlink_to("a")
+    _upper_symlink(tree, "ln", "b")
+    writes, deletes = tree.harvest()
+    assert writes == [] and deletes == []

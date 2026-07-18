@@ -16,7 +16,8 @@ Boot facts settled by the stage-4 spikes (see DESIGN.md):
     pinned kernel has virtio-rng built in, so entropy is real — the
     old puipui kernel needed a ``PYTHONHASHSEED=0`` cmdline workaround.
   - rootfs medium comes from ``meta.json`` — only ``initramfs`` is wired;
-    ``ext4`` (virtio-blk) is the additive large-image path.
+    ``erofs`` (virtio-blk, read-only by construction) is the additive
+    large-image path.
 
 Requesting this rung where it can't run fails closed
 (:class:`IsolationUnavailable`) rather than silently degrading.
@@ -73,15 +74,52 @@ def _vfkit_bin() -> str:
     return exe
 
 
-def _medium_boot_args(rootfs_path: Path, medium: str) -> list[str]:
-    """VMM args that mount the rootfs, chosen by its medium."""
+def _medium_boot_args(rootfs_path: Path, medium: str, rundir: str) -> list[str]:
+    """VMM args that provide the rootfs, chosen by its medium."""
     if medium == "initramfs":
         return ["--initrd", str(rootfs_path)]
-    if medium == "ext4":  # additive scale path — builder can't emit it yet
-        raise IsolationUnavailable(
-            "ext4 rootfs boot is not wired yet; build with medium='initramfs'"
+    if medium == "erofs":
+        # First virtio-blk device: the kernel mounts it as / directly
+        # (see _medium_cmdline); demand-paged — RAM is pages touched,
+        # not image size. Each VM attaches a per-boot APFS clone
+        # (instant CoW, zero extra disk): VZ takes an exclusive lock on
+        # a read-write attachment, so concurrent VMs can't share one
+        # file — and vfkit's virtio-blk exposes no readOnly flag even
+        # though the VZ API has one (upstream opportunity; a readonly
+        # attach would also restore cross-VM page-cache sharing).
+        # The EMPTY initrd is a vfkit-CLI appeasement (its
+        # kernel/initrd/cmdline flags are an all-or-nothing group though
+        # VZ itself makes initrd optional); the kernel finds no /init in
+        # it and falls through to root=.
+        from ..images.cpio import FileSet, build_cpio_gz
+
+        clone = Path(rundir) / rootfs_path.name
+        # cp -c = APFS clonefile (instant CoW). Fall back to a real
+        # copy where the flag doesn't exist (GNU cp) or cloning fails
+        # (non-APFS volume) — correctness first, speed when available.
+        cloned = subprocess.run(
+            ["cp", "-c", str(rootfs_path), str(clone)],
+            capture_output=True,
         )
+        if cloned.returncode != 0:
+            shutil.copyfile(rootfs_path, clone)
+        dummy = Path(rundir) / "empty.cpio.gz"
+        dummy.write_bytes(build_cpio_gz(FileSet()))
+        return [
+            "--initrd", str(dummy),
+            "--device", f"virtio-blk,path={clone}",
+        ]
     raise IsolationUnavailable(f"unknown rootfs medium {medium!r}")
+
+
+def _medium_cmdline(medium: str) -> str:
+    """Extra kernel cmdline for the medium (appended to the dud.* set)."""
+    if medium == "erofs":
+        # rootwait: virtio-blk probes async; don't panic before /dev/vda.
+        # init=/init: on a real root the kernel would look for
+        # /sbin/init — our entrypoint keeps its initramfs name.
+        return " root=/dev/vda rootfstype=erofs ro rootwait init=/init"
+    return ""
 
 
 class VfkitSession(HostSession):
@@ -98,6 +136,9 @@ class VfkitSession(HostSession):
         home: str | Path | None = None,
         boot_timeout: float = 30.0,
         packages: list[str] | None = None,
+        debs: list[str] | None = None,
+        disks: list[str | Path] | None = None,
+        medium: str = "initramfs",
         host_objects: dict[str, Any] | None = None,
         allow: dict[str, set[str]] | None = None,
         cache: dict[str, bytes] | None = None,
@@ -106,6 +147,10 @@ class VfkitSession(HostSession):
         super().__init__(host_objects, allow, cache, on_emit)
         if platform.system() != "Darwin":
             raise IsolationUnavailable("vfkit rung requires macOS (HVF)")
+        for disk in disks or []:
+            # Validate up front: fail before any pull/build work is spent.
+            if not Path(disk).is_file():
+                raise IsolationUnavailable(f"disk image not found: {disk}")
         # Pooling hooks (see backends/pool.py): when a pool owns this VM,
         # close() parks it there instead of powering off; _pool_kwargs is
         # the boot fingerprint source. park_state (stamped by the owner
@@ -118,13 +163,16 @@ class VfkitSession(HostSession):
         self._pool_kwargs = {
             "image": image, "arch": arch, "workspace": workspace,
             "kernel": kernel, "memory_mib": memory_mib, "cpus": cpus,
-            "home": home, "packages": packages,
+            "home": home, "packages": packages, "debs": debs,
+            "disks": [str(d) for d in disks] if disks else None,
+            "medium": medium,
         }
         home = Path(home) if home else dud_home()
         arch = arch or _host_arch()
 
         self.build = build_rootfs(
-            image, arch=arch, workspace=workspace, home=home, packages=packages
+            image, arch=arch, workspace=workspace, home=home,
+            packages=packages, debs=debs, medium=medium,
         )
         kernel_path = _resolve_kernel(kernel, arch, home)
         vfkit = _vfkit_bin()
@@ -148,17 +196,24 @@ class VfkitSession(HostSession):
             f"console=hvc0 random.trust_cpu=on "
             f"dud.mode=connect dud.cid={_HOST_CID} dud.port={_VSOCK_PORT} "
             f"dud.root={workspace}"
-        )
+        ) + _medium_cmdline(self.build.medium)
         args = [
             vfkit, "--cpus", str(cpus), "--memory", str(memory_mib),
             "--kernel", str(kernel_path),
             "--kernel-cmdline", cmdline,
-            *_medium_boot_args(self.build.rootfs_path, self.build.medium),
+            *_medium_boot_args(self.build.rootfs_path, self.build.medium,
+                               self._rundir),
             "--device", "virtio-rng",
             "--device", f"virtio-serial,logFilePath={self._console}",
             "--device",
             f"virtio-vsock,port={_VSOCK_PORT},socketURL={self._sock_path}",
         ]
+        # Extra block devices (read-only artifacts: erofs workspace
+        # images, published-app snapshots). Guest order: extras follow
+        # the rootfs device — /dev/vda.. on initramfs, /dev/vdb.. when
+        # the root itself is a block device (erofs).
+        for disk in disks or []:
+            args += ["--device", f"virtio-blk,path={Path(disk)}"]
         self._vfkit_log = open(os.path.join(self._rundir, "vfkit.log"), "wb")
         self._proc = subprocess.Popen(args, stdout=self._vfkit_log,
                                       stderr=subprocess.STDOUT)

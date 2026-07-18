@@ -33,11 +33,12 @@ PIPELINE_VERSION = 1
 # Rootfs media the backend can boot. The medium is folded into the spec
 # hash so a threshold change can never serve a wrong-medium artifact, and
 # stamped into meta.json so the backend picks the vfkit device flags
-# without guessing. Only ``initramfs`` is built today; ``ext4`` (large
-# images, demand-paged from a virtio-blk disk) is the additive scale path.
+# without guessing. Only ``initramfs`` is built today; ``erofs`` (large
+# images, demand-paged read-only from a virtio-blk disk) is the additive
+# scale path, built by the self-hosted builder (a dud VM with erofs-utils).
 _MEDIUM_FILENAME = {
     "initramfs": "rootfs.cpio.gz",
-    "ext4": "rootfs.ext4",
+    "erofs": "rootfs.erofs",
 }
 
 
@@ -72,7 +73,8 @@ def _dud_code_hash() -> str:
 
 
 def _spec_hash(
-    digest: str, workspace: str, medium: str, packages: tuple[str, ...]
+    digest: str, workspace: str, medium: str, packages: tuple[str, ...],
+    debs: tuple[str, ...] = (),
 ) -> str:
     h = hashlib.sha256()
     h.update(f"v{PIPELINE_VERSION}\0".encode())
@@ -80,8 +82,31 @@ def _spec_hash(
     h.update(f"{workspace}\0".encode())
     h.update(f"{medium}\0".encode())
     h.update(("\0".join(packages) + "\0").encode())
+    if debs:
+        # Folded only when present so pre-debs cached specs stay valid.
+        # (Theoretical collision with a package literally named
+        # "debs:x" — unreachable with valid pip names; fold this
+        # unconditionally at the next PIPELINE_VERSION bump.)
+        h.update(("debs:" + "\0".join(debs) + "\0").encode())
     h.update(_dud_code_hash().encode())
     return h.hexdigest()[:24]
+
+
+# medium="auto" picks per image: small pure-slim images stay initramfs
+# (zero moving parts); anything with layered packages or a big base
+# goes erofs (demand-paged, page-cache shared). The threshold reads the
+# pulled layer blobs (compressed, on disk) — cheap and deterministic
+# per digest, so the choice is stable for a given spec.
+_AUTO_EROFS_LAYER_BYTES = 100 * 1024 * 1024
+
+
+def _resolve_medium(medium: str, image, packages: tuple[str, ...]) -> str:
+    if medium != "auto":
+        return medium
+    layer_bytes = sum(p.stat().st_size for p in image.layer_paths)
+    if packages or layer_bytes > _AUTO_EROFS_LAYER_BYTES:
+        return "erofs"
+    return "initramfs"
 
 
 def build(
@@ -92,21 +117,28 @@ def build(
     force: bool = False,
     medium: str = "initramfs",
     packages: list[str] | None = None,
+    debs: list[str] | None = None,
 ) -> RootfsBuild:
     """Produce (or reuse) a rootfs for ``ref`` in the requested medium.
 
     ``packages`` layers prebuilt guest-arch wheels into the image's
     ``site-packages`` (see :mod:`dud.images.wheels`) — e.g. the data
     stack a workspace needs but ``python:slim`` doesn't ship.
+    ``debs`` layers pinned system packages the same way (see
+    :mod:`dud.images.debs`) — e.g. erofs-utils for a builder VM.
+    ``medium="auto"`` resolves per image (see ``_resolve_medium``);
+    the RESOLVED medium is what enters the spec hash and meta.json.
     """
-    if medium not in _MEDIUM_FILENAME:
+    if medium not in _MEDIUM_FILENAME and medium != "auto":
         raise ValueError(f"unknown rootfs medium {medium!r}")
     pkgs = tuple(sorted(packages or ()))
+    deb_names = tuple(sorted(debs or ()))
     home = home or dud_home()
     reg = registry.Registry(home)
     image = reg.pull(ref, arch=arch)
     resolved_arch = arch or registry._host_arch()
-    spec = _spec_hash(image.digest, workspace, medium, pkgs)
+    medium = _resolve_medium(medium, image, pkgs)
+    spec = _spec_hash(image.digest, workspace, medium, pkgs, deb_names)
 
     out_dir = home / "images" / spec
     rootfs_path = out_dir / _MEDIUM_FILENAME[medium]
@@ -128,7 +160,9 @@ def build(
     fileset = rootfs.build_fileset(image, workspace=workspace)
     if pkgs:
         _layer_packages(fileset, list(pkgs), resolved_arch)
-    data = _serialize(fileset, medium)
+    if deb_names:
+        _layer_debs(fileset, list(deb_names), resolved_arch, home)
+    data = _serialize(fileset, medium, home, resolved_arch)
     tmp = rootfs_path.with_suffix(".part")
     tmp.write_bytes(data)
     tmp.rename(rootfs_path)
@@ -140,6 +174,7 @@ def build(
         "medium": medium,
         "artifact": _MEDIUM_FILENAME[medium],
         "packages": list(pkgs),
+        "debs": list(deb_names),
         "env": result.env,
         "workdir": result.workdir,
         "pipeline_version": PIPELINE_VERSION,
@@ -160,16 +195,105 @@ def _layer_packages(fileset, packages: list[str], arch: str) -> None:
         wheels.add_target_tree(fileset, Path(td), site)
 
 
-def _serialize(fileset, medium: str) -> bytes:
+def _layer_debs(fileset, names: list[str], arch: str, home: Path) -> None:
+    """Fetch pinned debs and fold their payloads into the tree."""
+    from . import debs as debs_mod
+
+    for name in names:
+        spec = debs_mod.deb_spec(name, arch)
+        debs_mod.add_deb_tree(fileset, debs_mod.fetch_deb(spec, home))
+
+
+def _serialize(fileset, medium: str, home: Path, arch: str) -> bytes:
     if medium == "initramfs":
         from .cpio import build_cpio_gz
 
         return build_cpio_gz(fileset)
-    # ext4 needs a userspace image builder (e2fsprogs mke2fs -d, or a Linux
-    # helper VM) and is the scale path for large images — not wired yet.
-    raise NotImplementedError(
-        f"medium {medium!r} is not implemented; only 'initramfs' builds today"
+    if medium == "erofs":
+        return _build_erofs(fileset, home, arch)
+    raise NotImplementedError(f"medium {medium!r} is not implemented")
+
+
+# The erofs builder VM is itself a cached initramfs spec (slim +
+# erofs-utils via the pinned-deb layer) — built once ever, booted per
+# erofs build. No recursion: the builder never needs an erofs root.
+_BUILDER_IMAGE = "python:3.12-slim"
+
+
+def _build_erofs(fileset, home: Path, arch: str) -> bytes:
+    """Self-hosted mkfs: no mkfs.erofs on macOS, so build inside a VM."""
+    import platform
+
+    if platform.system() != "Darwin":  # pragma: no cover - future rungs
+        raise NotImplementedError(
+            "erofs builds currently require the vfkit builder VM (macOS)"
+        )
+    from ..backends.vfkit import VfkitSession  # lazy: circular import
+
+    tar = _fileset_tar(fileset, prefix="src")
+    # Content lands on the guest's workspace tmpfs (lower) and the
+    # image accumulates in the upper: size the VM for both plus slack.
+    mem = max(2048, (len(tar) >> 20) * 3 + 1024)
+    session = VfkitSession(
+        image=_BUILDER_IMAGE, arch=arch, home=home,
+        debs=["erofs-utils"], memory_mib=mem,
     )
+    try:
+        session.push_tree(tar)
+        r = session.shell(
+            "mkfs.erofs -zlz4 -T0 rootfs.erofs src/", timeout=600.0
+        )
+        if r.exit_code != 0:
+            raise RuntimeError(f"mkfs.erofs failed:\n{r.transcript}")
+        return session.diff().writes["rootfs.erofs"]
+    finally:
+        session.close()
+
+
+def _fileset_tar(fileset, prefix: str) -> bytes:
+    """Serialize a FileSet as a tar under ``prefix/``, extraction-safe.
+
+    Absolute symlink targets are rewritten relative: at runtime inside
+    the image they resolve identically, and it keeps the tar acceptable
+    to tarfile's ``data`` filter (which rejects absolute link targets)
+    on the builder-VM push path.
+
+    Known divergence from the cpio path: that same ``data`` filter
+    strips setuid/setgid/sticky bits at extraction, so an erofs image's
+    ``su``-style binaries lose them while an initramfs keeps exact
+    modes. Irrelevant while guests run everything as root; revisit if a
+    non-root guest model ever appears.
+    """
+    import io
+    import posixpath
+    import tarfile
+
+    from .cpio import is_dir, is_symlink
+
+    fileset.ensure_parents()
+    buf = io.BytesIO()
+    ordered = sorted(fileset.nodes.items(),
+                     key=lambda kv: (kv[0].count("/"), kv[0]))
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for path, node in ordered:
+            info = tarfile.TarInfo(f"{prefix}/{path}")
+            info.mode = node.mode & 0o7777
+            if is_dir(node.mode):
+                info.type = tarfile.DIRTYPE
+                tf.addfile(info)
+            elif is_symlink(node.mode):
+                target = node.data.decode()
+                if target.startswith("/"):
+                    target = posixpath.relpath(
+                        target.lstrip("/"), posixpath.dirname(path) or "."
+                    )
+                info.type = tarfile.SYMTYPE
+                info.linkname = target
+                tf.addfile(info)
+            else:
+                info.size = len(node.data)
+                tf.addfile(info, io.BytesIO(node.data))
+    return buf.getvalue()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -178,14 +302,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--arch", default=None, help="linux arch (default: host)")
     ap.add_argument("--workspace", default="/workspace")
     ap.add_argument("--medium", default="initramfs",
-                    choices=sorted(_MEDIUM_FILENAME), help="rootfs medium")
+                    choices=sorted(_MEDIUM_FILENAME) + ["auto"],
+                    help="rootfs medium (auto: pick by image size/packages)")
     ap.add_argument("--package", action="append", default=[], metavar="PKG",
                     help="pip package to layer in (repeatable)")
+    ap.add_argument("--deb", action="append", default=[], metavar="NAME",
+                    help="pinned system package to layer in (repeatable)")
     ap.add_argument("--force", action="store_true", help="rebuild even if cached")
     args = ap.parse_args(argv)
 
     r = build(args.ref, arch=args.arch, workspace=args.workspace,
-              force=args.force, medium=args.medium, packages=args.package)
+              force=args.force, medium=args.medium, packages=args.package,
+              debs=args.deb)
     size_mb = r.rootfs_path.stat().st_size / 1e6
     print(f"ref     {r.ref}")
     print(f"digest  {r.digest}")

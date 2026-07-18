@@ -137,7 +137,13 @@ def harvest(
       - a copied-up file whose content equals the snapshot's is NOT a
         write (overlay copies up on metadata-only touches);
       - ignore rules (__pycache__, *.pyc/pyo) apply to both sides;
-      - symlinks and empty dirs don't round-trip (diffscan v0 parity).
+      - symlinks and empty dirs don't round-trip (diffscan v0 parity) —
+        but an upper symlink SHADOWING lower content still deletes it
+        (scan-diff sees the lower file vanish from the merged index);
+      - the walk assumes a quiescent tree: the supervisor is single-
+        threaded and diff runs between execs. A background guest
+        process writing mid-diff could tear the observation — exactly
+        as it could under scan-diff, so parity holds even in the race.
 
     ``is_whiteout`` / ``is_opaque`` are injectable for host-side tests
     (real whiteouts need mknod; real opaque marks need trusted xattrs).
@@ -145,6 +151,7 @@ def harvest(
     upper_files: dict[str, Path] = {}
     whiteouts: list[str] = []
     opaques: list[str] = []
+    shadows: list[str] = []  # upper symlinks covering lower content
 
     def walk(rel_dir: str, in_opaque: bool) -> None:
         for entry in os.scandir(upper / rel_dir if rel_dir else upper):
@@ -165,7 +172,14 @@ def harvest(
             elif stat.S_ISREG(st.st_mode):
                 if not entry.name.endswith(_IGNORE_SUFFIXES):
                     upper_files[rel] = Path(entry.path)
-            # symlinks / other node types: skipped (v0 parity)
+            elif stat.S_ISLNK(st.st_mode):
+                # Symlinks don't round-trip (v0), but one that covers
+                # lower content still hides it from the merged index —
+                # scan-diff would report the delete, so must we.
+                # (Opaque scopes handle their own hidden lowers.)
+                if not in_opaque:
+                    shadows.append(rel)
+            # other node types: skipped (v0 parity)
 
     walk("", False)
 
@@ -180,11 +194,11 @@ def harvest(
             # dir -> file transition: the whiteout was consumed by the
             # replacing entry, but the lower dir's files are still gone.
             deletes.update(_files_under(lower, rel))
-    for rel in whiteouts:
+    for rel in whiteouts + shadows:
         target = snap / rel
-        if target.is_dir():
+        if target.is_dir() and not target.is_symlink():
             deletes.update(_files_under(target, rel))
-        elif target.is_file():
+        elif target.is_file() and not target.is_symlink():
             if not rel.endswith(_IGNORE_SUFFIXES):
                 deletes.add(rel)
     for rel in opaques:
@@ -322,32 +336,12 @@ class OverlayStage:
         tar = diffscan.make_tar(self.work, writes)  # merged view has truth
         if rebase:
             _umount(self.work)
-            self._replay(self.upper, self.snap)
+            replay(self.upper, self.snap)
             for d in (self.upper, self.ovlwork):
                 shutil.rmtree(d, ignore_errors=True)
                 d.mkdir()
             self._mount_overlay()
         return writes, deletes, tar
-
-    def _replay(self, udir: Path, sdir: Path) -> None:
-        """Fold the upper into the snapshot, exactly as overlay merges:
-        whiteouts delete, opaque dirs replace, files copy up. Runs only
-        while unmounted. This IS rebase — baseline := merged view."""
-        for entry in os.scandir(udir):
-            spath = sdir / entry.name
-            st = entry.stat(follow_symlinks=False)
-            if stat.S_ISDIR(st.st_mode):
-                if _is_opaque(Path(entry.path)) or spath.is_file():
-                    _rmtree_or_unlink(spath)
-                spath.mkdir(exist_ok=True)
-                self._replay(Path(entry.path), spath)
-            elif _is_whiteout(Path(entry.path), st):
-                _rmtree_or_unlink(spath)
-            elif stat.S_ISREG(st.st_mode):
-                if spath.is_dir():
-                    _rmtree_or_unlink(spath)
-                shutil.copy2(entry.path, spath)
-            # symlinks/others: not part of the contract (v0)
 
     def reset_stage(self) -> None:
         self._refresh(clear_snap=False)
@@ -359,11 +353,52 @@ class OverlayStage:
     @contextmanager
     def readonly(self):
         """A true read-only workspace window (view execs)."""
-        _remount(self.work, readonly=True)
+        try:
+            _remount(self.work, readonly=True)
+        except StageError as e:
+            if e.errno == errno.EBUSY:
+                # Fail loud but point at the likely culprit: EBUSY here
+                # almost always means a stray guest process (from an
+                # earlier shell()) holds a writable fd in the workspace.
+                raise StageError(
+                    e.errno,
+                    f"{e.strerror}: cannot remount workspace read-only — "
+                    f"a process may hold a writable fd in it",
+                ) from e
+            raise
         try:
             yield
         finally:
             _remount(self.work, readonly=False)
+
+
+def replay(
+    udir: Path,
+    sdir: Path,
+    is_whiteout=_is_whiteout,
+    is_opaque=_is_opaque,
+) -> None:
+    """Fold an upperdir into the snapshot, exactly as overlay merges:
+    whiteouts delete, opaque dirs replace, files copy up. Runs only
+    while unmounted. This IS rebase — baseline := merged view.
+
+    Predicates are injectable for host-side tests, same as harvest.
+    """
+    for entry in os.scandir(udir):
+        spath = sdir / entry.name
+        st = entry.stat(follow_symlinks=False)
+        if stat.S_ISDIR(st.st_mode):
+            if is_opaque(Path(entry.path)) or spath.is_file():
+                _rmtree_or_unlink(spath)
+            spath.mkdir(exist_ok=True)
+            replay(Path(entry.path), spath, is_whiteout, is_opaque)
+        elif is_whiteout(Path(entry.path), st):
+            _rmtree_or_unlink(spath)
+        elif stat.S_ISREG(st.st_mode):
+            if spath.is_dir():
+                _rmtree_or_unlink(spath)
+            shutil.copy2(entry.path, spath)
+        # symlinks/others: not part of the contract (v0)
 
 
 def _rmtree_or_unlink(p: Path) -> None:
@@ -375,4 +410,21 @@ def _rmtree_or_unlink(p: Path) -> None:
 
 def make_stage(root: Path):
     """The best staging this environment supports."""
-    return OverlayStage.try_create(root) or ScanStage(root)
+    stage = OverlayStage.try_create(root)
+    if stage is not None:
+        return stage
+    try:
+        return ScanStage(root)
+    except OSError as e:
+        if e.errno == errno.EROFS:
+            # An erofs root is only writable through the overlay tmpfs.
+            # Landing here means overlay staging failed (its reason was
+            # already logged to the console by try_create) — name the
+            # situation instead of dying as PID 1 with a raw traceback.
+            raise StageError(
+                errno.EROFS,
+                "workspace root is read-only (erofs root) and overlay "
+                "staging is unavailable — see earlier console line for "
+                "the overlay failure; the VM cannot stage without it",
+            ) from e
+        raise

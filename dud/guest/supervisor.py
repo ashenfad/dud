@@ -111,13 +111,28 @@ class Supervisor:
         if os.getpid() == 1:  # VM rung only: we own the machine
             # Kill strays BEFORE touching the trees — a leftover daemon
             # with its cwd inside the workspace would pin the overlay
-            # mount we're about to cycle.
-            for entry in os.listdir("/proc"):
-                if entry.isdigit() and entry != "1":
+            # mount we're about to cycle. SIGKILL is async, so wait for
+            # the machine to actually be ours again: reap everything
+            # that reparented to us (we're PID 1 — unreaped strays
+            # would accumulate as zombies for the life of a pooled VM)
+            # and re-scan /proc, bounded, until only PID 1 remains.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                others = [e for e in os.listdir("/proc")
+                          if e.isdigit() and e != "1"]
+                for entry in others:
                     try:
                         os.kill(int(entry), signal.SIGKILL)
                     except (ProcessLookupError, PermissionError):
                         pass
+                try:
+                    while os.waitpid(-1, os.WNOHANG) != (0, 0):
+                        pass
+                except ChildProcessError:
+                    pass
+                if not others:
+                    break
+                time.sleep(0.02)
         self.stage.reset_guest(bool(body.get("keep_tree")))
         self.shell = ShellState(cwd=str(self.work), env=dict(self._boot_env))
         return {}, []

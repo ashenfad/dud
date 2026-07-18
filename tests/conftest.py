@@ -14,6 +14,9 @@ def _new_session(**kwargs):
     backend = os.environ.get("DUD_BACKEND", "subprocess")
     if backend == "vfkit":
         from dud.backends.vfkit import VfkitSession
+        # DUD_MEDIUM lets the same corpus run against an erofs root
+        # (DUD_BACKEND=vfkit DUD_MEDIUM=erofs uv run pytest tests/conformance)
+        kwargs.setdefault("medium", os.environ.get("DUD_MEDIUM", "initramfs"))
         return VfkitSession(**kwargs)
     if backend == "subprocess":
         from dud import Session
