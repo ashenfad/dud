@@ -85,7 +85,7 @@ class VmPool:
         while True:
             matched = False
             with self._lock:
-                self._expire_locked()
+                stale = self._expire_locked()
                 bucket = self._idle.get(key) or []
                 parked = None
                 if bucket:
@@ -97,6 +97,8 @@ class VmPool:
                                 break
                     if parked is None:
                         parked = bucket.pop()  # oldest first
+            for s in stale:
+                self._teardown(s)
             if parked is None:
                 self._maybe_refill(key)  # replace what we're about to boot
                 session = VfkitSession(**kwargs)
@@ -189,13 +191,15 @@ class VmPool:
             return
         key = _fingerprint(session._pool_kwargs)
         with self._lock:
-            self._expire_locked()
+            stale = self._expire_locked()
             bucket = self._idle.setdefault(key, [])
             bucket.insert(0, (time.monotonic(), state, session))
             limit = max(self.max_idle, self._targets.get(key, (0, None))[0])
             overflow = bucket[limit:]
             del bucket[limit:]
         for _, _, s in overflow:
+            self._teardown(s)
+        for s in stale:
             self._teardown(s)
 
     def close(self) -> None:
@@ -226,7 +230,10 @@ class VmPool:
         except Exception:
             pass
 
-    def _expire_locked(self) -> None:
+    def _expire_locked(self) -> list[VfkitSession]:
+        """Prune expired idle VMs; returns them for the CALLER to tear
+        down after releasing the lock — close() does channel I/O and can
+        wait seconds, which must not stall every acquire/release."""
         cutoff = time.monotonic() - self.ttl
         expired = []
         for key, bucket in self._idle.items():
@@ -241,11 +248,7 @@ class VmPool:
                 )
             expired.extend(s for _, _, s in stale)
             self._idle[key] = keep
-        if expired:
-            # teardown outside the lock is nicer, but expiry is rare and
-            # close() only touches the session's own resources
-            for s in expired:
-                self._teardown(s)
+        return expired
 
 
 _shared: VmPool | None = None

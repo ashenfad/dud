@@ -23,6 +23,7 @@ def make_layer(tmp_path):
         files: dict[str, bytes | str] | None = None,
         dirs: list[str] | None = None,
         symlinks: dict[str, str] | None = None,
+        hardlinks: dict[str, str] | None = None,
         whiteouts: list[str] | None = None,
     ) -> Path:
         buf = io.BytesIO()
@@ -41,6 +42,11 @@ def make_layer(tmp_path):
             for link, target in (symlinks or {}).items():
                 info = tarfile.TarInfo(link)
                 info.type = tarfile.SYMTYPE
+                info.linkname = target
+                tf.addfile(info)
+            for link, target in (hardlinks or {}).items():
+                info = tarfile.TarInfo(link)
+                info.type = tarfile.LNKTYPE
                 info.linkname = target
                 tf.addfile(info)
             for wh in whiteouts or []:

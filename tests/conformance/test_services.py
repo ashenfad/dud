@@ -35,6 +35,29 @@ def test_cache_delete(session):
     assert r.outputs["hit"] is False
 
 
+def test_cache_read_is_not_a_write(make_session):
+    """Merely reading a key must not ship it back as a cache write."""
+    class CountingCache(dict):
+        def __init__(self):
+            super().__init__()
+            self.sets = 0
+
+        def __setitem__(self, key, value):
+            self.sets += 1
+            super().__setitem__(key, value)
+
+    cache = CountingCache()
+    with make_session(cache=cache) as s:
+        s.python("cache['seed'] = [1, 2, 3]")
+        writes_after_seed = cache.sets
+        s.python("total = sum(cache['seed'])")
+        assert cache.sets == writes_after_seed  # read-only exec: no churn
+        s.python("cache['seed'].append(4)")  # in-place mutation still lands
+        r = s.python("four = cache['seed'][-1]")
+        assert r.outputs["four"] == 4
+        assert cache.sets > writes_after_seed
+
+
 def test_cache_readonly_blocks_writes(make_session):
     with make_session() as s:
         s.python("cache['seed'] = 1")

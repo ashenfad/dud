@@ -105,6 +105,58 @@ def test_pull_with_no_cache_propagates_registry_error(tmp_path, monkeypatch):
         reg.pull("python:3.12-slim", arch="arm64")
 
 
+class _FakeResponse:
+    def __init__(self, raw: bytes):
+        self._raw = raw
+
+    def read(self) -> bytes:
+        return self._raw
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_manifest_by_digest_verifies_bytes(tmp_path, monkeypatch):
+    reg = Registry(tmp_path)
+    monkeypatch.setattr(
+        Registry, "_get", lambda self, r, p, a: _FakeResponse(b"{}")
+    )
+    ref = ImageRef.parse("python:3.12-slim")
+    with pytest.raises(RegistryError, match="manifest digest mismatch"):
+        reg._manifest(ref, "sha256:" + "0" * 64)
+
+
+def test_expired_token_retried_once_with_fresh_auth(tmp_path, monkeypatch):
+    import io
+    import urllib.error
+
+    reg = Registry(tmp_path)
+    reg._tokens["library/python"] = "stale"
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append(req.get_header("Authorization"))
+        if len(calls) == 1:
+            raise urllib.error.HTTPError(
+                req.full_url, 401, "Unauthorized", None, None
+            )
+        return io.BytesIO(b"ok")
+
+    monkeypatch.setattr(
+        "dud.images.registry.urllib.request.urlopen", fake_urlopen
+    )
+    monkeypatch.setattr(Registry, "_token", lambda self, r: (
+        "stale" if not calls else "fresh"
+    ))
+    ref = ImageRef.parse("python:3.12-slim")
+    resp = reg._get(ref, "blobs/sha256:abc", "*/*")
+    assert resp.read() == b"ok"
+    assert calls == ["Bearer stale", "Bearer fresh"]
+
+
 def test_pull_cache_is_per_arch(tmp_path, monkeypatch):
     reg = Registry(tmp_path)
     manifest = _fake_manifest(reg)

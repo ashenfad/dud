@@ -175,9 +175,15 @@ class VfkitSession(HostSession):
             return conn
         except (socketlib.timeout, OSError) as e:
             self._teardown_vm()
+            tail = self._console_tail()  # read before the rundir goes away
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+            shutil.rmtree(self._rundir, ignore_errors=True)
             raise IsolationUnavailable(
                 f"guest did not connect within {timeout}s ({e}); console tail:\n"
-                + self._console_tail()
+                + tail
             )
 
     def _console_tail(self, n: int = 25) -> str:

@@ -80,3 +80,13 @@ def test_gz_is_deterministic():
     fs = FileSet()
     fs.add_file("a.txt", b"hello")
     assert build_cpio_gz(fs) == build_cpio_gz(fs)
+
+
+def test_symlinked_parent_with_children_fails_loudly():
+    import pytest
+
+    fs = FileSet()
+    fs.add_symlink("lib", "usr/lib")
+    fs.add_file("lib/foo", b"x")  # should have been resolved upstream
+    with pytest.raises(ValueError, match="symlinked dir"):
+        build_cpio(fs)

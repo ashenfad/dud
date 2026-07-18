@@ -53,8 +53,72 @@ def test_inject_dud_targets_site_packages(make_layer):
     assert key in fs.nodes and fs.nodes[key].data
 
 
-def test_build_fileset_adds_init_and_workspace(make_layer):
+def test_hardlink_same_layer_adopts_contents(make_layer):
+    l1 = make_layer("l1", files={"a/orig": "data"},
+                    hardlinks={"a/link": "a/orig"})
+    fs = rootfs.flatten_layers([l1])
+    assert fs.nodes["a/link"].data == b"data"
+
+
+def test_hardlink_across_layers_adopts_lower_contents(make_layer):
+    l1 = make_layer("l1", files={"a/orig": "lower-data"})
+    l2 = make_layer("l2", hardlinks={"a/link": "a/orig"})
+    fs = rootfs.flatten_layers([l1, l2])
+    assert fs.nodes["a/link"].data == b"lower-data"
+
+
+def test_hardlink_missing_target_fails_loudly(make_layer):
+    import pytest
+
+    l1 = make_layer("l1", hardlinks={"a/link": "not/there"})
+    with pytest.raises(ValueError, match="target not found"):
+        rootfs.flatten_layers([l1])
+
+
+def test_writes_resolve_through_symlinked_parents(make_layer):
+    """merged-usr shape: lib -> usr/lib, later layer writes lib/foo."""
+    l1 = make_layer("l1", dirs=["usr/lib"], symlinks={"lib": "usr/lib"})
+    l2 = make_layer("l2", files={"lib/foo/x": "hi"})
+    fs = rootfs.flatten_layers([l1, l2])
+    assert fs.nodes["usr/lib/foo/x"].data == b"hi"
+    assert "lib/foo/x" not in fs.nodes
+    assert fs.nodes["lib"].data == b"usr/lib"  # symlink untouched
+
+
+def test_writes_resolve_through_absolute_symlink(make_layer):
+    l1 = make_layer("l1", dirs=["usr/lib"], symlinks={"lib": "/usr/lib"})
+    l2 = make_layer("l2", files={"lib/x": "hi"})
+    fs = rootfs.flatten_layers([l1, l2])
+    assert fs.nodes["usr/lib/x"].data == b"hi"
+
+
+def test_symlink_loop_drops_entry(make_layer):
+    l1 = make_layer("l1", symlinks={"a": "b", "b": "a"})
+    l2 = make_layer("l2", files={"a/x": "hi"})
+    fs = rootfs.flatten_layers([l1, l2])
+    assert not any(k.endswith("/x") for k in fs.nodes)
+
+
+def test_build_fileset_requires_interpreter(make_layer):
+    import pytest
+
+    from dud.images.registry import PulledImage, ImageRef
+
     l1 = make_layer("l1", dirs=["usr/local/lib/python3.12/site-packages"])
+    img = PulledImage(
+        ref=ImageRef.parse("python:3.12-slim"),
+        digest="sha256:deadbeef", config={}, layer_paths=[l1],
+    )
+    with pytest.raises(ValueError, match="no /usr/local/bin/python3"):
+        rootfs.build_fileset(img)
+
+
+def test_build_fileset_adds_init_and_workspace(make_layer):
+    l1 = make_layer(
+        "l1",
+        dirs=["usr/local/lib/python3.12/site-packages"],
+        files={"usr/local/bin/python3": b"\x7fELF"},
+    )
     from dud.images.registry import PulledImage, ImageRef
 
     img = PulledImage(

@@ -21,6 +21,15 @@ from dataclasses import dataclass, field
 S_IFDIR = 0o040000
 S_IFREG = 0o100000
 S_IFLNK = 0o120000
+_S_IFMT = 0o170000
+
+
+def is_dir(mode: int) -> bool:
+    return mode & _S_IFMT == S_IFDIR
+
+
+def is_symlink(mode: int) -> bool:
+    return mode & _S_IFMT == S_IFLNK
 
 
 @dataclass
@@ -74,7 +83,16 @@ class FileSet:
         for d in needed:
             if d not in self.nodes:
                 self.nodes[d] = Node(mode=S_IFDIR | 0o755)
-            elif not self.nodes[d].mode & S_IFDIR:
+            elif is_symlink(self.nodes[d].mode):
+                # A symlink with children means layer application failed
+                # to resolve writes through it (or a later layer replaced
+                # a populated dir with a symlink). Silently converting it
+                # to a real dir would break e.g. merged-usr root symlinks
+                # — fail loudly instead.
+                raise ValueError(
+                    f"symlinked dir {d!r} has children; cannot emit cpio"
+                )
+            elif not is_dir(self.nodes[d].mode):
                 # A file shadows a needed dir path — the dir wins (a later
                 # layer turned a file into a directory).
                 self.nodes[d] = Node(mode=S_IFDIR | 0o755)
@@ -91,14 +109,14 @@ def _pad4(buf: io.BytesIO) -> None:
 
 def _entry(buf: io.BytesIO, ino: int, name: str, node: Node) -> None:
     name_bytes = name.encode() + b"\x00"
-    is_dir = bool(node.mode & S_IFDIR)
+    entry_is_dir = is_dir(node.mode)
     header = (
         b"070701"
         + _field(ino)
         + _field(node.mode)
         + _field(node.uid)
         + _field(node.gid)
-        + _field(2 if is_dir else 1)  # nlink
+        + _field(2 if entry_is_dir else 1)  # nlink
         + _field(node.mtime)
         + _field(len(node.data))
         + _field(0) + _field(0)       # devmajor, devminor

@@ -50,8 +50,18 @@ class Session(HostSession):
             env=dict(os.environ),
         )
         child.close()
-        self._ch = Channel(parent, handler=self._handle)
-        self._ch.hello_recv()
+        try:
+            self._ch = Channel(parent, handler=self._handle)
+            self._ch.hello_recv()
+        except Exception:
+            # Ctor failure (e.g. proto version mismatch) must not leave
+            # an orphaned supervisor child behind.
+            self._proc.kill()
+            self._proc.wait(timeout=5)
+            parent.close()
+            if self._tmp is not None:
+                self._tmp.cleanup()
+            raise
 
     def close(self) -> None:
         if self._closed:

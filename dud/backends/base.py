@@ -16,13 +16,26 @@ from __future__ import annotations
 
 import base64
 import io
+import posixpath
 import tarfile
 from pathlib import Path
 from typing import Any, Callable
 
-from ..proto import Channel
+from ..proto import Channel, ProtocolError
 from ..results import Diff, ExecError, PythonResult, ShellResult
 from ..values import decode_map, decode_value, encode_value
+
+
+def _safe_diff_path(name: str) -> str:
+    """Normalize a guest-supplied diff path; fail loud on escapes.
+
+    Diff keys flow into consumer stores and filesystems — making the
+    wire shape trustworthy here beats re-checking it in every consumer.
+    """
+    p = posixpath.normpath(name).lstrip("/")
+    if p in ("", ".", "..") or p.startswith("../"):
+        raise ProtocolError(f"guest diff path escapes the workspace: {name!r}")
+    return p
 
 
 class HostSession:
@@ -34,7 +47,10 @@ class HostSession:
       hostcall. ``allow`` maps name -> permitted method names (default:
       all public callables — rung-1 cooperative posture).
     - ``on_emit``: callback(name, value) for guest emits; also collected
-      in ``self.emits``.
+      in ``self.emits``. Emits are *events*, not state: they arrive live
+      mid-exec and are kept even when the exec later fails — unlike
+      cache writes, which roll back. Consumers must not assume
+      checkpoint atomicity for emits.
     """
 
     _ch: Channel
@@ -163,8 +179,9 @@ class HostSession:
                     if member.isfile():
                         f = tf.extractfile(member)
                         if f is not None:
-                            writes[member.name] = f.read()
-        return Diff(writes=writes, deletes=list(body.get("deletes", [])))
+                            writes[_safe_diff_path(member.name)] = f.read()
+        deletes = [_safe_diff_path(d) for d in body.get("deletes", [])]
+        return Diff(writes=writes, deletes=deletes)
 
     def reset(self) -> None:
         self._ch.request("reset_stage")

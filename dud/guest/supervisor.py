@@ -200,11 +200,18 @@ class Supervisor:
                 return msg.get("body", {})
 
     def _crash_result(self, proc) -> dict:
+        # The ChannelClosed path arrives here without ever polling, so
+        # give the exit status a moment to land before reporting it.
+        try:
+            proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            pass
+        code = proc.returncode if proc.returncode is not None else "(unreaped)"
         return {
             "ok": False, "transcript": "", "prints": [],
             "outputs": {}, "outputs_skipped": {},
             "error": {"etype": "RunnerCrash",
-                      "message": f"runner exited {proc.returncode} without a result"},
+                      "message": f"runner exited {code} without a result"},
         }
 
     def _kill(self, proc) -> None:

@@ -52,6 +52,7 @@ class CacheView(MutableMapping):
         self._ch = channel
         self._readonly = readonly
         self._local: dict[str, Any] = {}
+        self._fetched: dict[str, bytes] = {}  # pickle bytes as read
         self._deleted: set[str] = set()
         self._known_missing: set[str] = set()
 
@@ -64,8 +65,10 @@ class CacheView(MutableMapping):
         if not body.get("hit"):
             self._known_missing.add(key)
             raise KeyError(key)
-        value = pickle.loads(base64.b64decode(body["b64"]))
+        raw = base64.b64decode(body["b64"])
+        value = pickle.loads(raw)
         self._local[key] = value
+        self._fetched[key] = raw
         return value
 
     def __setitem__(self, key: str, value: Any) -> None:
@@ -99,12 +102,18 @@ class CacheView(MutableMapping):
         return sum(1 for _ in self)
 
     def flush(self) -> tuple[dict[str, str], list[str]]:
-        """(writes as b64 pickles, deletes) for the result payload."""
+        """(writes as b64 pickles, deletes) for the result payload.
+
+        Keys that were only read ship back only if their re-pickled
+        bytes differ from what was fetched — that keeps in-place
+        mutation capture (``cache["x"].append(...)``) without turning
+        every read into a spurious write upstream.
+        """
         writes = {}
         for k, v in self._local.items():
-            writes[k] = base64.b64encode(
-                pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
-            ).decode()
+            raw = pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
+            if self._fetched.get(k) != raw:
+                writes[k] = base64.b64encode(raw).decode()
         return writes, sorted(self._deleted)
 
 
@@ -335,7 +344,15 @@ def main() -> None:
 
     # Single request lifecycle: read the run request, execute, respond.
     msg, _bins = channel._recv_msg()
-    assert msg.get("kind") == "req" and msg.get("verb") == "run"
+    if msg.get("kind") != "req" or msg.get("verb") != "run":
+        # Not an assert: protocol validation must survive python -O.
+        channel._send_msg(
+            {"id": msg.get("id", 0), "kind": "err", "etype": "ProtocolError",
+             "message": f"runner expected a run request, got {msg!r}"},
+            [],
+        )
+        channel.close()
+        return
     try:
         result = run(channel, msg.get("body", {}))
         channel._send_msg({"id": msg["id"], "kind": "resp", "body": result}, [])

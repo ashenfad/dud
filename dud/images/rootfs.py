@@ -15,7 +15,7 @@ import tarfile
 from pathlib import Path
 
 from . import registry
-from .cpio import FileSet, Node, S_IFDIR, S_IFLNK, S_IFREG
+from .cpio import FileSet, Node, S_IFDIR, S_IFLNK, S_IFREG, is_dir, is_symlink
 
 _WH_PREFIX = ".wh."
 _WH_OPAQUE = ".wh..wh..opq"
@@ -35,6 +35,45 @@ def flatten_layers(layer_paths: list[Path]) -> FileSet:
     for layer in layer_paths:
         _apply_layer(fs, layer)
     return fs
+
+
+def _lookup(fs: FileSet, layer_nodes: dict, path: str) -> "Node | None":
+    """A path's node in the merged view (this layer over the lower fs)."""
+    node = layer_nodes.get(path)
+    return node if node is not None else fs.nodes.get(path)
+
+
+def _resolve_parents(fs: FileSet, layer_nodes: dict, path: str) -> str | None:
+    """Rewrite ``path`` through any symlinked ancestor dirs.
+
+    Real tar extraction follows symlinks when descending into parent
+    directories — on merged-usr Debian a layer writing ``lib/foo`` lands
+    in ``usr/lib/foo`` because ``/lib`` is a symlink. Mirror that here so
+    the flattened tree matches what a real extraction would produce.
+    Returns None for escapes and symlink loops (entry dropped, like
+    ``_safe``).
+    """
+    parts = path.split("/")
+    prefix = ""
+    for comp in parts[:-1]:
+        cand = prefix + comp
+        for _ in range(40):  # bounded chase; a loop drops the entry
+            node = _lookup(fs, layer_nodes, cand)
+            if node is None or not is_symlink(node.mode):
+                break
+            target = node.data.decode()
+            if target.startswith("/"):
+                nxt = target
+            else:
+                nxt = posixpath.join(posixpath.dirname(cand), target)
+            resolved = _safe(nxt)
+            if resolved is None:
+                return None
+            cand = resolved
+        else:
+            return None
+        prefix = cand + "/"
+    return prefix + parts[-1]
 
 
 def _apply_layer(fs: FileSet, layer_path: Path) -> None:
@@ -66,7 +105,9 @@ def _apply_layer(fs: FileSet, layer_path: Path) -> None:
                         if parent else base[len(_WH_PREFIX):]
                     )
                 else:
-                    _collect_entry(layer_nodes, tf, m, path)
+                    resolved = _resolve_parents(fs, layer_nodes, path)
+                    if resolved is not None:
+                        _collect_entry(fs, layer_nodes, tf, m, resolved)
 
     for d in opaque_dirs:
         prefix = (d + "/") if d else ""
@@ -78,7 +119,7 @@ def _apply_layer(fs: FileSet, layer_path: Path) -> None:
 
 
 def _collect_entry(
-    dst: dict, tf: tarfile.TarFile, m: tarfile.TarInfo, path: str
+    fs: FileSet, dst: dict, tf: tarfile.TarFile, m: tarfile.TarInfo, path: str
 ) -> None:
     perm = m.mode & 0o7777
     if m.isdir():
@@ -88,9 +129,16 @@ def _collect_entry(
     elif m.islnk():
         # Hardlink: adopt the target's contents (this layer, else lower).
         src = _safe(m.linkname)
-        node = dst.get(src) if src else None
-        if node is not None:
-            dst[path] = Node(mode=node.mode, data=node.data)
+        if src is not None:
+            src = _resolve_parents(fs, dst, src)
+        node = _lookup(fs, dst, src) if src else None
+        if node is None:
+            # A silently missing file in a booted image is undebuggable;
+            # a broken image should fail at build time.
+            raise ValueError(
+                f"hardlink {path!r} -> {m.linkname!r}: target not found"
+            )
+        dst[path] = Node(mode=node.mode, data=node.data)
     elif m.isreg():
         f = tf.extractfile(m)
         data = f.read() if f is not None else b""
@@ -102,7 +150,7 @@ def _site_packages(fs: FileSet) -> str:
     """Find the image's site-packages dir (python:slim ships exactly one)."""
     candidates = sorted(
         k for k, n in fs.nodes.items()
-        if (n.mode & S_IFDIR)
+        if is_dir(n.mode)
         and k.startswith("usr/local/lib/python3.")
         and k.endswith("/site-packages")
     )
@@ -156,11 +204,21 @@ def _init_script(site: str, workspace: str) -> bytes:
     return "\n".join(lines).encode()
 
 
+_INTERPRETER = "usr/local/bin/python3"
+
+
 def build_fileset(
     image: registry.PulledImage, workspace: str = "/workspace"
 ) -> FileSet:
     """Full rootfs: flattened image + dud runtime + /init entrypoint."""
     fs = flatten_layers(image.layer_paths)
+    # /init's shebang hardcodes the docker-official-python layout; an
+    # image without it would boot to a kernel panic, so fail at build.
+    if _INTERPRETER not in fs.nodes:
+        raise ValueError(
+            f"image has no /{_INTERPRETER}; dud guests currently require "
+            f"a python:*-slim-style layout"
+        )
     site = inject_dud(fs)
     fs.add_dir(workspace, 0o755)
     fs.add_file("init", _init_script(site, workspace), 0o755)

@@ -148,18 +148,25 @@ class Registry:
 
     def _get(self, ref: ImageRef, path: str, accept: str) -> urllib.request.addinfourl:
         url = f"https://{ref.registry}/v2/{ref.repository}/{path}"
-        headers = {"Accept": accept}
-        tok = self._token(ref)
-        if tok:
-            headers["Authorization"] = f"Bearer {tok}"
-        try:
-            return urllib.request.urlopen(
-                urllib.request.Request(url, headers=headers), timeout=120
-            )
-        except urllib.error.HTTPError as e:
-            raise RegistryError(f"GET {path} -> {e.code} {e.reason}") from e
-        except urllib.error.URLError as e:
-            raise RegistryError(f"GET {path} failed: {e}") from e
+        for attempt in (0, 1):
+            headers = {"Accept": accept}
+            tok = self._token(ref)
+            if tok:
+                headers["Authorization"] = f"Bearer {tok}"
+            try:
+                return urllib.request.urlopen(
+                    urllib.request.Request(url, headers=headers), timeout=120
+                )
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 0:
+                    # Anonymous tokens expire (~5 min); a long multi-blob
+                    # pull can outlive one. Re-auth once and retry.
+                    self._tokens.pop(ref.repository, None)
+                    continue
+                raise RegistryError(f"GET {path} -> {e.code} {e.reason}") from e
+            except urllib.error.URLError as e:
+                raise RegistryError(f"GET {path} failed: {e}") from e
+        raise AssertionError("unreachable")
 
     # ---- manifests ---------------------------------------------------
 
@@ -178,10 +185,14 @@ class Registry:
     def _manifest(self, ref: ImageRef, reference: str) -> tuple[dict, str]:
         with self._get(ref, f"manifests/{reference}", _MANIFEST_ACCEPT) as r:
             raw = r.read()
-            digest = r.headers.get("Docker-Content-Digest") or (
-                "sha256:" + hashlib.sha256(raw).hexdigest()
+        actual = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if reference.startswith("sha256:") and actual != reference:
+            # Closes the trust chain index -> manifest -> blobs: a
+            # manifest fetched BY digest must hash to that digest.
+            raise RegistryError(
+                f"manifest digest mismatch: asked {reference}, got {actual}"
             )
-        return json.loads(raw), digest
+        return json.loads(raw), actual
 
     def _select_platform(self, index: dict, arch: str) -> str:
         for m in index.get("manifests", []):
