@@ -29,11 +29,23 @@ def _hash_file(p: Path) -> str:
     return h.hexdigest()
 
 
+# Derived state real CPython writes into the tree as a side effect of
+# imports. It is never part of the workspace contract: under the VFS
+# executors it doesn't exist at all, and letting it into diffs both
+# poisons read-only views (a GET that merely IMPORTS a workspace module
+# would "write") and commits bytecode junk into the store above.
+_IGNORE_DIRS = {"__pycache__"}
+_IGNORE_SUFFIXES = (".pyc", ".pyo")
+
+
 def index_tree(root: Path) -> dict[str, str]:
     """relpath -> sha256 for every regular file under root."""
     out: dict[str, str] = {}
-    for dirpath, _dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
         for name in filenames:
+            if name.endswith(_IGNORE_SUFFIXES):
+                continue
             p = Path(dirpath) / name
             if p.is_symlink() or not p.is_file():
                 continue
