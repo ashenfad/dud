@@ -1,6 +1,6 @@
 # dud 🧨
 
-*A dumb firecracker.* Real, disposable machines for versioned agent
+*An immutable firecracker.* Real, disposable machines for versioned agent
 workspaces: tree in, execute against a real filesystem, diff out.
 Versioning belongs to the layer above (e.g.
 [nontainer](https://github.com/ashenfad/nontainer)'s providers) — dud
