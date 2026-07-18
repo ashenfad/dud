@@ -70,12 +70,13 @@ def test_force_rebuilds(tmp_path, stub_image):
     assert r.rootfs_path.exists()
 
 
-def test_spec_hash_tracks_workspace_medium_and_code():
-    base = buildmod._spec_hash("sha256:x", "/workspace", "initramfs")
-    assert base != buildmod._spec_hash("sha256:x", "/data", "initramfs")
-    assert base != buildmod._spec_hash("sha256:y", "/workspace", "initramfs")
-    assert base != buildmod._spec_hash("sha256:x", "/workspace", "ext4")
-    assert base == buildmod._spec_hash("sha256:x", "/workspace", "initramfs")
+def test_spec_hash_tracks_workspace_medium_packages_and_code():
+    base = buildmod._spec_hash("sha256:x", "/workspace", "initramfs", ())
+    assert base != buildmod._spec_hash("sha256:x", "/data", "initramfs", ())
+    assert base != buildmod._spec_hash("sha256:y", "/workspace", "initramfs", ())
+    assert base != buildmod._spec_hash("sha256:x", "/workspace", "ext4", ())
+    assert base != buildmod._spec_hash("sha256:x", "/workspace", "initramfs", ("numpy",))
+    assert base == buildmod._spec_hash("sha256:x", "/workspace", "initramfs", ())
 
 
 def test_meta_records_medium(tmp_path, stub_image):
@@ -85,7 +86,32 @@ def test_meta_records_medium(tmp_path, stub_image):
     meta = json.loads(r.meta_path.read_text())
     assert meta["medium"] == "initramfs"
     assert meta["artifact"] == "rootfs.cpio.gz"
+    assert meta["packages"] == []
     assert r.medium == "initramfs"
+
+
+def test_build_layers_packages(tmp_path, stub_image, monkeypatch):
+    """packages= folds resolved wheels into site-packages and records them
+    (wheel resolution is stubbed — no uv/network)."""
+    import gzip
+    import json
+    from pathlib import Path
+
+    from dud.images import wheels
+
+    def fake_resolve(packages, dest, arch, py):
+        pkg = Path(dest) / "fakepkg"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("VALUE = 1\n")
+        return dest
+
+    monkeypatch.setattr(wheels, "resolve_wheels", fake_resolve)
+    r = buildmod.build("python:3.12-slim", home=tmp_path / "home",
+                       packages=["fakepkg"])
+    meta = json.loads(r.meta_path.read_text())
+    assert meta["packages"] == ["fakepkg"]
+    raw = gzip.decompress(r.rootfs_path.read_bytes())
+    assert b"site-packages/fakepkg/__init__.py" in raw
 
 
 def test_unknown_medium_rejected(tmp_path, stub_image):

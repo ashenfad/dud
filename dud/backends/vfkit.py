@@ -96,6 +96,7 @@ class VfkitSession(HostSession):
         cpus: int = 2,
         home: str | Path | None = None,
         boot_timeout: float = 30.0,
+        packages: list[str] | None = None,
         host_objects: dict[str, Any] | None = None,
         allow: dict[str, set[str]] | None = None,
         cache: dict[str, bytes] | None = None,
@@ -107,7 +108,9 @@ class VfkitSession(HostSession):
         home = Path(home) if home else dud_home()
         arch = arch or _host_arch()
 
-        self.build = build_rootfs(image, arch=arch, workspace=workspace, home=home)
+        self.build = build_rootfs(
+            image, arch=arch, workspace=workspace, home=home, packages=packages
+        )
         kernel_path = _resolve_kernel(kernel, arch, home)
         vfkit = _vfkit_bin()
 
