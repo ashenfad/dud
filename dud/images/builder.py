@@ -256,8 +256,13 @@ def _build_erofs(fileset, home: Path, arch: str) -> bytes:
     import platform
     import shutil
 
+    # The host branch is non-Darwin only, even when brew has installed
+    # mkfs.erofs: macOS tempdirs are case-insensitive APFS, where paths
+    # differing only by case/normalization silently merge during
+    # extraction — a divergence class the case-sensitive builder-VM
+    # tmpfs cannot have. Linux hosts extract on a case-sensitive fs.
     tool = shutil.which("mkfs.erofs")
-    if tool:
+    if tool and platform.system() != "Darwin":
         return _build_erofs_host(tool, fileset)
     if platform.system() != "Darwin":  # pragma: no cover - odd hosts
         raise NotImplementedError(
@@ -297,10 +302,18 @@ def _build_erofs_host(tool: str, fileset) -> bytes:
     import tarfile
 
     with tempfile.TemporaryDirectory() as td:
-        with tarfile.open(
-            fileobj=io.BytesIO(_fileset_tar(fileset, prefix="src")), mode="r:"
-        ) as tf:
-            tf.extractall(td, filter="data")
+        # filter="data" leaves directory modes to mkdir's umask; pin it
+        # so host builds are reproducible and match the guest path
+        # (PID 1 extracts under umask 022 -> 755 dirs).
+        prior = os.umask(0o022)
+        try:
+            with tarfile.open(
+                fileobj=io.BytesIO(_fileset_tar(fileset, prefix="src")),
+                mode="r:",
+            ) as tf:
+                tf.extractall(td, filter="data")
+        finally:
+            os.umask(prior)
         out = Path(td) / "rootfs.erofs"
         r = subprocess.run(
             [tool, "--all-root", "-zlz4", "-T0", str(out),

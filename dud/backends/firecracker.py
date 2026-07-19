@@ -140,6 +140,11 @@ class FirecrackerSession(HostSession):
         kernel_path = _resolve_kernel(kernel, arch, home)
 
         _sweep_once()
+        # /tmp anchoring is inherited from vfkit (macOS sun_path cap)
+        # and kept for sweep symmetry. Known tradeoff: on distros where
+        # /tmp is tmpfs (Fedora/Arch), the writable scratch clone lives
+        # in RAM for the VM's lifetime — revisit if those become
+        # deployment targets (validated targets: Ubuntu, ubuntu-latest).
         self._rundir = tempfile.mkdtemp(dir="/tmp", prefix=_RUNDIR_PREFIX)
         self._api_sock = os.path.join(self._rundir, "fc.sock")
         self._vsock_uds = os.path.join(self._rundir, "vsock")
@@ -170,17 +175,17 @@ class FirecrackerSession(HostSession):
             self._configure(kernel_path, workspace, cpus, memory_mib,
                             disks or [])
             conn = self._accept(boot_timeout)
-        except Exception:
+        except Exception as e:
             self._teardown_vm()
-            tail = self._console_tail()
+            tail = self._console_tail()  # empty for pre-InstanceStart failures
             try:
                 self._srv.close()
             except OSError:
                 pass
             shutil.rmtree(self._rundir, ignore_errors=True)
             raise IsolationUnavailable(
-                f"firecracker boot failed; console tail:\n{tail}"
-            ) from None
+                f"firecracker boot failed ({e}); console tail:\n{tail}"
+            ) from e
         self._ch = Channel(conn, handler=self._handle)
         self._ch.hello_recv()
 
