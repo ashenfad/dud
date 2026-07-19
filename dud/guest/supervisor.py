@@ -18,10 +18,12 @@ Invoked as: python -m dud.guest.supervisor <socket-fd> <root-dir>
 
 from __future__ import annotations
 
+import json
 import os
 import select
 import signal
 import socket as socketlib
+import struct
 import subprocess
 import sys
 import time
@@ -37,6 +39,35 @@ _RUNNER_DEFAULT_TIMEOUT = 30.0
 _SHELL_DEFAULT_TIMEOUT = 30.0
 
 
+class _WorkerChild:
+    """Popen-shaped handle for a runner forked by the template.
+
+    The child is the TEMPLATE's child, not ours, so waitpid is off the
+    table — liveness is signal-0, exit codes are unknowable (the pump
+    only needs alive/dead), and kill is the same killpg the spawn path
+    uses (the child setsid's after fork)."""
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.returncode: int | None = None
+
+    def poll(self):
+        try:
+            os.kill(self.pid, 0)
+            return None
+        except (ProcessLookupError, PermissionError):
+            self.returncode = -1
+            return -1
+
+    def wait(self, timeout: float | None = None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("view-worker", timeout)
+            time.sleep(0.01)
+        return self.returncode
+
+
 class Supervisor:
     def __init__(self, channel: Channel, root: Path):
         self.channel = channel
@@ -50,7 +81,107 @@ class Supervisor:
         # Boot-time env snapshot: reset_guest restores this, so exports
         # from one pooled session never leak into the next.
         self._boot_env = dict(os.environ)
+        # View-worker template (VM rung only): warms in the background;
+        # view execs route through it once ready, spawn-path until then.
+        self._template: tuple[subprocess.Popen, socketlib.socket] | None = None
+        self._template_ready = False
+        self._start_template()
         channel.handler = self.handle
+
+    # ---- view-worker template ----------------------------------------
+
+    def _start_template(self) -> None:
+        """Spawn the warm fork-template (dud.guest.template). Best
+        effort and VM-rung only: a failed or absent template just
+        means view execs stay on the spawn path."""
+        if os.getpid() != 1:
+            return
+        try:
+            ours, theirs = socketlib.socketpair()
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "dud.guest.template",
+                 str(theirs.fileno())],
+                pass_fds=(theirs.fileno(),),
+                start_new_session=True,
+                env=dict(self._boot_env),
+            )
+            theirs.close()
+            self._template = (proc, ours)
+            self._template_ready = False
+        except Exception:
+            self._template = None
+
+    def _drop_template(self) -> None:
+        if self._template is None:
+            return
+        proc, ctl = self._template
+        self._template = None
+        self._template_ready = False
+        try:
+            ctl.close()
+        except OSError:
+            pass
+        try:
+            os.kill(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    def _worker_state(self) -> str:
+        if self._template is None:
+            return "off"
+        proc, ctl = self._template
+        if proc.poll() is not None:
+            # Died (crash, OOM): re-warm rather than staying cold —
+            # worst case is one cheap background spawn per exec.
+            self._drop_template()
+            self._start_template()
+            return "warming" if self._template is not None else "off"
+        if not self._template_ready:
+            # The readiness byte arrives whenever warm-up finishes.
+            ready, _, _ = select.select([ctl], [], [], 0)
+            if ready:
+                try:
+                    self._template_ready = ctl.recv(1) == b"R"
+                except OSError:
+                    self._drop_template()
+                    return "off"
+                if not self._template_ready:  # EOF: template died
+                    self._drop_template()
+                    return "off"
+        return "ready" if self._template_ready else "warming"
+
+    def _fork_from_template(self, cwd: str, env: dict):
+        """Ask the template for a forked runner on a fresh socketpair.
+        Returns (parent_socket, child_handle) or None to fall back to
+        the spawn path (any control-channel trouble drops the template;
+        a fresh one is started for later execs)."""
+        if self._worker_state() != "ready":
+            return None
+        _proc, ctl = self._template
+        parent, child = socketlib.socketpair()
+        try:
+            payload = json.dumps({"cwd": cwd, "env": env}).encode()
+            ctl.settimeout(5.0)
+            ctl.sendmsg(
+                [struct.pack(">I", len(payload)) + payload],
+                [(socketlib.SOL_SOCKET, socketlib.SCM_RIGHTS,
+                  struct.pack("i", child.fileno()))],
+            )
+            pid_bytes = b""
+            while len(pid_bytes) < 8:
+                chunk = ctl.recv(8 - len(pid_bytes))
+                if not chunk:
+                    raise OSError("template EOF")
+                pid_bytes += chunk
+            ctl.settimeout(None)
+        except OSError:
+            parent.close()
+            child.close()
+            self._drop_template()
+            self._start_template()
+            return None
+        child.close()
+        return parent, _WorkerChild(int.from_bytes(pid_bytes, "big"))
 
     # ---- dispatch ----------------------------------------------------
 
@@ -64,7 +195,8 @@ class Supervisor:
 
     def do_ping(self, body, bins):
         return {"pong": True, "workspace": str(self.work),
-                "staging": self.stage.kind}, []
+                "staging": self.stage.kind,
+                "view_worker": self._worker_state()}, []
 
     def do_shutdown(self, body, bins):
         shutdown_served()
@@ -139,6 +271,12 @@ class Supervisor:
         # park-time promotion copies a consistent image.
         if os.getpid() == 1:
             os.sync()
+            # The kill sweep above took the template with it (it's just
+            # another non-PID-1 process — that's the hygiene contract).
+            # Re-warm for the next session while it boots/pushes.
+            self._template = None
+            self._template_ready = False
+            self._start_template()
         return {}, []
 
     def do_exec_python(self, body, bins):
@@ -151,19 +289,29 @@ class Supervisor:
         # post-hoc diff check there).
         guard = (self.stage.readonly() if body.get("fs_readonly")
                  else nullcontext())
-        parent, child = socketlib.socketpair()
         env = dict(self.shell.env)
         env["DUD_WORKSPACE"] = str(self.work)
         cwd = self.shell.cwd if os.path.isdir(self.shell.cwd) else str(self.work)
         with guard:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "dud.guest.runner", str(child.fileno())],
-                pass_fds=(child.fileno(),),
-                cwd=cwd,
-                env=env,
-                start_new_session=True,
-            )
-            child.close()
+            # View execs (fs_readonly) route through the warm template
+            # when it's ready — fork beats spawn+imports by ~0.4 s on
+            # the DS stack. Anything else, or a template that isn't
+            # there yet, takes the identical spawn path.
+            forked = (self._fork_from_template(cwd, env)
+                      if body.get("fs_readonly") else None)
+            if forked is not None:
+                parent, proc = forked
+            else:
+                parent, child = socketlib.socketpair()
+                proc = subprocess.Popen(
+                    [sys.executable, "-m", "dud.guest.runner",
+                     str(child.fileno())],
+                    pass_fds=(child.fileno(),),
+                    cwd=cwd,
+                    env=env,
+                    start_new_session=True,
+                )
+                child.close()
             rchan = Channel(parent)
             rchan._next_id += 1
             rid = rchan._next_id
@@ -247,6 +395,12 @@ class Supervisor:
             pass
 
     def _reap(self, proc) -> None:
+        if isinstance(proc, _WorkerChild):
+            # The template owns its children's lifecycle (SIGCHLD
+            # reaper); we just make sure the group is dead. Waiting
+            # here would race the template's reap for no benefit.
+            self._kill(proc)
+            return
         if proc.poll() is None:
             self._kill(proc)
         try:

@@ -335,11 +335,10 @@ def run(channel: Channel, req: dict) -> dict:
     return result
 
 
-def main() -> None:
-    import socket as socketlib
-
-    fd = int(sys.argv[1])
-    sock = socketlib.socket(fileno=fd)
+def serve(sock) -> None:
+    """One-request lifecycle over an already-open socket. Split from
+    main() so the view-worker template (dud.guest.template) can serve
+    the identical contract from a forked child."""
     channel = Channel(sock)
 
     # Single request lifecycle: read the run request, execute, respond.
@@ -364,6 +363,12 @@ def main() -> None:
         )
     finally:
         channel.close()
+
+
+def main() -> None:
+    import socket as socketlib
+
+    serve(socketlib.socket(fileno=int(sys.argv[1])))
 
 
 if __name__ == "__main__":

@@ -134,17 +134,30 @@ app, immutability physical rather than procedural), and any future
 format without host tooling. Size-based auto-selection (small →
 initramfs, big → erofs) once both exist.
 
-### 2b. View-exec latency (preview GETs)
+### 2b. ~~View-exec latency (preview GETs)~~ shipped
 
-Baked hash-based ``.pyc`` into layered packages (pipeline v2) — every
-exec was recompiling its imports from source (~1 s per preview GET,
-almost all pandas). Measured after: session switch on a warm pool
-0.65 s; preview API GETs 370–580 ms (was ~1 s). The remaining floor
-is per-exec interpreter spawn + pandas module init (~0.4 s). Next
-lever if it matters: a session-persistent read-only **view worker**
-in the guest — imports warm, fresh namespace per request (sandtrap
-served views from a warm process too, so this is parity, not a
-cheat). Pairs naturally with the stage-6 dispatch pool.
+Two levers, both landed:
+
+- **pyc bake (pipeline v2)**: hash-based ``.pyc`` baked into layered
+  packages — every exec was recompiling its imports from source
+  (~1 s per preview GET, almost all pandas). GETs → 370–580 ms.
+- **View worker** (2026-07-19): view execs (``fs_readonly``) fork
+  from a warm import **template** (``dud.guest.template``, VM rung
+  only) instead of paying interpreter spawn + module init per
+  request. The template imports the image's installed packages once
+  at boot (background; spawn-path until ready — ``ping`` reports
+  ``view_worker``), never runs user code, and forks per request:
+  CoW-warm imports, genuinely fresh namespace, child exits after one
+  request. Timeout kills the child's group; ``reset_guest`` kills and
+  re-warms the template; a dead template degrades to the spawn path
+  and re-warms. Observable via ``DUD_VIEW_WORKER=1`` in the exec env
+  (conformance pins routing, freshness, read-only enforcement,
+  timeout, and death-recovery). Measured (pandas image, erofs):
+  exec 250 ms (spawn) → **117 ms** (worker, *including* the real
+  read-only remount); the gap widens with import weight — the worker
+  is flat where spawn scales with the stack. Zero public API change.
+  The remaining floor is fork + remount + channel; the stage-6
+  dispatch pool inherits this machinery wholesale.
 
 ### 3. ~~VM lifecycle hardening~~ shipped (2026-07-19)
 
