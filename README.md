@@ -8,7 +8,7 @@ is deliberately storage-blind, and the machines are deliberately dumb:
 all the smarts live in state, so any VM can vanish at any moment and
 nothing of value goes with it.
 
-> **Status: pre-alpha, all three rungs live.** The subprocess backend
+> **Status: alpha, on PyPI, all three rungs live.** The subprocess backend
 > (real bash, real Python, zero isolation — own-agent-own-laptop
 > posture), the vfkit microVM backend (macOS/HVF), and the firecracker
 > microVM backend (Linux/KVM) all pass the same conformance corpus
@@ -18,6 +18,31 @@ nothing of value goes with it.
 > files — zero RAM, ~tens-of-ms resume) all work today. See
 > [DESIGN.md](DESIGN.md) for the rationale, [PLAN.md](PLAN.md) for the
 > original staging, and [ROADMAP.md](ROADMAP.md) for what's next.
+
+## Install
+
+```bash
+pip install dud
+```
+
+That's the whole install for the subprocess rung (zero dependencies,
+zero isolation). The VM rungs each want two more things:
+
+**macOS (vfkit):**
+
+```bash
+brew install vfkit          # the VMM
+python -m dud.kernels       # the pinned guest kernel (~18 MB, digest-verified)
+```
+
+**Linux (firecracker):** a `firecracker` binary on `$PATH` (or point
+`$DUD_FIRECRACKER` at one), access to `/dev/kvm`, and the same
+`python -m dud.kernels` fetch.
+
+Everything else — OCI image pulls, rootfs builds, scratch volumes —
+is pure Python and arrives on first use, cached under `~/.dud`.
+Requesting a rung the host can't provide fails loud
+(`IsolationUnavailable`) with the missing piece named.
 
 ## Quick look
 
