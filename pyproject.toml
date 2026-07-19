@@ -1,6 +1,6 @@
 [project]
 name = "dud"
-version = "0.0.1"
+version = "0.1.1"
 description = "A dumb firecracker: real, disposable machines for versioned agent workspaces"
 readme = "README.md"
 requires-python = ">=3.11"
