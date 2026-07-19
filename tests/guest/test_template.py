@@ -22,6 +22,23 @@ from dud.values import decode_map
 
 REPO = Path(__file__).resolve().parents[2]
 
+# GitHub's shared macOS runners (observed on the macOS 26.4 image)
+# intermittently deliver a spurious immediate EOF on a freshly
+# SCM_RIGHTS-passed socketpair end: the forked child's first recv
+# returns b"" while the test still holds the open peer. Verified
+# host-OS-level, not ours — child tracebacks show a clean EOF before
+# the peer wrote or closed anything, back-to-back forks hit it in a
+# row, and neither 70+ local macOS runs nor any Linux runner has ever
+# reproduced it (actions runs 29698537737, 29699319859, 29699536587).
+# Production is unaffected either way: the template only runs as
+# guest PID 1 inside a Linux VM — Linux CI keeps that coverage, and
+# local macOS keeps the dev signal.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "darwin" and os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="GH macOS runners: spurious EOF on SCM_RIGHTS-passed "
+           "socketpairs (OS-level; production template is Linux-only)",
+)
+
 
 def _recvn(sock: socket.socket, n: int) -> bytes:
     buf = b""
