@@ -95,21 +95,25 @@ def session(
     if backend == "vfkit":
         if pooled:
             from .backends.pool import shared_pool
+            from .backends.vfkit import VfkitSession
 
-            return shared_pool().acquire(state=state, **kwargs)
+            return shared_pool(VfkitSession).acquire(state=state, **kwargs)
         if state is not None:
             raise ValueError("state= is park affinity; it requires pooled=True")
         from .backends.vfkit import VfkitSession
 
         return VfkitSession(**kwargs)
     if backend == "firecracker":
-        if pooled or state is not None:
-            raise NotImplementedError(
-                "firecracker pooling lands with the snapshot/restore work "
-                "(parked VMs become restorable files there)"
-            )
         from .backends.firecracker import FirecrackerSession
 
+        if pooled:
+            from .backends.pool import shared_pool
+
+            return shared_pool(FirecrackerSession).acquire(
+                state=state, **kwargs
+            )
+        if state is not None:
+            raise ValueError("state= is park affinity; it requires pooled=True")
         return FirecrackerSession(**kwargs)
     if backend == "subprocess":
         if pooled or state is not None:

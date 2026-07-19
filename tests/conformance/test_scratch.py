@@ -34,7 +34,7 @@ def _boot(scratch):
 
     return dud.session(
         _BACKEND, medium=os.environ.get("DUD_MEDIUM", "initramfs"),
-        scratch=scratch,
+        scratch=scratch, memory_mib=1024,
     )
 
 

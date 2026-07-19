@@ -100,6 +100,28 @@ def sweep_stale_rundirs(root: str | Path = "/tmp") -> list[str]:
     once it's old enough (10 min) to rule out a concurrent mid-boot."""
     removed: list[str] = []
     for path in Path(root).glob(_RUNDIR_PREFIX + "*"):
+        # Frozen park (firecracker snapshots): no VMM is running, the
+        # rundir IS the VM — vmstate + memory + disk clones. The marker
+        # records the owning host process; while that pid lives the
+        # bundle is somebody's parked session, and once it dies the
+        # bundle is garbage (a snapshot nobody can thaw).
+        frozen = path / "frozen"
+        if frozen.exists():
+            try:
+                owner = int(frozen.read_text())
+            except (OSError, ValueError):
+                owner = None
+            if owner is not None:
+                try:
+                    os.kill(owner, 0)
+                    continue  # live owner: leave the frozen VM alone
+                except ProcessLookupError:
+                    pass  # owner died; fall through to removal
+                except (PermissionError, OSError):
+                    continue  # alive but not ours: leave it alone
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(str(path))
+            continue
         pidfile = path / "pid"
         try:
             pid = int(pidfile.read_text())

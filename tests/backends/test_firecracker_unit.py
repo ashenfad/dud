@@ -46,11 +46,24 @@ def test_fc_bin_resolution(tmp_path, monkeypatch):
         fc._fc_bin()
 
 
-def test_factory_firecracker_pooling_fails_loud():
-    with pytest.raises(NotImplementedError, match="snapshot"):
-        dud.session("firecracker", pooled=True)
-    with pytest.raises(NotImplementedError, match="snapshot"):
-        dud.session("firecracker", pooled=True, state="c1")
+def test_factory_firecracker_pooled_routes_to_shared_pool(monkeypatch):
+    """pooled=True acquires from the fc-typed shared pool (frozen
+    parking); state without pooled stays a loud error."""
+    from dud.backends import pool as poolmod
+
+    acquired = []
+
+    class FakePool:
+        def acquire(self, state=None, **kw):
+            acquired.append((state, kw))
+            return "pooled-session"
+
+    monkeypatch.setattr(poolmod, "shared_pool",
+                        lambda cls: FakePool())
+    assert dud.session("firecracker", pooled=True, state="c1") == "pooled-session"
+    assert acquired == [("c1", {})]
+    with pytest.raises(ValueError, match="park affinity"):
+        dud.session("firecracker", state="c1")
 
 
 def test_factory_vm_resolves_per_platform(monkeypatch):

@@ -176,3 +176,27 @@ def test_vfkit_alive_rejects_dead_and_reused_pids():
     finally:
         p.kill()
         p.wait()
+
+
+def test_sweep_keeps_frozen_dir_with_live_owner(tmp_path):
+    """A frozen park (firecracker snapshot) has no VMM pid — the
+    marker's HOST pid is what keeps the sweep off the bundle."""
+    import os
+
+    d = _rundir(tmp_path, "frozen-live")
+    (d / "frozen").write_text(str(os.getpid()))
+    assert vfkit.sweep_stale_rundirs(tmp_path) == [] and d.exists()
+
+
+def test_sweep_removes_frozen_dir_with_dead_owner(tmp_path):
+    d = _rundir(tmp_path, "frozen-dead", pid=12345)
+    (d / "frozen").write_text("999999999")  # beyond pid_max everywhere
+    removed = vfkit.sweep_stale_rundirs(tmp_path)
+    assert removed == [str(d)] and not d.exists()
+
+
+def test_sweep_removes_frozen_dir_with_garbage_marker(tmp_path):
+    d = _rundir(tmp_path, "frozen-junk")
+    (d / "frozen").write_text("not-a-pid")
+    removed = vfkit.sweep_stale_rundirs(tmp_path)
+    assert removed == [str(d)] and not d.exists()

@@ -153,7 +153,7 @@ class Channel:
         try:
             rbody, rbins = self.handler(verb, msg.get("body", {}), bins)
             self._send_msg({"id": rid, "kind": "resp", "body": rbody}, rbins)
-        except _Shutdown:
+        except (_Shutdown, _Freeze):
             self._send_msg({"id": rid, "kind": "resp", "body": {}}, [])
             raise
         except Exception as e:  # noqa: BLE001 — boundary: report, don't die
@@ -163,16 +163,26 @@ class Channel:
                 [],
             )
 
-    def serve(self) -> None:
-        """Serve incoming requests until shutdown or EOF."""
+    def serve(self) -> str:
+        """Serve incoming requests until shutdown, freeze, or EOF.
+
+        Returns why serving stopped — ``"shutdown"`` (the shutdown verb
+        was served), ``"freeze"`` (the freeze verb: the peer intends to
+        snapshot us and the caller should redial rather than die), or
+        ``"eof"`` (the socket closed under us).
+        """
         try:
             while True:
                 msg, bins = self._recv_msg()
                 if msg.get("kind") != "req":
                     raise ProtocolError(f"server got {msg.get('kind')!r}")
                 self._serve_one(msg, bins)
-        except (_Shutdown, ChannelClosed):
-            return
+        except _Shutdown:
+            return "shutdown"
+        except _Freeze:
+            return "freeze"
+        except ChannelClosed:
+            return "eof"
 
     def close(self) -> None:
         try:
@@ -185,6 +195,20 @@ class _Shutdown(Exception):
     """Raised by a handler to end ``serve()`` after responding."""
 
 
+class _Freeze(Exception):
+    """Raised by a handler to end ``serve()`` after responding, telling
+    the serving loop the peer is about to snapshot the machine — the
+    caller should close and redial instead of treating it as an exit."""
+
+
 def shutdown_served() -> None:
     """Handlers call this on the ``shutdown`` verb (responds, then exits)."""
     raise _Shutdown()
+
+
+def freeze_served() -> None:
+    """Handlers call this on the ``freeze`` verb (responds, then hands
+    control back to the redial loop). Distinct from shutdown so that a
+    bare EOF keeps meaning "die" — only an explicit, acked freeze puts
+    the guest into its redial-and-wait posture."""
+    raise _Freeze()

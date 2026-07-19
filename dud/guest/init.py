@@ -162,10 +162,30 @@ def main(default_root: str = "/workspace") -> None:
             sock = _connect_vsock(cid, port, time.monotonic() + 10.0)
         _log("channel up")
         channel = Channel(sock)
-        Supervisor(channel, root)
+        supervisor = Supervisor(channel, root)
         channel.hello_send()
-        channel.serve()
-        channel.close()
+        while True:
+            reason = channel.serve()
+            channel.close()
+            if reason != "freeze" or mode == "listen":
+                break
+            # Freeze/thaw (firecracker snapshots): the host acked our
+            # freeze response and is about to pause + snapshot us — we
+            # may resume milliseconds or days from now, in a VMM the
+            # host process spawned fresh. Redial and rebind; all warm
+            # state (staging, shell env, template) carries over. The
+            # deadline is monotonic, which does not tick while the VM
+            # is paused, so it budgets only actual running time: the
+            # pre-pause window (dials bounce off a closed listener)
+            # plus the post-thaw accept. A host that thaws us and dies
+            # before accepting exhausts it and we power off — the
+            # no-dangling-VMs invariant, kept.
+            _log("frozen; redialing for thaw")
+            sock = _connect_vsock(cid, port, time.monotonic() + 60.0)
+            _log("thawed; channel up")
+            channel = Channel(sock)
+            supervisor.rebind(channel)
+            channel.hello_send()
         _log("channel closed; powering off")
     except Exception as e:  # noqa: BLE001 — PID 1 must not raise into the kernel
         _log(f"fatal: {type(e).__name__}: {e}")

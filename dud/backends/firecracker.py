@@ -114,7 +114,7 @@ class FirecrackerSession(HostSession):
                 raise IsolationUnavailable(f"disk image not found: {disk}")
         if scratch is not None and not Path(scratch).is_file():
             raise IsolationUnavailable(f"scratch volume not found: {scratch}")
-        fc = _fc_bin()
+        fc = self._fc_exe = _fc_bin()
 
         # Pooling hooks: interface parity with VfkitSession. The shared
         # pool is vfkit-typed today; firecracker pooling arrives with
@@ -122,6 +122,7 @@ class FirecrackerSession(HostSession):
         self._pool: Any = None
         self.park_state: str | None = None
         self.resumed = False
+        self.frozen = False
         self._pool_kwargs = {
             "image": image, "arch": arch, "workspace": workspace,
             "kernel": kernel, "memory_mib": memory_mib, "cpus": cpus,
@@ -299,6 +300,107 @@ class FirecrackerSession(HostSession):
         except Exception:
             pass
 
+    # ---- freeze / thaw ---------------------------------------------------
+
+    def freeze(self) -> None:
+        """Park this VM as files: snapshot memory + device state into
+        the rundir and kill the VMM. A frozen session costs zero RAM
+        and zero CPU; :meth:`thaw` resumes it in tens of milliseconds
+        with all guest state — filesystem, shell env, live memory —
+        exactly where it was.
+
+        The guest cooperates via the ``freeze`` verb (it syncs, acks,
+        closes the channel, and enters a bounded redial loop), so a
+        bare EOF keeps meaning "die" on every other path. The rundir
+        must survive as-is: the snapshot's device table references the
+        disk files (rootfs, debs, scratch clone) by absolute path. A
+        ``frozen`` marker carrying our pid keeps the sweep off it for
+        exactly as long as this process lives."""
+        if self.frozen:
+            return
+        # Close the listener before the freeze verb: the guest starts
+        # redialing the moment it acks, and those dials must bounce
+        # rather than land on the pre-freeze listener.
+        try:
+            self._srv.close()
+        except OSError:
+            pass
+        self._ch.request("freeze")
+        self._ch.close()
+        self._api("PATCH", "/vm", {"state": "Paused"})
+        for name in ("vmstate", "mem"):
+            try:
+                os.unlink(os.path.join(self._rundir, name))
+            except OSError:
+                pass
+        self._api("PUT", "/snapshot/create", {
+            "snapshot_type": "Full",
+            "snapshot_path": os.path.join(self._rundir, "vmstate"),
+            "mem_file_path": os.path.join(self._rundir, "mem"),
+        })
+        self._teardown_vm()
+        Path(self._rundir, "frozen").write_text(str(os.getpid()))
+        self.frozen = True
+
+    def thaw(self, timeout: float = 30.0) -> None:
+        """Resume a frozen session in a fresh VMM. Fast path: the
+        memory file is mmap'd, not read — resume latency is near
+        constant in guest RAM size, and pages fault in on demand.
+
+        After the guest redials we send ``resync``: the wall clock
+        stopped at snapshot time, and the fork template pre-dates the
+        snapshot (identical PRNG state across clones of one snapshot),
+        so the guest sets the clock and re-warms the template."""
+        if not self.frozen:
+            return
+        # The dead VMM's socket files linger; both would EADDRINUSE
+        # the new process (firecracker refuses an existing API socket,
+        # and re-creates the vsock listener from the snapshot config).
+        for stale in (self._api_sock, self._vsock_uds,
+                      f"{self._vsock_uds}_{_VSOCK_PORT}"):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+        self._srv = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+        self._srv.bind(f"{self._vsock_uds}_{_VSOCK_PORT}")
+        self._srv.listen(1)
+        self._fc_log = open(self._console, "ab")
+        self._proc = subprocess.Popen(
+            [self._fc_exe, "--api-sock", self._api_sock],
+            stdout=self._fc_log, stderr=subprocess.STDOUT,
+        )
+        Path(self._rundir, "pid").write_text(str(self._proc.pid))
+        try:
+            self._await_api()
+            self._api("PUT", "/snapshot/load", {
+                "snapshot_path": os.path.join(self._rundir, "vmstate"),
+                "mem_backend": {
+                    "backend_type": "File",
+                    "backend_path": os.path.join(self._rundir, "mem"),
+                },
+                "resume_vm": True,
+            })
+            conn = self._accept(timeout)
+        except Exception as e:
+            self._teardown_vm()
+            try:
+                self._srv.close()
+            except OSError:
+                pass
+            tail = self._console_tail()
+            raise IsolationUnavailable(
+                f"firecracker thaw failed ({e}); console tail:\n{tail}"
+            ) from e
+        self._ch = Channel(conn, handler=self._handle)
+        self._ch.hello_recv()
+        self.frozen = False
+        try:
+            os.unlink(os.path.join(self._rundir, "frozen"))
+        except OSError:
+            pass
+        self._ch.request("resync", {"epoch": time.time()})
+
     # ---- scratch ---------------------------------------------------------
 
     def promote_scratch(self) -> None:
@@ -317,6 +419,16 @@ class FirecrackerSession(HostSession):
         self._closed = True
         if self._pool is not None:  # future: snapshot-backed parking
             self._pool.release(self)
+            return
+        if self.frozen:
+            # Discarding a frozen park is a disposal path: the guest
+            # never gets a clean shutdown, so no scratch promotion —
+            # the snapshot dies with its rundir.
+            try:
+                self._fc_log.close()
+            except Exception:
+                pass
+            shutil.rmtree(self._rundir, ignore_errors=True)
             return
         clean = False
         try:

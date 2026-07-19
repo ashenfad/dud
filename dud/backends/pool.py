@@ -1,4 +1,4 @@
-"""Reuse vfkit VMs across sessions: same image, new state, no boot.
+"""Reuse VMs across sessions: same image, new state, no boot.
 
 The design premise makes VMs fungible — files ride in via ``push_tree``,
 cache and host objects live host-side, python state dies with each
@@ -6,6 +6,20 @@ runner — so a session's identity never touches the machine. A pool
 keyed by the *boot fingerprint* (image, packages, kernel, sizing) hands
 an idle VM to the next session for the cost of a ``reset_guest`` +
 ``push_tree`` (~100s of ms) instead of a boot (~seconds).
+
+Two parking postures, chosen by what the backend can do:
+
+- **hot** (vfkit): the parked VM keeps running; reuse is reset + push.
+  Idle warmth costs RAM (macOS pages untouched guest memory out, so
+  less than the headline size, but not nothing).
+- **frozen** (firecracker): the parked VM is snapshotted to files and
+  its VMM killed; reuse is a thaw (~tens of ms — the memory file is
+  mmap'd, not read). Idle warmth costs disk only, so frozen VMs are
+  invisible to ``max_total`` and never reclaimed for RAM pressure.
+
+The posture is duck-typed off the session (``freeze``/``thaw``); the
+acquire/release contract, fingerprints, affinity tags, and caps are
+identical either way.
 
 Hygiene on release, not acquire (secrets leave promptly): wipe both
 trees, restore boot-time shell env, and kill every non-supervisor
@@ -50,7 +64,7 @@ _BINDING_KEYS = ("host_objects", "allow", "cache", "on_emit")
 _NON_IDENTITY = ("boot_timeout",)
 
 
-def _fingerprint(kwargs: dict[str, Any]) -> str:
+def _fingerprint(kwargs: dict[str, Any], session_cls: type = None) -> str:
     """Boot-identity hash, normalized against the constructor's defaults
     so sparse call-site kwargs and a session's fully-captured
     ``_pool_kwargs`` produce the SAME key (acquire must find what release
@@ -61,7 +75,9 @@ def _fingerprint(kwargs: dict[str, Any]) -> str:
     initramfs (resolution needs image inspection this hash must not
     do). Self-consistent either way — just pick one style per app, or
     mixed call sites warm separate buckets."""
-    params = inspect.signature(VfkitSession.__init__).parameters
+    params = inspect.signature(
+        (session_cls or VfkitSession).__init__
+    ).parameters
     ident: dict[str, Any] = {}
     for name, p in params.items():
         if name == "self" or name in _BINDING_KEYS or name in _NON_IDENTITY:
@@ -72,12 +88,13 @@ def _fingerprint(kwargs: dict[str, Any]) -> str:
 
 
 class VmPool:
-    """Idle vfkit VMs keyed by boot fingerprint.
+    """Idle VMs keyed by boot fingerprint.
 
-    ``acquire`` returns a :class:`VfkitSession` whose ``close()`` parks
-    the VM here (after guest reset) instead of powering it off; the pool
-    tears VMs down on idle-cap overflow, TTL expiry (checked lazily),
-    ``close()``, or process exit.
+    ``acquire`` returns a session whose ``close()`` parks the VM here
+    (after guest reset) instead of powering it off; the pool tears VMs
+    down on idle-cap overflow, TTL expiry (checked lazily), ``close()``,
+    or process exit. ``session_cls`` picks the rung (default vfkit);
+    sessions that can ``freeze`` park frozen (see the module docstring).
     """
 
     def __init__(
@@ -85,10 +102,12 @@ class VmPool:
         max_idle: int = 2,
         ttl: float = 900.0,
         max_total: int | None = None,
+        session_cls: type | None = None,
     ):
         self.max_idle = max_idle
         self.ttl = ttl
         self.max_total = max_total
+        self.session_cls = session_cls or VfkitSession
         self._idle: dict[str, list[tuple[float, VfkitSession]]] = {}
         # Bound = checked out and held by a session owner. Tracked so
         # max_total can reclaim the LRU one under demand (id() keys:
@@ -108,7 +127,7 @@ class VmPool:
         ``resumed=True`` — its tree already IS that state, so the caller
         skips the push and just continues. Any other VM (or a fresh
         boot) comes back ``resumed=False``."""
-        key = _fingerprint(kwargs)
+        key = _fingerprint(kwargs, self.session_cls)
         binding = {k: kwargs.get(k) for k in _BINDING_KEYS}
         while True:
             matched = False
@@ -134,7 +153,7 @@ class VmPool:
             if parked is None:
                 self._make_room()
                 self._maybe_refill(key)  # replace what we're about to boot
-                session = VfkitSession(**kwargs)
+                session = self.session_cls(**kwargs)
                 session._pool = self  # close() -> release
                 session.resumed = False
                 with self._lock:
@@ -142,7 +161,12 @@ class VmPool:
                 return session
             _, _, session = parked
             try:
-                session.ping()
+                # Frozen parks resume here (thaw = new VMM over the
+                # snapshot files); hot parks just prove liveness.
+                if getattr(session, "frozen", False):
+                    session.thaw()
+                else:
+                    session.ping()
             except Exception:
                 self._teardown(session)
                 continue  # dead while parked: boot fresh next loop
@@ -167,10 +191,16 @@ class VmPool:
         if self.max_total is None:
             return
         while True:
-            victim: VfkitSession | None = None
+            victim: Any = None
             with self._lock:
+                # Frozen parks are files, not processes: they consume
+                # no RAM/CPU, so the cap neither counts them nor
+                # reclaims them (TTL is their only expiry — disk GC).
                 total = len(self._bound) + sum(
-                    len(b) for b in self._idle.values()
+                    1
+                    for b in self._idle.values()
+                    for _, _, s in b
+                    if not getattr(s, "frozen", False)
                 )
                 if total < self.max_total:
                     return
@@ -180,8 +210,8 @@ class VmPool:
                     # key) are exempt, as with TTL: reclaiming one just
                     # triggers a re-boot churn loop under pressure.
                     floor = self._targets.get(key, (0, None))[0]
-                    for i, (t, _tag, _s) in enumerate(bucket):
-                        if i < floor:
+                    for i, (t, _tag, s) in enumerate(bucket):
+                        if i < floor or getattr(s, "frozen", False):
                             continue
                         if oldest is None or t < oldest[0]:
                             oldest = (t, key, i)
@@ -207,7 +237,7 @@ class VmPool:
         whenever an acquire drains below ``n``. Targeted VMs are exempt
         from TTL expiry — holding them warm is the entire point. Callers
         opting in accept the idle RAM cost."""
-        key = _fingerprint(kwargs)
+        key = _fingerprint(kwargs, self.session_cls)
         boot_kwargs = {k: v for k, v in kwargs.items() if k not in _BINDING_KEYS}
         with self._lock:
             self._targets[key] = (max(0, n), boot_kwargs)
@@ -252,9 +282,20 @@ class VmPool:
                         if total >= self.max_total:
                             return  # the cap outranks the warm target
                 try:
-                    session = VfkitSession(**boot_kwargs)
+                    session = self.session_cls(**boot_kwargs)
                 except Exception:
-                    return  # best-effort: no kernel / no HVF -> no prewarm
+                    return  # best-effort: no kernel / no KVM -> no prewarm
+                # Zero-RAM prewarm where the backend can: a frozen
+                # freshly-booted VM is warmth as a file.
+                try:
+                    if hasattr(session, "freeze"):
+                        session.freeze()
+                except Exception:
+                    try:
+                        session.close()
+                    except Exception:
+                        pass
+                    return
                 session._pool = self
                 with self._lock:
                     self._idle.setdefault(key, []).insert(
@@ -290,7 +331,16 @@ class VmPool:
             session.promote_scratch()
         except Exception:
             pass
-        key = _fingerprint(session._pool_kwargs)
+        # Frozen posture: park as files, not as a process. The reset
+        # already ran, so what freezes is a clean guest; thaw at the
+        # next acquire resumes it in tens of ms with imports warm.
+        if hasattr(session, "freeze"):
+            try:
+                session.freeze()
+            except Exception:
+                self._teardown(session)
+                return
+        key = _fingerprint(session._pool_kwargs, self.session_cls)
         with self._lock:
             stale = self._expire_locked()
             bucket = self._idle.setdefault(key, [])
@@ -360,26 +410,38 @@ class VmPool:
         return expired
 
 
-_shared: VmPool | None = None
+_shared: dict[type, VmPool] = {}
 _shared_lock = threading.Lock()
 
 
-def shared_pool() -> VmPool:
-    """The process-wide default pool (what DudExecutor uses).
+def shared_pool(session_cls: type | None = None) -> VmPool:
+    """The process-wide default pool for a rung (what DudExecutor
+    uses); ``session_cls=None`` picks the host platform's VM rung.
 
-    ``$DUD_VM_MAX_TOTAL`` caps live VMs (bound + idle) with
-    demand-driven reclaim; unset means uncapped — macOS pages out
-    untouched guest memory, so idle VMs cost less than their headline
-    size and a hard cap is opt-in.
+    ``$DUD_VM_MAX_TOTAL`` caps RUNNING VMs (bound + hot-idle; frozen
+    parks are files and don't count) with demand-driven reclaim; unset
+    means uncapped — macOS pages out untouched guest memory, so idle
+    VMs cost less than their headline size and a hard cap is opt-in.
     """
-    global _shared
+    if session_cls is None:
+        import platform
+
+        if platform.system() == "Darwin":
+            session_cls = VfkitSession
+        else:
+            from .firecracker import FirecrackerSession
+
+            session_cls = FirecrackerSession
     with _shared_lock:
-        if _shared is None:
+        pool = _shared.get(session_cls)
+        if pool is None:
             cap = os.environ.get("DUD_VM_MAX_TOTAL")
-            _shared = VmPool(max_total=int(cap) if cap else None)
-        return _shared
+            pool = _shared[session_cls] = VmPool(
+                max_total=int(cap) if cap else None, session_cls=session_cls
+            )
+        return pool
 
 
 def acquire_vfkit(**kwargs: Any) -> VfkitSession:
-    """Acquire from the shared pool. The session's ``close()`` parks it."""
-    return shared_pool().acquire(**kwargs)
+    """Acquire from the shared vfkit pool. ``close()`` parks it."""
+    return shared_pool(VfkitSession).acquire(**kwargs)

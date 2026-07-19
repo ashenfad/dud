@@ -448,6 +448,24 @@ dev, note it in the tool primer.
 > RAM dir (4-4 gives it overlay staging), and the ~2.5 s dial retry is
 > worth trimming (vfkit readiness signal) later.
 
+> **Freeze/thaw green (stage 5 pooling, 2026-07-19).** Firecracker
+> snapshots turn parking into files: `freeze()` sends a guest-acked
+> `freeze` verb (sync → ack → close → bounded redial loop), pauses the
+> VM, writes vmstate + memory into the rundir, and kills the VMM;
+> `thaw()` spawns a fresh VMM over `/snapshot/load` and the guest's
+> redial lands on a re-bound listener, then `resync` sets the wall
+> clock and replaces the fork template (clones of one snapshot must
+> not share PRNG state). Restore mmaps the memory file — resume is
+> near constant-time in guest RAM, pages fault in on demand. The
+> freeze verb is deliberate ceremony: a bare EOF still powers the
+> guest off, so process linkage (no dangling VMs) survives; the one
+> new dangling shape — a frozen bundle whose host died — is covered by
+> a `frozen` marker holding the owner pid, which the rundir sweep
+> honors while the owner lives and reaps once it dies. The pool
+> duck-types the posture off `freeze`/`thaw`: vfkit parks hot,
+> firecracker parks frozen at zero RAM (invisible to `max_total`), one
+> acquire/release contract above both.
+
 sandtrap's fail-closed pattern transplants directly: requesting a rung
 the platform can't provide **raises** (`IsolationUnavailable`-style),
 never silently degrades; results carry a status describing what took

@@ -18,6 +18,7 @@ Invoked as: python -m dud.guest.supervisor <socket-fd> <root-dir>
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import select
@@ -31,13 +32,29 @@ from pathlib import Path
 
 from contextlib import nullcontext
 
-from ..proto import Channel, ChannelClosed, RemoteError, shutdown_served
+from ..proto import (
+    Channel,
+    ChannelClosed,
+    RemoteError,
+    freeze_served,
+    shutdown_served,
+)
 from .shell import ShellOutcome, ShellState, run_shell
 from .staging import make_stage
 
 _RUNNER_DEFAULT_TIMEOUT = 30.0
 _SHELL_DEFAULT_TIMEOUT = 30.0
 _CTL_TIMEOUT = 5.0  # template control handshake budget
+
+# clock_settime plumbing for do_resync (guest PID 1 is root; the
+# subprocess rung never takes this path).
+_CLOCK_REALTIME = 0
+_libc = ctypes.CDLL(None, use_errno=True)
+
+
+class _timespec(ctypes.Structure):
+    _fields_ = [("tv_sec", ctypes.c_long), ("tv_nsec", ctypes.c_long)]
+
 # Consecutive worker-path failures before the template is presumed
 # fork-hostile (a warm import left live threads; children wedge) and
 # replaced. One failure can be the exec's own fault; two in a row
@@ -93,6 +110,13 @@ class Supervisor:
         self._template_ready = False
         self._worker_failures = 0
         self._start_template()
+        channel.handler = self.handle
+
+    def rebind(self, channel: Channel) -> None:
+        """Attach to a fresh channel after a freeze/thaw cycle. All the
+        warm state — staging, shell env, the fork template — carries
+        over; only the transport is new."""
+        self.channel = channel
         channel.handler = self.handle
 
     # ---- view-worker template ----------------------------------------
@@ -215,6 +239,33 @@ class Supervisor:
 
     def do_shutdown(self, body, bins):
         shutdown_served()
+
+    def do_freeze(self, body, bins):
+        """The host is about to snapshot this VM (see the firecracker
+        rung's freeze/thaw). Flush block-backed state so the frozen
+        disk image is consistent, ack, and hand the serve loop back to
+        init's redial-and-wait posture. VM rung only: elsewhere there
+        is no machine to snapshot and no redial loop to return to."""
+        if os.getpid() != 1:
+            raise ValueError("freeze requires the VM rung (guest PID 1)")
+        os.sync()
+        freeze_served()
+
+    def do_resync(self, body, bins):
+        """Post-thaw fixup, host-initiated on the first request after a
+        redial: set the wall clock (frozen guests wake with the clock
+        stopped at snapshot time) and replace the fork template (its
+        interpreter pre-dates the snapshot, so clones of one snapshot
+        would otherwise share PRNG state across forked workers)."""
+        if os.getpid() != 1:
+            return {}, []
+        epoch = float(body["epoch"])
+        ts = _timespec(int(epoch), int((epoch % 1.0) * 1e9))
+        _libc.clock_settime(_CLOCK_REALTIME, ctypes.byref(ts))
+        self._drop_template()
+        self._worker_failures = 0
+        self._start_template()
+        return {}, []
 
     def do_push_tree(self, body, bins):
         self.stage.push(bins[0] if bins and bins[0] else None)

@@ -61,7 +61,8 @@ def test_session_factory_vfkit_paths(monkeypatch):
             built.append(("pooled", state, kw))
             return "pooled"
 
-    monkeypatch.setattr(poolmod, "shared_pool", lambda: FakePool())
+    monkeypatch.setattr(poolmod, "shared_pool",
+                        lambda cls=None: FakePool())
     assert dud.session("vfkit", image="x") == "direct"
     assert dud.session("vm", pooled=True, state="c1", image="x") == "pooled"
     assert built == [("direct", {"image": "x"}),

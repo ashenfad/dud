@@ -264,11 +264,21 @@ platform, so consumer config never changes.
 
 Still open on this rung:
 
-- **Pooling / snapshot-restore** — deliberately deferred together:
-  firecracker snapshots make a parked VM a *file* (resume ≈ 5–20 ms,
-  CoW memory), which reshapes the pool rather than reusing its
-  vfkit-shaped internals; `pooled=True` fails loud until then. Needs
-  guest vsock redial-on-restore.
+- **Pooling / snapshot-restore — SHIPPED (2026-07-19, freeze/thaw)**:
+  `freeze()` parks a running VM as files (guest-cooperative `freeze`
+  verb → pause → `/snapshot/create` → kill VMM; a `frozen` marker
+  carrying the host pid keeps the sweep off the bundle) and `thaw()`
+  resumes in a fresh VMM (`/snapshot/load`, mmap'd memory file, guest
+  redials vsock, `resync` fixes the wall clock and re-warms the fork
+  template for PRNG uniqueness across clones). The pool duck-types the
+  posture: vfkit parks hot (reset + keep running), firecracker parks
+  frozen (reset + freeze; thaw on acquire) — same acquire/release
+  contract, same affinity tags, and frozen parks are invisible to
+  `max_total` (files, not RAM). A bare channel EOF still means "die";
+  only an acked freeze enters the guest's bounded redial loop, so the
+  no-dangling-VMs invariant survives. Still open here: golden
+  snapshots per fingerprint (boot-once → freeze-clean → every pool
+  miss thaws a clone instead of cold-booting).
 - **Hardening posture**: jailer, no-NIC default, cgroup budgets — the
   production-grade wrapper, not needed for the dev rung.
 - **amd64 pins** (kernel `vmlinux`, debs) — wanted for CI anyway:

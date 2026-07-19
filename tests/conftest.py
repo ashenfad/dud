@@ -2,6 +2,13 @@ import os
 
 import pytest
 
+# Conformance VMs are slim-python guests, not DS images: 1 GiB is
+# comfortable and halves the churn that wears out the nested-virt dev
+# VM (2 GiB allocs + 2 GiB snapshot writes per freeze — see
+# dev/fc-test.sh for the other half of that story). Override per test
+# with an explicit memory_mib kwarg.
+_TEST_VM_MIB = int(os.environ.get("DUD_TEST_VM_MIB", "1024"))
+
 
 def _new_session(**kwargs):
     """Construct the backend selected by ``DUD_BACKEND`` (default subprocess).
@@ -17,10 +24,12 @@ def _new_session(**kwargs):
         # DUD_MEDIUM lets the same corpus run against an erofs root
         # (DUD_BACKEND=vfkit DUD_MEDIUM=erofs uv run pytest tests/conformance)
         kwargs.setdefault("medium", os.environ.get("DUD_MEDIUM", "initramfs"))
+        kwargs.setdefault("memory_mib", _TEST_VM_MIB)
         return VfkitSession(**kwargs)
     if backend == "firecracker":
         from dud.backends.firecracker import FirecrackerSession
         kwargs.setdefault("medium", os.environ.get("DUD_MEDIUM", "initramfs"))
+        kwargs.setdefault("memory_mib", _TEST_VM_MIB)
         return FirecrackerSession(**kwargs)
     if backend == "subprocess":
         from dud import Session

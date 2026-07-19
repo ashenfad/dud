@@ -153,3 +153,47 @@ def test_handlerless_channel_rejects_incoming_requests():
     assert body == {"ok": 1}
     t.join(timeout=5)
     client.close()
+
+
+def test_serve_reports_why_it_stopped():
+    """serve() distinguishes shutdown / freeze / EOF: freeze must be an
+    explicit, acked verb — a bare EOF keeps meaning "die" so the
+    no-dangling-VMs invariant survives the snapshot work."""
+    from dud.proto import freeze_served
+
+    def handler(verb, body, bins):
+        if verb == "freeze":
+            freeze_served()
+        shutdown_served()
+
+    # freeze: the requester gets an ack AND serve() returns "freeze"
+    a, b = socket.socketpair()
+    server = Channel(b, handler=handler)
+    reasons = []
+    t = threading.Thread(target=lambda: reasons.append(server.serve()),
+                         daemon=True)
+    t.start()
+    client = Channel(a)
+    body, _ = client.request("freeze")
+    assert body == {}
+    t.join(timeout=5)
+    assert reasons == ["freeze"]
+    client.close()
+
+    # shutdown
+    a, b = socket.socketpair()
+    server = Channel(b, handler=handler)
+    reasons = []
+    t = threading.Thread(target=lambda: reasons.append(server.serve()),
+                         daemon=True)
+    t.start()
+    Channel(a).request("shutdown")
+    t.join(timeout=5)
+    assert reasons == ["shutdown"]
+    a.close()
+
+    # EOF
+    a, b = socket.socketpair()
+    server = Channel(b, handler=handler)
+    a.close()
+    assert server.serve() == "eof"

@@ -389,3 +389,96 @@ def test_reset_guest_keep_tree_over_real_guest():
         assert "unset" in r.transcript  # env reset
         assert "keepme" in r.transcript  # tree survived
         assert r.cwd.endswith("/work")  # cwd reset
+
+
+# ---- frozen parking (firecracker posture, duck-typed) -----------------
+
+
+class FrozenFakeVM(FakeVM):
+    """A FakeVM that can freeze/thaw — the firecracker posture.
+
+    The explicit signature matters: the pool fingerprints boot identity
+    off ``inspect.signature(session_cls.__init__)``, exactly like the
+    real session classes."""
+
+    def __init__(self, image="python:3.12-slim", arch=None,
+                 workspace="/workspace", kernel=None, memory_mib=2048,
+                 cpus=2, home=None, boot_timeout=30.0, packages=None,
+                 host_objects=None, allow=None, cache=None, on_emit=None):
+        super().__init__(image=image, arch=arch, workspace=workspace,
+                         kernel=kernel, memory_mib=memory_mib, cpus=cpus,
+                         home=home, boot_timeout=boot_timeout,
+                         packages=packages, host_objects=host_objects,
+                         allow=allow, cache=cache, on_emit=on_emit)
+        self.frozen = False
+        self.freezes = 0
+        self.thaws = 0
+        self.thaw_fails = False
+
+    def freeze(self):
+        self.frozen = True
+        self.freezes += 1
+
+    def thaw(self):
+        if self.thaw_fails:
+            raise ConnectionError("snapshot corrupt")
+        self.frozen = False
+        self.thaws += 1
+
+
+def _fc_pool(monkeypatch, **kw):
+    FakeVM.booted = 0  # the counter lives on the base class
+    return poolmod.VmPool(session_cls=FrozenFakeVM, **kw)
+
+
+def test_release_freezes_and_acquire_thaws(monkeypatch):
+    p = _fc_pool(monkeypatch)
+    s = p.acquire()
+    s.close()
+    assert s.frozen and s.freezes == 1
+    assert s.requests == ["reset_guest"]  # hygiene BEFORE the freeze
+    s2 = p.acquire()
+    assert s2 is s and not s2.frozen and s2.thaws == 1
+    assert FakeVM.booted == 1  # reuse, not a boot
+
+
+def test_frozen_idles_are_invisible_to_max_total(monkeypatch):
+    """A frozen park is files, not RAM: booting past the cap must not
+    sacrifice it, and it must not count against the cap."""
+    p = _fc_pool(monkeypatch, max_total=1)
+    a = p.acquire(image="a")
+    a.close()  # parked frozen under image=a
+    b = p.acquire(image="b")  # boots; cap=1 must NOT reclaim the frozen park
+    assert not a.torn_down
+    assert FakeVM.booted == 2
+    c = p.acquire(image="a")  # thaw the park, no boot
+    assert c is a and c.thaws == 1
+    b.close()
+    c.close()
+
+
+def test_failed_thaw_falls_back_to_fresh_boot(monkeypatch):
+    p = _fc_pool(monkeypatch)
+    s = p.acquire()
+    s.close()
+    s.thaw_fails = True
+    s2 = p.acquire()
+    assert s2 is not s and s.torn_down
+    assert FakeVM.booted == 2
+
+
+def test_prewarm_parks_frozen(monkeypatch):
+    p = _fc_pool(monkeypatch)
+    p.prewarm(1, background=False, image="warm")
+    bucket = p._idle[poolmod._fingerprint({"image": "warm"}, FrozenFakeVM)]
+    assert len(bucket) == 1 and bucket[0][2].frozen
+
+
+def test_vfkit_pool_never_freezes(monkeypatch):
+    """Hot posture unchanged: no freeze attr, park keeps the VM live."""
+    p = _pool(monkeypatch)
+    s = p.acquire()
+    s.close()
+    assert not hasattr(s, "frozen") and not s.torn_down
+    s2 = p.acquire()
+    assert s2 is s

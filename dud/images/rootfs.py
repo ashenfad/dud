@@ -175,6 +175,7 @@ _HOST_ONLY = {
     ("dud", "images"),
     ("dud", "kernels.py"),
     ("dud", "backends", "vfkit.py"),
+    ("dud", "backends", "firecracker.py"),
     ("dud", "backends", "pool.py"),
 }
 
