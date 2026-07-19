@@ -1,26 +1,32 @@
 # dud 🧨
 
-*An immutable firecracker.* Real, disposable machines for versioned agent
-workspaces: tree in, execute against a real filesystem, diff out.
-Versioning belongs to the layer above (e.g.
+*A dumb firecracker.* Real, disposable microVMs that never go off:
+virtualize the state, not the machine. Tree in, execute against a real
+filesystem, diff out. Versioning belongs to the layer above (e.g.
 [nontainer](https://github.com/ashenfad/nontainer)'s providers) — dud
-is deliberately storage-blind.
+is deliberately storage-blind, and the machines are deliberately dumb:
+all the smarts live in state, so any VM can vanish at any moment and
+nothing of value goes with it.
 
-> **Status: pre-alpha, rungs 1–2.** The subprocess backend (real
-> bash, real Python, zero isolation — own-agent-own-laptop posture)
-> and the vfkit microVM backend (macOS, real isolation, ~3 s boot,
-> full conformance suite green over vsock) both work, including
-> OCI-image workspaces with pip-layered packages. Firecracker (Linux)
-> is designed but not built. See [DESIGN.md](DESIGN.md) for the full
-> rationale, [PLAN.md](PLAN.md) for the original staging, and
-> [ROADMAP.md](ROADMAP.md) for what's next from here.
+> **Status: pre-alpha, all three rungs live.** The subprocess backend
+> (real bash, real Python, zero isolation — own-agent-own-laptop
+> posture), the vfkit microVM backend (macOS/HVF), and the firecracker
+> microVM backend (Linux/KVM) all pass the same conformance corpus
+> over the same wire protocol. OCI-image workspaces with pip-layered
+> packages, warm VM pooling with state affinity, a disk-backed scratch
+> plane, and snapshot parking on firecracker (a parked VM is inert
+> files — zero RAM, ~tens-of-ms resume) all work today. See
+> [DESIGN.md](DESIGN.md) for the rationale, [PLAN.md](PLAN.md) for the
+> original staging, and [ROADMAP.md](ROADMAP.md) for what's next.
 
 ## Quick look
 
 ```python
-from dud import Session
+import dud
 
-with Session() as s:
+# backend="subprocess" | "vfkit" | "firecracker" | "vm" (best VM rung
+# for this host — config written against "vm" survives new rungs)
+with dud.session("vm", image="python:3.12-slim") as s:
     s.shell("mkdir -p data && echo 'a,b\n1,2' > data/in.csv")
     r = s.python("""
 import csv
@@ -36,11 +42,16 @@ rows                             # last expression echoes, REPL-style
     # hand d to your versioned store; dud doesn't care what it is
 ```
 
+`pooled=True` reuses VMs across sessions from a process-wide warm
+pool; `state="<your content hash>"` parks and resumes a workspace
+without re-pushing it. On macOS a parked VM stays hot; on firecracker
+it's frozen to disk — same contract, better economics.
+
 Host objects cross the boundary as *names*, not references — guest
 code gets a proxy whose only power is making allowlisted calls:
 
 ```python
-s = Session(host_objects={"db": my_db}, allow={"db": {"query"}})
+s = dud.session(host_objects={"db": my_db}, allow={"db": {"query"}})
 s.python("rows = db.query(filter='active')")   # ok
 s.python("db.drop_all()")                       # PermissionError, host-side
 ```
@@ -55,12 +66,14 @@ substrate hardens:
 
 | rung | platform | isolation |
 |---|---|---|
-| `subprocess` (today) | any OS | none — dev/CI floor |
-| `vfkit` (today) | macOS (HVF) | real Linux microVM |
-| `firecracker` (planned) | Linux/KVM | microVM + jailer, snapshots |
+| `subprocess` | any OS | none — dev/CI floor |
+| `vfkit` | macOS (HVF) | real Linux microVM |
+| `firecracker` | Linux/KVM | microVM + snapshot parking (jailer planned) |
 
-The conformance suite in `tests/conformance/` is the contract: a
-future rung that can't pass it unchanged isn't a rung.
+The conformance suite in `tests/conformance/` is the contract: a rung
+that can't pass it unchanged isn't a rung. Requesting a rung the host
+can't provide raises (`IsolationUnavailable`) — nothing silently
+degrades.
 
 ## Development
 
@@ -68,6 +81,12 @@ future rung that can't pass it unchanged isn't a rung.
 uv sync --extra dev
 uv run pytest
 ```
+
+VM-rung conformance needs the rung's platform: on macOS,
+`DUD_BACKEND=vfkit uv run pytest tests/conformance`; the firecracker
+corpus runs on any Linux with `/dev/kvm` — including, on Apple
+silicon (M3+), a nested-virt Lima guest (`dev/lima-fc.yaml`,
+`dev/fc-test.sh`).
 
 ## License
 
