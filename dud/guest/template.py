@@ -148,6 +148,19 @@ def main() -> None:
 
                 serve(socket.socket(fileno=exec_fd))
             except BaseException:  # noqa: BLE001 — child never re-enters the loop
+                # Say WHY before dying: stderr reaches the VM console
+                # (or pytest capture) — a silently vanishing child is
+                # undiagnosable, and was (CI flake, 2026-07-19).
+                try:
+                    import traceback
+
+                    sys.stderr.write(
+                        f"[dud-template] child {os.getpid()} died pre-exit:\n"
+                    )
+                    traceback.print_exc(file=sys.stderr)
+                    sys.stderr.flush()
+                except BaseException:  # noqa: BLE001
+                    pass
                 os._exit(1)
             os._exit(0)
         os.close(exec_fd)
