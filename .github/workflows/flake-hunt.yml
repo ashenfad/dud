@@ -1,0 +1,38 @@
+# TEMPORARY: hunting the macos-latest/3.13 template-child flake with
+# diagnostics attached (child deaths now print tracebacks). Delete
+# once the cause is pinned. 4 jobs x 75 iterations = 300 rolls of the
+# exact dice that came up bad twice on main.
+name: Flake hunt
+
+on:
+  push:
+    branches: [ template-flake-diagnosis ]
+
+permissions:
+  contents: read
+
+jobs:
+  hunt:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        round: [1, 2, 3, 4]
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+
+    - name: Hammer the template tests
+      run: |
+        for i in $(seq 1 75); do
+          echo "=== iteration $i"
+          pytest tests/guest/test_template.py -q || exit 1
+        done
