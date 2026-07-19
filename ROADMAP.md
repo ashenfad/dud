@@ -65,12 +65,20 @@ Unblocked and now actionable:
   and baseline RAM cost drops from 2x tree to 1x + changes.
   `fs_readonly` exec windows are a *true* r/o remount on this rung
   (rung 1 keeps the documented post-hoc gap).
-- **Workspace at `/`** — the deferred other half of 4-4: mounting the
-  workspace at the root to close the absolute-path fidelity gap (a
-  handler writing `/app/x` lands outside the diff today). Deferred
-  because it changes guest path/cwd semantics that nontainer and
-  studio observe (`__cwd__` persistence, sandtrap parity) — needs the
-  surface layers at the table, not a dud-only decision.
+- ~~**Workspace at the root**~~ **shipped** (2026-07-20) — the
+  deferred other half of 4-4, decided WITH the surface layers at the
+  table (nontainer/studio settled on `/workspace` as the one
+  agent-visible root across executors; a guest can't mount at `/`, a
+  VFS can present any prefix, and `/workspace` is the strongest
+  training prior). The merged overlay now mounts AT the configured
+  root (`dud.root`, default `/workspace`) and the staging trees moved
+  to a stash tmpfs at `/run/dud-stage` — so the agent-visible root
+  contains exactly the workspace, absolute writes like
+  `/workspace/x` land in the upper (in the diff — the fidelity gap,
+  closed), and the backing trees are out of guest reach (mutating a
+  mounted overlay's lower/upper is kernel-UB; they used to sit
+  exposed inside the root). Rung 1 keeps `root/work` (a host temp
+  dir can't claim `/workspace`; documented dev-posture gap).
 - **virtiofs lowerdir**: large workspaces mounted from the host
   instead of tarred over vsock every session. Deferred indefinitely
   (2026-07-19): the scratch plane (3b) routes bulk to disk-cache, so
