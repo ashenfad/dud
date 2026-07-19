@@ -28,7 +28,10 @@ from . import registry, rootfs
 
 # Bump when the flatten/inject/cpio logic changes shape in a way that
 # should invalidate cached rootfs artifacts.
-PIPELINE_VERSION = 1
+# v2: layered packages ship baked hash-based .pyc (imports were
+#     recompiling pandas per exec: ~1s per view GET); debs marker
+#     folded unconditionally into the spec hash.
+PIPELINE_VERSION = 2
 
 # Rootfs media the backend can boot. The medium is folded into the spec
 # hash so a threshold change can never serve a wrong-medium artifact, and
@@ -82,12 +85,7 @@ def _spec_hash(
     h.update(f"{workspace}\0".encode())
     h.update(f"{medium}\0".encode())
     h.update(("\0".join(packages) + "\0").encode())
-    if debs:
-        # Folded only when present so pre-debs cached specs stay valid.
-        # (Theoretical collision with a package literally named
-        # "debs:x" — unreachable with valid pip names; fold this
-        # unconditionally at the next PIPELINE_VERSION bump.)
-        h.update(("debs:" + "\0".join(debs) + "\0").encode())
+    h.update(("\0".join(debs) + "\0").encode())
     h.update(_dud_code_hash().encode())
     return h.hexdigest()[:24]
 
@@ -192,7 +190,39 @@ def _layer_packages(fileset, packages: list[str], arch: str) -> None:
     py = wheels.python_version_from_site(site)
     with tempfile.TemporaryDirectory(prefix="dud-wheels-") as td:
         wheels.resolve_wheels(packages, Path(td), arch, py)
+        _bytecompile(Path(td), py)
         wheels.add_target_tree(fileset, Path(td), site)
+
+
+def _bytecompile(root: Path, py: str) -> None:
+    """Bake .pyc files into the layered tree.
+
+    Wheels unpacked by resolve_wheels carry no bytecode, and the guest
+    can't durably write any (script model resets; erofs roots are
+    immutable) — so without this, EVERY exec recompiles its imports
+    from source (measured: ~1s per view GET, almost entirely pandas
+    recompilation). Hash-based UNCHECKED pycs are the right kind for a
+    baked image: sources never change underneath them, and they dodge
+    both our deterministic zero mtimes and the validation stat.
+
+    Bytecode is minor-version-scoped, so only bake when the host
+    interpreter matches the guest's (python:3.12-* guest, 3.12 host —
+    the studio norm); a mismatch silently skips, costing speed only.
+    """
+    import compileall
+    import py_compile
+
+    host_py = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if host_py != py:
+        return
+    # workers=1 = sequential in-process: parallel workers use
+    # multiprocessing spawn, which re-imports the caller's __main__ —
+    # a landmine for embedded callers (REPLs, heredocs). One-time cost
+    # per image build; a few seconds is fine.
+    compileall.compile_dir(
+        str(root), quiet=2, workers=1,
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
 
 
 def _layer_debs(fileset, names: list[str], arch: str, home: Path) -> None:

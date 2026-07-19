@@ -130,6 +130,18 @@ app, immutability physical rather than procedural), and any future
 format without host tooling. Size-based auto-selection (small →
 initramfs, big → erofs) once both exist.
 
+### 2b. View-exec latency (preview GETs)
+
+Baked hash-based ``.pyc`` into layered packages (pipeline v2) — every
+exec was recompiling its imports from source (~1 s per preview GET,
+almost all pandas). Measured after: session switch on a warm pool
+0.65 s; preview API GETs 370–580 ms (was ~1 s). The remaining floor
+is per-exec interpreter spawn + pandas module init (~0.4 s). Next
+lever if it matters: a session-persistent read-only **view worker**
+in the guest — imports warm, fresh namespace per request (sandtrap
+served views from a warm process too, so this is parity, not a
+cheat). Pairs naturally with the stage-6 dispatch pool.
+
 ### 3. VM lifecycle hardening
 
 Cheap, high-value, mostly host-side:
