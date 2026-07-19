@@ -129,3 +129,51 @@ def test_user_error_is_not_a_worker_failure(sup):
     sup._note_worker_outcome(user_err)
     assert sup._template is not None  # guest answered: the worker works
     theirs.close()
+
+
+def test_exec_once_dead_worker_is_crash_shaped(sup):
+    """A forked child that died before serving must come back as a
+    RunnerCrash result — the shape the breaker and the spawn-path
+    retry key on — not leak a raw BrokenPipeError to the wire."""
+
+    class _DeadProc:
+        pid = 999998
+        returncode = -1
+
+        def poll(self):
+            return -1
+
+        def wait(self, timeout=None):
+            return -1
+
+    ours, theirs = socket.socketpair()
+    theirs.close()  # the "child" is already gone
+    body = sup._exec_once((ours, _DeadProc()), "/", {}, {"code": "x"}, 5.0)
+    assert body["error"]["etype"] == "RunnerCrash"
+
+
+def test_view_exec_crash_falls_back_to_spawn_path(sup, tmp_path):
+    """The worker path may flake (child dies unserved); the caller
+    must still get their view result — one spawn-path retry, and the
+    breaker still counts the crash."""
+
+    class _DeadProc:
+        pid = 999997
+        returncode = -1
+
+        def poll(self):
+            return -1
+
+        def wait(self, timeout=None):
+            return -1
+
+    def fake_fork(cwd, env):
+        ours, theirs = socket.socketpair()
+        theirs.close()
+        return ours, _DeadProc()
+
+    sup._fork_from_template = fake_fork
+    body, bins = sup.do_exec_python(
+        {"code": "answer = 41 + 1", "fs_readonly": True}, [])
+    assert body["ok"], body
+    assert sup._worker_failures == 1  # the crash was still counted

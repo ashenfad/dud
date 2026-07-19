@@ -372,33 +372,57 @@ class Supervisor:
             # there yet, takes the identical spawn path.
             forked = (self._fork_from_template(cwd, env)
                       if body.get("fs_readonly") else None)
+            result = self._exec_once(forked, cwd, env, run_body, timeout)
             if forked is not None:
-                parent, proc = forked
-            else:
-                parent, child = socketlib.socketpair()
-                proc = subprocess.Popen(
-                    [sys.executable, "-m", "dud.guest.runner",
-                     str(child.fileno())],
-                    pass_fds=(child.fileno(),),
-                    cwd=cwd,
-                    env=env,
-                    start_new_session=True,
-                )
-                child.close()
-            rchan = Channel(parent)
-            rchan._next_id += 1
-            rid = rchan._next_id
+                self._note_worker_outcome(result)
+                err = (result or {}).get("error")
+                if err and err.get("etype") == "RunnerCrash":
+                    # A worker child that died without ever answering
+                    # (fork-env fragility: setsid pid collisions and
+                    # kin — observed on loaded CI runners). The spawn
+                    # path is the structural fallback, so take it once
+                    # for THIS exec rather than surfacing a crash the
+                    # caller didn't earn. Same at-most-once-observed
+                    # doctrine as executor recovery: state can't have
+                    # moved (fs_readonly), hostcalls may repeat.
+                    # Timeouts are excluded — user code ran there.
+                    result = self._exec_once(None, cwd, env, run_body,
+                                             timeout)
+        return result, []
+
+    def _exec_once(self, forked, cwd: str, env: dict, run_body: dict,
+                   timeout: float) -> dict:
+        """One runner lifecycle: connect (forked worker or fresh
+        spawn), send the run request, pump to a result, clean up."""
+        if forked is not None:
+            parent, proc = forked
+        else:
+            parent, child = socketlib.socketpair()
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "dud.guest.runner",
+                 str(child.fileno())],
+                pass_fds=(child.fileno(),),
+                cwd=cwd,
+                env=env,
+                start_new_session=True,
+            )
+            child.close()
+        rchan = Channel(parent)
+        rchan._next_id += 1
+        rid = rchan._next_id
+        try:
             rchan._send_msg(
                 {"id": rid, "kind": "req", "verb": "run", "body": run_body}, []
             )
-            try:
-                result = self._pump_runner(rchan, rid, proc, timeout)
-            finally:
-                rchan.close()
-                self._reap(proc)
-        if forked is not None:
-            self._note_worker_outcome(result)
-        return result, []
+            return self._pump_runner(rchan, rid, proc, timeout)
+        except OSError:
+            # EPIPE at send: the runner died before taking the request.
+            # Crash-shaped, so the breaker and the retry above see it —
+            # a raw BrokenPipeError reply would look like a wire bug.
+            return self._crash_result(proc)
+        finally:
+            rchan.close()
+            self._reap(proc)
 
     def _note_worker_outcome(self, result: dict) -> None:
         """Circuit breaker: a template whose children keep timing out
