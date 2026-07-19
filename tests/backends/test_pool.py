@@ -37,6 +37,8 @@ class FakeVM:
         self.torn_down = False
         self._in_flight = 0
         self.last_used = 0.0
+        self._scratch_master = "fake-master"  # truthy: promotion armed
+        self.promotions = 0
         outer = self
 
         class Ch:
@@ -53,6 +55,11 @@ class FakeVM:
         if self.dead:
             raise ConnectionError("vm died")
         return {"pong": True}
+
+    def promote_scratch(self):
+        # Mirrors the real guard: teardown disarms by clearing the master.
+        if self._scratch_master is not None:
+            self.promotions += 1
 
     def close(self):
         if self._closed:
@@ -145,6 +152,63 @@ def test_ttl_expires_parked_vms(monkeypatch):
     a.close()
     b = p.acquire(image="x")  # lazy expiry runs first: a is stale
     assert b is not a and FakeVM.booted == 2
+
+
+def test_park_promotes_scratch_disposal_never_does(monkeypatch):
+    """The scratch contract's clean-path gate at the pool layer: a park
+    (successful reset) promotes; every disposal path — TTL expiry,
+    overflow, reclaim, failed reset — must NOT publish scratch (a
+    reclaimed VM was never quiesced; a TTL victim's clone is staler
+    than whatever parked since)."""
+    p = _no_auto(_pool(monkeypatch, max_idle=1, max_total=None))
+    a = p.acquire(image="x")
+    a.close()  # park: promote exactly once
+    assert a.promotions == 1
+
+    b = p.acquire(image="x")  # note: reuses a (same object)
+    c = p.acquire(image="x")
+    b.close()
+    parked = b.promotions  # every promotion so far was a legitimate park
+    c.close()  # overflow: b (older) is torn down
+    assert b.torn_down
+    assert b.promotions == parked  # the eviction itself promoted nothing
+    assert b._scratch_master is None  # disposal disarmed promotion
+
+    # Failed reset: teardown instead of park, no promotion.
+    d = p.acquire(image="fresh-z")  # new fingerprint: a pristine FakeVM
+    d.dead = True
+    d.close()
+    assert d.torn_down and d.promotions == 0
+
+    # Bound reclaim under max_total: never a promotion.
+    p2 = _no_auto(_pool(monkeypatch, max_total=1))
+    e = p2.acquire(image="x")
+    p2.acquire(image="y")  # forces reclaim of bound LRU e
+    assert e.torn_down and e.promotions == 0
+
+
+def test_refill_respects_max_total(monkeypatch):
+    p = _no_auto(_pool(monkeypatch, max_total=2))
+    a = p.acquire(image="x")
+    b = p.acquire(image="x")
+    p.prewarm(2, background=False, image="x")  # cap full: no boots
+    assert FakeVM.booted == 2
+    a.close()
+    b.close()
+    p._refill(_key(image="x"))  # room now exists as idle slots drain in
+    assert FakeVM.booted == 2  # still capped: bound+idle == max_total
+
+
+def test_make_room_spares_prewarm_floor(monkeypatch):
+    """Reclaiming a prewarm-target VM would just re-boot it (churn):
+    the floor is exempt from idle-victim selection, so the cap
+    over-boots instead."""
+    p = _no_auto(_pool(monkeypatch, max_total=1))
+    p.prewarm(1, background=False, image="x")
+    warm = p._idle[_key(image="x")][0][2]
+    p.acquire(image="y")  # needs room; the only idle VM is floored
+    assert warm.torn_down is False
+    assert FakeVM.booted == 2  # over-boot, cap as pressure valve
 
 
 def test_reset_guest_over_real_guest():

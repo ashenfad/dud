@@ -170,7 +170,13 @@ class VmPool:
                     return
                 oldest: tuple[float, str, int] | None = None
                 for key, bucket in self._idle.items():
+                    # Prewarm-floor VMs (the newest n of a targeted
+                    # key) are exempt, as with TTL: reclaiming one just
+                    # triggers a re-boot churn loop under pressure.
+                    floor = self._targets.get(key, (0, None))[0]
                     for i, (t, _tag, _s) in enumerate(bucket):
+                        if i < floor:
+                            continue
                         if oldest is None or t < oldest[0]:
                             oldest = (t, key, i)
                 if oldest is not None:
@@ -233,6 +239,12 @@ class VmPool:
                     n, boot_kwargs = target
                     if len(self._idle.get(key) or ()) >= n:
                         return
+                    if self.max_total is not None:
+                        total = len(self._bound) + sum(
+                            len(b) for b in self._idle.values()
+                        )
+                        if total >= self.max_total:
+                            return  # the cap outranks the warm target
                 try:
                     session = VfkitSession(**boot_kwargs)
                 except Exception:
@@ -264,6 +276,14 @@ class VmPool:
         except Exception:
             self._teardown(session)
             return
+        # A successful reset means the guest is alive and synced: an
+        # intermediate scratch promotion here means the cache survives
+        # even if the parked VM later dies. Best-effort by the scratch
+        # contract — a failed promotion is a cold cache, not an error.
+        try:
+            session.promote_scratch()
+        except Exception:
+            pass
         key = _fingerprint(session._pool_kwargs)
         with self._lock:
             stale = self._expire_locked()
@@ -300,6 +320,12 @@ class VmPool:
         # close() no-ops and the VM process would leak.
         with self._lock:
             self._bound.pop(id(session), None)
+        # Disposal is NOT a clean park: TTL expiry, overflow, reclaim,
+        # and failed-reset all land here, and none of them may publish
+        # scratch (a reclaimed VM was never quiesced; a TTL victim's
+        # clone is staler than whatever parked since). Parked victims
+        # already promoted at park time, so nothing true is lost.
+        session._scratch_master = None
         session._pool = None
         session._closed = False
         try:

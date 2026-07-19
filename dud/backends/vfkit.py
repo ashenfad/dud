@@ -129,6 +129,22 @@ def _sweep_once() -> None:
             pass  # hygiene, never a boot blocker
 
 
+def _clone_or_copy(src: Path, dest: Path) -> None:
+    """APFS clonefile when possible (instant, CoW, zero extra disk),
+    real copy where the flag or filesystem doesn't support it —
+    correctness first, speed when available."""
+    r = subprocess.run(["cp", "-c", str(src), str(dest)],
+                       capture_output=True)
+    if r.returncode != 0:
+        shutil.copyfile(src, dest)
+
+
+def _scratch_device(medium: str, n_disks: int) -> str:
+    """Guest name of the scratch volume: it is attached last, after
+    the rootfs block device (erofs only) and any extra disks."""
+    return "/dev/vd" + "abcdefghij"[(1 if medium == "erofs" else 0) + n_disks]
+
+
 def _medium_boot_args(rootfs_path: Path, medium: str, rundir: str) -> list[str]:
     """VMM args that provide the rootfs, chosen by its medium."""
     if medium == "initramfs":
@@ -149,15 +165,7 @@ def _medium_boot_args(rootfs_path: Path, medium: str, rundir: str) -> list[str]:
         from ..images.cpio import FileSet, build_cpio_gz
 
         clone = Path(rundir) / rootfs_path.name
-        # cp -c = APFS clonefile (instant CoW). Fall back to a real
-        # copy where the flag doesn't exist (GNU cp) or cloning fails
-        # (non-APFS volume) — correctness first, speed when available.
-        cloned = subprocess.run(
-            ["cp", "-c", str(rootfs_path), str(clone)],
-            capture_output=True,
-        )
-        if cloned.returncode != 0:
-            shutil.copyfile(rootfs_path, clone)
+        _clone_or_copy(rootfs_path, clone)
         dummy = Path(rundir) / "empty.cpio.gz"
         dummy.write_bytes(build_cpio_gz(FileSet()))
         return [
@@ -194,6 +202,7 @@ class VfkitSession(HostSession):
         debs: list[str] | None = None,
         disks: list[str | Path] | None = None,
         medium: str = "initramfs",
+        scratch: str | Path | None = None,
         host_objects: dict[str, Any] | None = None,
         allow: dict[str, set[str]] | None = None,
         cache: dict[str, bytes] | None = None,
@@ -206,6 +215,8 @@ class VfkitSession(HostSession):
             # Validate up front: fail before any pull/build work is spent.
             if not Path(disk).is_file():
                 raise IsolationUnavailable(f"disk image not found: {disk}")
+        if scratch is not None and not Path(scratch).is_file():
+            raise IsolationUnavailable(f"scratch volume not found: {scratch}")
         # Pooling hooks (see backends/pool.py): when a pool owns this VM,
         # close() parks it there instead of powering off; _pool_kwargs is
         # the boot fingerprint source. park_state (stamped by the owner
@@ -221,6 +232,10 @@ class VfkitSession(HostSession):
             "home": home, "packages": packages, "debs": debs,
             "disks": [str(d) for d in disks] if disks else None,
             "medium": medium,
+            # Scratch is boot identity on purpose: a pooled VM may only
+            # serve sessions keyed to the SAME master (no cross-key
+            # cache leakage through reuse).
+            "scratch": str(scratch) if scratch else None,
         }
         home = Path(home) if home else dud_home()
         arch = arch or _host_arch()
@@ -248,11 +263,26 @@ class VfkitSession(HostSession):
         self._srv.bind(self._sock_path)
         self._srv.listen(1)
 
+        # Scratch volume: a per-boot CoW clone of the caller's master
+        # (VZ exclusively locks r/w attachments, so VMs can't share the
+        # file). The clone IS the persisted artifact — promotion back
+        # to the master is a clonefile+rename on clean park/shutdown.
+        self._scratch_master = Path(scratch) if scratch else None
+        self._scratch_clone: Path | None = None
+        if self._scratch_master is not None:
+            self._scratch_clone = Path(self._rundir) / "scratch.img"
+            _clone_or_copy(self._scratch_master, self._scratch_clone)
+
         cmdline = (
             f"console=hvc0 random.trust_cpu=on "
             f"dud.mode=connect dud.cid={_HOST_CID} dud.port={_VSOCK_PORT} "
             f"dud.root={workspace}"
         ) + _medium_cmdline(self.build.medium)
+        if self._scratch_clone is not None:
+            cmdline += (
+                f" dud.scratch="
+                f"{_scratch_device(self.build.medium, len(disks or []))}"
+            )
         args = [
             vfkit, "--cpus", str(cpus), "--memory", str(memory_mib),
             "--kernel", str(kernel_path),
@@ -270,6 +300,8 @@ class VfkitSession(HostSession):
         # the root itself is a block device (erofs).
         for disk in disks or []:
             args += ["--device", f"virtio-blk,path={Path(disk)}"]
+        if self._scratch_clone is not None:
+            args += ["--device", f"virtio-blk,path={self._scratch_clone}"]
         self._vfkit_log = open(os.path.join(self._rundir, "vfkit.log"), "wb")
         self._proc = subprocess.Popen(args, stdout=self._vfkit_log,
                                       stderr=subprocess.STDOUT)
@@ -307,6 +339,35 @@ class VfkitSession(HostSession):
         except OSError:
             return "(no console output)"
 
+    # ---- scratch -------------------------------------------------------
+
+    def promote_scratch(self) -> None:
+        """Publish this VM's scratch clone as the new master.
+
+        Cache semantics: last CLEAN park/shutdown wins; a crashed VM's
+        clone is never promoted (it dies with the rundir — losing a
+        cache is an inconvenience, not an error). Callers ensure the
+        guest has synced first (``reset_guest`` syncs; kernel poweroff
+        syncs); the ext4 journal covers the copy being taken of a
+        still-mounted volume.
+        """
+        if self._scratch_master is None or self._scratch_clone is None:
+            return
+        if not self._scratch_clone.exists():
+            return
+        # Unique temp per promoter: concurrent same-master promotions
+        # (two viewer sessions of one published app parking at once)
+        # must not share a staging path — a shared name lets one
+        # replace the other's half-written copy over the master.
+        part = self._scratch_master.with_suffix(
+            f".promote.{os.getpid()}.{id(self):x}"
+        )
+        try:
+            _clone_or_copy(self._scratch_clone, part)
+            part.replace(self._scratch_master)
+        finally:
+            part.unlink(missing_ok=True)  # crash between clone and replace
+
     # ---- teardown ------------------------------------------------------
 
     def _teardown_vm(self) -> None:
@@ -331,8 +392,10 @@ class VfkitSession(HostSession):
             self._pool.release(self)
             return
         # shutdown verb -> supervisor stops serving -> init powers the VM off.
+        clean = False
         try:
             self._ch.request("shutdown")
+            clean = True
         except Exception:
             pass
         try:
@@ -343,6 +406,14 @@ class VfkitSession(HostSession):
             self._proc.wait(timeout=8)
         except subprocess.TimeoutExpired:
             self._teardown_vm()
+            clean = False
+        if clean:
+            # Graceful poweroff: the kernel synced the scratch volume
+            # on the way down, so the clone is promotable.
+            try:
+                self.promote_scratch()
+            except OSError:
+                pass
         for closeable in (self._srv, self._vfkit_log):
             try:
                 closeable.close()

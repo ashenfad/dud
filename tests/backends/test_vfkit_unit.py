@@ -90,6 +90,27 @@ def test_medium_cmdline():
     assert "ro" in extra.split() and "rootwait" in extra.split()
 
 
+def test_scratch_device_names_by_medium_and_disks():
+    """Scratch attaches last: after the erofs root device (if any) and
+    any extra disks."""
+    assert vfkit._scratch_device("initramfs", 0) == "/dev/vda"
+    assert vfkit._scratch_device("initramfs", 2) == "/dev/vdc"
+    assert vfkit._scratch_device("erofs", 0) == "/dev/vdb"
+    assert vfkit._scratch_device("erofs", 2) == "/dev/vdd"
+
+
+def test_missing_scratch_volume_fails_closed(tmp_path, monkeypatch):
+    import platform
+
+    if platform.system() != "Darwin":
+        pytest.skip("vfkit ctor is Darwin-only")
+    monkeypatch.setenv("DUD_HOME", str(tmp_path))
+    from dud.backends.vfkit import VfkitSession
+
+    with pytest.raises(IsolationUnavailable, match="scratch volume not found"):
+        VfkitSession(scratch=tmp_path / "nope.ext4")
+
+
 def _rundir(tmp_path, name, pid=None, age=0.0):
     import os
     import time

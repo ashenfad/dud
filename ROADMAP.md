@@ -72,7 +72,11 @@ Unblocked and now actionable:
   studio observe (`__cwd__` persistence, sandtrap parity) — needs the
   surface layers at the table, not a dud-only decision.
 - **virtiofs lowerdir**: large workspaces mounted from the host
-  instead of tarred over vsock every session.
+  instead of tarred over vsock every session. Deferred indefinitely
+  (2026-07-19): the scratch plane (3b) routes bulk to disk-cache, so
+  state stays small — kvgit's own assumption — and eager hydration
+  (~0.4 s / 200 MB) stops mattering. Revisit only if large *source*
+  data (user uploads that are genuinely state) becomes common.
 
 The kernel is rehosted as a dud release asset
 ([kernel-kata-3.32.0](https://github.com/ashenfad/dud/releases/tag/kernel-kata-3.32.0),
@@ -182,6 +186,23 @@ are just deliberate deaths.
   in ~1 s). Find or add a readiness signal. Matters less now that
   reuse skips boots and recovery is rare, but still paid on pool
   misses and first opens.
+
+### 3b. ~~The scratch plane~~ shipped (2026-07-19)
+
+Disk as a cache for computation (DESIGN.md "The scratch plane"):
+``VfkitSession(scratch=master.img)`` attaches a per-boot CoW clone of
+an ext4 volume mounted over ``/tmp`` — cache, not state (never in
+diffs/commits/forks; promoted to the master only on clean
+park/shutdown, discarded on crash; ext4 journal = no guest fsck).
+``dud.images.scratch.blank_ext4(size)`` bakes the blank master
+(self-hosted mke2fs via pinned e2fsprogs debs; native tool when the
+host has one), cached per size class. Scratch is part of the boot
+fingerprint, so pooled VMs never leak cache across keys. Intended
+customer: published apps (frozen commit → cache can't go stale) —
+wiring the key choice (token/commit → master path) into
+nontainer/studio is the remaining surface work. This deliberately
+replaced the lazy-hydration track: state stays small and eager
+(kvgit's own assumption), computation residue gets the disk.
 
 ### 4. Dogfood gate, now with real walls
 

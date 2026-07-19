@@ -12,9 +12,11 @@ merged-usr-aware machinery layers use.
 This is deliberately NOT apt: no dependency resolution, no maintainer
 scripts, no alternatives. Each pin is exactly one deb to unpack;
 suitable only for leaf tools whose runtime deps already ship in the
-base image (checked live once, then pinned). First user: erofs-utils
-for the self-hosted image builder — its deps on bookworm (libc6,
-liblz4-1, libselinux1, libuuid1) are all present in python:*-slim.
+base image (checked live once, then pinned) — or whose few missing
+libs are themselves pinned alongside, same-source same-version. First
+user: erofs-utils for the self-hosted image builder (bookworm deps
+all in python:*-slim); second: e2fsprogs + its two sibling libs for
+the scratch-volume bake.
 """
 
 from __future__ import annotations
@@ -58,6 +60,46 @@ DEBS: dict[tuple[str, str], DebSpec] = {
         ),
         sha256=(
             "e60b4d4c582a0f18b919adba9d955a789ffb96506a389414e69f795b1f73f6d6"
+        ),
+    ),
+    # mke2fs for the scratch-volume bake (dud.images.scratch). Unlike
+    # erofs-utils, e2fsprogs' library deps are NOT all in python:slim,
+    # so its two sibling libs ride along (same source package, same
+    # version — this is still pinning, not resolution).
+    ("e2fsprogs", "arm64"): DebSpec(
+        name="e2fsprogs",
+        version="1.47.0-2+b2",
+        arch="arm64",
+        url=(
+            "https://deb.debian.org/debian/pool/main/e/e2fsprogs/"
+            "e2fsprogs_1.47.0-2+b2_arm64.deb"
+        ),
+        sha256=(
+            "9842c31d32c897e3414168c4fab34cddd1633adacbc7858896e7a797d1be1b24"
+        ),
+    ),
+    ("libext2fs2", "arm64"): DebSpec(
+        name="libext2fs2",
+        version="1.47.0-2+b2",
+        arch="arm64",
+        url=(
+            "https://deb.debian.org/debian/pool/main/e/e2fsprogs/"
+            "libext2fs2_1.47.0-2+b2_arm64.deb"
+        ),
+        sha256=(
+            "c1d2551a6238d6a1c64601a0d68183573ca2b5dbd213068d50eaa0747ac1b406"
+        ),
+    ),
+    ("libcom-err2", "arm64"): DebSpec(
+        name="libcom-err2",
+        version="1.47.0-2+b2",
+        arch="arm64",
+        url=(
+            "https://deb.debian.org/debian/pool/main/e/e2fsprogs/"
+            "libcom-err2_1.47.0-2+b2_arm64.deb"
+        ),
+        sha256=(
+            "36c15f933a965b50f4c9558d792d9556934c84e532703935d8ae7e69dd3fa863"
         ),
     ),
 }

@@ -103,6 +103,53 @@ snapshot on the next turn. Fork = provider branch (O(1)) + fresh VM
 pointed at it. Restore = re-materialize a different commit. VM lifetime
 is a tuning knob, never a correctness concern.
 
+## The scratch plane: disk as a cache for computation
+
+A guest sees three planes, with progressively weaker guarantees and
+progressively cheaper writes:
+
+| plane | where | guarantee |
+|---|---|---|
+| **state** | the workspace | committed, versioned, the *complete* description of a session |
+| **cache** | the kv `cache` | managed, transactional (writes land only on successful execs) |
+| **scratch** | `/tmp` | best-effort memoization; may vanish at any moment |
+
+The scratch plane is the formalization of what was previously
+"out-of-workspace residue": a writable ext4 volume mounted over
+`/tmp`, whose contents are **cache in the strict sense** — derived,
+re-derivable, and droppable without correctness consequences. The
+commit remains the complete guarantee of state *because* scratch is
+structurally excluded from it: scratch never appears in diffs, never
+enters commits, is never restored, and a fork always starts cold.
+Anything an app must not lose does not belong in `/tmp`.
+
+The intended customer is a **published app** (a frozen snapshot): its
+commit never advances, so a scratch keyed to it can never go stale —
+materialize an index on the first query, serve every later query
+fast. Interactive sessions get VM-lifetime scratch only (their commit
+moves every checkpoint; don't version scratch against history — that
+way lies blurring the state guarantee).
+
+Mechanics (VM rungs): a blank sparse ext4 **master** is baked once
+per size class (self-hosted `mke2fs`, like the erofs build; native on
+hosts that have it). Each boot attaches a CoW **clone** of the
+caller's master and mounts it over `/tmp` — nothing is copied, blocks
+materialize as touched. On a *clean* park or shutdown the clone is
+promoted back to the master (clonefile + atomic rename;
+last-clean-wins — it's cache). A crashed VM's clone is discarded with
+its rundir, and the ext4 journal means a promoted-mid-flight volume
+mounts clean in-kernel, no guest fsck. The master's path is part of
+the VM's **boot fingerprint**, so a pooled VM only ever serves
+sessions keyed to the same scratch — no cross-key cache leakage
+through reuse.
+
+Two properties keep the contract honest. First, the disposable thesis
+*polices* it: VM death, pool reclaim, and eviction clear scratch
+constantly and randomly, so code that secretly depends on it breaks
+in development, not production. Second, scratch is a shared surface
+within its key — handlers serving multiple viewers must not stash
+per-viewer secrets in `/tmp`, the same rule as any server-side cache.
+
 ## Wire protocol
 
 One channel between host and guest supervisor (vsock for VMs, unix

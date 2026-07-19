@@ -135,6 +135,10 @@ class Supervisor:
                 time.sleep(0.02)
         self.stage.reset_guest(bool(body.get("keep_tree")))
         self.shell = ShellState(cwd=str(self.work), env=dict(self._boot_env))
+        # Flush block-backed state (the scratch volume) so the host's
+        # park-time promotion copies a consistent image.
+        if os.getpid() == 1:
+            os.sync()
         return {}, []
 
     def do_exec_python(self, body, bins):

@@ -13,6 +13,8 @@ Kernel cmdline knobs (space-separated in ``/proc/cmdline``):
   ``dud.cid=N``      peer CID to connect to (default 2 = host)
   ``dud.mode=M``     ``connect`` (default) or ``listen``
   ``dud.root=PATH``  workspace root (default from the /init wrapper)
+  ``dud.scratch=DEV``  ext4 scratch volume to mount over /tmp (cache
+                       plane: best-effort, never boot-blocking)
 """
 
 from __future__ import annotations
@@ -55,6 +57,25 @@ def _mount_essentials() -> None:
     _mount("devpts", "/dev/pts", "devpts")
     _mount("tmpfs", "/run", "tmpfs")
     _mount("tmpfs", "/tmp", "tmpfs")
+
+
+def _mount_scratch(dev: str) -> None:
+    """Mount the scratch volume over /tmp's tmpfs. Best-effort by the
+    scratch contract: scratch is cache, so a missing or unmountable
+    volume must never stop the machine — the session just runs with a
+    RAM-backed /tmp. A volume from a crashed VM mounts clean without
+    userspace fsck: ext4 journal replay happens in-kernel at mount."""
+    deadline = time.monotonic() + 2.0
+    while not os.path.exists(dev) and time.monotonic() < deadline:
+        time.sleep(0.05)  # virtio-blk probes async
+    if not os.path.exists(dev):
+        _log(f"scratch device {dev} never appeared; /tmp stays tmpfs")
+        return
+    _mount(dev, "/tmp", "ext4")
+    try:
+        os.chmod("/tmp", 0o1777)  # ext4 root dir is 0755; /tmp is 1777
+    except OSError:
+        pass
 
 
 def _log(msg: str) -> None:
@@ -123,6 +144,8 @@ def main(default_root: str = "/workspace") -> None:
     mode = opts.get("mode", "connect")
     root = Path(opts.get("root", default_root))
     root.mkdir(parents=True, exist_ok=True)
+    if is_pid1 and opts.get("scratch"):
+        _mount_scratch(opts["scratch"])
 
     # Children (the python runner) inherit this so `-m dud.guest.runner`
     # resolves even if the package lives outside the default sys.path.
