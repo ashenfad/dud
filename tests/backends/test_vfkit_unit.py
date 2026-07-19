@@ -172,7 +172,14 @@ def test_vfkit_alive_rejects_dead_and_reused_pids():
     p = subprocess.Popen([sys.executable, "-c",
                           f"import time; time.sleep(30)  # {marker}"])
     try:
-        assert vfkit._vfkit_alive(p.pid, marker) is True
+        # ps can catch the child between fork and exec (argv not yet
+        # the marker-bearing one) — poll briefly rather than flake.
+        import time
+
+        deadline = time.monotonic() + 5.0
+        while not vfkit._vfkit_alive(p.pid, marker):
+            assert time.monotonic() < deadline, "argv never showed marker"
+            time.sleep(0.05)
     finally:
         p.kill()
         p.wait()

@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e ".[dev]"
+
+    # The full tree: host unit tests plus the conformance corpus on
+    # the subprocess rung (DUD_BACKEND defaults to subprocess; VM-rung
+    # tests skip without vfkit/KVM). Firecracker conformance under
+    # real /dev/kvm is a separate, planned workflow (needs amd64
+    # kernel + deb pins).
+    - name: Run tests
+      run: |
+        pytest tests/ -v
+
+    - name: Run linter
+      run: |
+        ruff check dud/

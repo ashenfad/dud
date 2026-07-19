@@ -4,11 +4,32 @@ version = "0.0.1"
 description = "A dumb firecracker: real, disposable machines for versioned agent workspaces"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+authors = [
+    {name = "ashenfad"},
+]
+keywords = ["agents", "sandbox", "microvm", "firecracker", "vfkit", "workspace"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = []
 
+[project.urls]
+"Homepage" = "https://github.com/ashenfad/dud"
+"Documentation" = "https://github.com/ashenfad/dud#readme"
+"Bug Tracker" = "https://github.com/ashenfad/dud/issues"
+"Source" = "https://github.com/ashenfad/dud"
+
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff"]
 
 [build-system]
 requires = ["hatchling"]

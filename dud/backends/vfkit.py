@@ -82,8 +82,11 @@ def _vfkit_alive(pid: int, rundir: str) -> bool:
     check guards against pid reuse: every vfkit invocation carries its
     rundir in its args (socketURL/console paths)."""
     try:
+        # -ww: unlimited width. procps (Linux) otherwise truncates to
+        # $COLUMNS even when piped (pytest exports COLUMNS=80), which
+        # cut argv before the rundir and made live VMs look stale.
         out = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "command="],
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True, text=True,
         )
     except OSError:
