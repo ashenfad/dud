@@ -56,6 +56,15 @@ _VSOCK_PORT = 1024
 _GUEST_CID = 3  # any CID > 2; the guest still dials CID 2 (the host)
 
 
+def _write_marker(path: Path, text: str) -> None:
+    """Atomic marker write (tmp + rename): a concurrent sweep must see
+    the old content or the new content, never a torn/empty file (which
+    reads as a garbage marker and gets the bundle reaped)."""
+    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
 def _fc_bin() -> str:
     exe = os.environ.get("DUD_FIRECRACKER") or shutil.which("firecracker")
     if not exe or not Path(exe).exists():
@@ -192,8 +201,9 @@ class FirecrackerSession(HostSession):
 
     # ---- firecracker API plane ----------------------------------------
 
-    def _api(self, method: str, resource: str, body: dict | None = None) -> None:
-        conn = _UnixHTTPConnection(self._api_sock)
+    def _api(self, method: str, resource: str, body: dict | None = None,
+             timeout: float = 5.0) -> None:
+        conn = _UnixHTTPConnection(self._api_sock, timeout=timeout)
         try:
             conn.request(method, resource,
                          body=json.dumps(body) if body is not None else None,
@@ -318,6 +328,8 @@ class FirecrackerSession(HostSession):
         exactly as long as this process lives."""
         if self.frozen:
             return
+        if self._closed and self._pool is None:
+            raise RuntimeError("cannot freeze a closed session")
         # Close the listener before the freeze verb: the guest starts
         # redialing the moment it acks, and those dials must bounce
         # rather than land on the pre-freeze listener.
@@ -327,19 +339,39 @@ class FirecrackerSession(HostSession):
             pass
         self._ch.request("freeze")
         self._ch.close()
+        # A paused guest can never see channel EOF, so if we die
+        # between Pause and the VMM kill the process-linkage cascade is
+        # dead and the VMM would dangle forever. The freezing marker
+        # (host pid + VMM pid) lets any later sweep finish the job:
+        # owner dead -> kill the recorded VMM if it still serves this
+        # rundir, then reap the bundle.
+        _write_marker(Path(self._rundir, "freezing"),
+                      f"{os.getpid()} {self._proc.pid}")
         self._api("PATCH", "/vm", {"state": "Paused"})
         for name in ("vmstate", "mem"):
             try:
                 os.unlink(os.path.join(self._rundir, name))
             except OSError:
                 pass
+        # snapshot/create answers only after writing the FULL guest
+        # memory file — size the timeout to RAM at worst-case ~25 MB/s
+        # (loaded disks, cloud block storage), never the 5s default.
+        mem_mib = int(self._pool_kwargs.get("memory_mib") or 2048)
         self._api("PUT", "/snapshot/create", {
             "snapshot_type": "Full",
             "snapshot_path": os.path.join(self._rundir, "vmstate"),
             "mem_file_path": os.path.join(self._rundir, "mem"),
-        })
+        }, timeout=max(60.0, mem_mib / 25.0))
+        # Marker order matters against a concurrent sweep: publish
+        # `frozen` (atomically — a torn read must not look like a
+        # garbage marker) BEFORE the VMM dies, so there is no instant
+        # where the rundir shows only a dead pidfile.
+        _write_marker(Path(self._rundir, "frozen"), str(os.getpid()))
         self._teardown_vm()
-        Path(self._rundir, "frozen").write_text(str(os.getpid()))
+        try:
+            os.unlink(os.path.join(self._rundir, "freezing"))
+        except OSError:
+            pass
         self.frozen = True
 
     def thaw(self, timeout: float = 30.0) -> None:

@@ -482,3 +482,27 @@ def test_vfkit_pool_never_freezes(monkeypatch):
     assert not hasattr(s, "frozen") and not s.torn_down
     s2 = p.acquire()
     assert s2 is s
+
+
+def test_make_room_never_victimizes_frozen_parks(monkeypatch):
+    """Under cap pressure the victim scan must skip frozen idles
+    (reclaiming files frees no RAM) and fall through to the quiet
+    bound LRU. Order matters: the frozen park must already be idle
+    when the scan runs at-cap, or the early total check hides it."""
+    p = _fc_pool(monkeypatch, max_total=1)
+    parked = p.acquire(image="parked")
+    parked.close()                     # frozen idle: invisible, total 0
+    held = p.acquire(image="held")     # bound, running: total = 1
+    fresh = p.acquire(image="fresh")   # at cap -> scan runs, skips the
+    assert held.torn_down              # frozen park, reclaims the LRU
+    assert not parked.torn_down and parked.frozen
+    fresh.close()
+
+
+def test_refill_cap_ignores_frozen_parks(monkeypatch):
+    """prewarm targets fill past max_total when the parks freeze —
+    frozen warmth is disk, not RAM, so the cap doesn't apply."""
+    p = _fc_pool(monkeypatch, max_total=2)
+    p.prewarm(3, background=False, image="warm")
+    bucket = p._idle[poolmod._fingerprint({"image": "warm"}, FrozenFakeVM)]
+    assert len(bucket) == 3 and all(s.frozen for _, _, s in bucket)

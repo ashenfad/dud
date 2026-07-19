@@ -121,3 +121,14 @@ def test_unix_http_connection_roundtrip():
     import shutil
 
     shutil.rmtree(td, ignore_errors=True)
+
+
+def test_frozen_session_requests_fail_with_guidance():
+    """shell()/python() on a frozen session must say 'thaw()', not
+    surface a bad-file-descriptor OSError."""
+    from dud.backends.base import HostSession, SessionLost
+
+    s = HostSession.__new__(HostSession)
+    s.frozen = True
+    with pytest.raises(SessionLost, match="thaw"):
+        s._request("exec_shell", {"script": "echo hi"})

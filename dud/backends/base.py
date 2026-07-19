@@ -86,6 +86,11 @@ class HostSession:
         call site. Transport failures become :class:`SessionLost`;
         guest-answered errors (``RemoteError``) pass through untouched —
         an answering guest is alive."""
+        if getattr(self, "frozen", False):
+            raise SessionLost(
+                f"session is frozen (parked as a snapshot); "
+                f"call thaw() before {verb!r}"
+            )
         self.last_used = time.monotonic()
         self._in_flight += 1
         try:

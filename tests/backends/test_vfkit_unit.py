@@ -207,3 +207,42 @@ def test_sweep_removes_frozen_dir_with_garbage_marker(tmp_path):
     (d / "frozen").write_text("not-a-pid")
     removed = vfkit.sweep_stale_rundirs(tmp_path)
     assert removed == [str(d)] and not d.exists()
+
+
+def test_sweep_freezing_marker_live_owner_is_untouchable(tmp_path):
+    """Mid-freeze (host paused the VMM, hasn't killed it yet): the
+    bundle belongs to a live host and must not be touched."""
+    import os
+
+    d = _rundir(tmp_path, "freezing-live")
+    (d / "freezing").write_text(f"{os.getpid()} 12345")
+    assert vfkit.sweep_stale_rundirs(tmp_path) == [] and d.exists()
+
+
+def test_sweep_freezing_dead_owner_kills_orphaned_vmm(tmp_path, monkeypatch):
+    """The one hole process-linkage can't cover: a host that died
+    between Pause and the VMM kill leaves a paused VMM that can NEVER
+    see EOF. The sweep must finish the job."""
+    import os
+    import signal as sigmod
+
+    killed = []
+    monkeypatch.setattr(vfkit, "_vfkit_alive",
+                        lambda pid, rd: pid == 4242)
+    monkeypatch.setattr(vfkit.os, "kill", lambda pid, sig: (
+        killed.append((pid, sig)) if sig == sigmod.SIGKILL
+        else (_ for _ in ()).throw(ProcessLookupError())  # owner probe
+    ))
+    d = _rundir(tmp_path, "freezing-dead")
+    (d / "freezing").write_text("999999999 4242")
+    removed = vfkit.sweep_stale_rundirs(tmp_path)
+    assert removed == [str(d)] and not d.exists()
+    assert killed == [(4242, sigmod.SIGKILL)]
+
+
+def test_sweep_freezing_dead_owner_dead_vmm_reaps(tmp_path, monkeypatch):
+    monkeypatch.setattr(vfkit, "_vfkit_alive", lambda pid, rd: False)
+    d = _rundir(tmp_path, "freezing-both-dead")
+    (d / "freezing").write_text("999999999 999999998")
+    removed = vfkit.sweep_stale_rundirs(tmp_path)
+    assert removed == [str(d)] and not d.exists()

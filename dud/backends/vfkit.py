@@ -28,6 +28,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import signal
 import socket as socketlib
 import subprocess
 import tempfile
@@ -103,6 +104,38 @@ def sweep_stale_rundirs(root: str | Path = "/tmp") -> list[str]:
     once it's old enough (10 min) to rule out a concurrent mid-boot."""
     removed: list[str] = []
     for path in Path(root).glob(_RUNDIR_PREFIX + "*"):
+        # Freeze-in-progress (firecracker): between Pause and the VMM
+        # kill, the process-linkage cascade is disarmed — a paused
+        # guest can never see channel EOF, so a host that dies in that
+        # window leaves a VMM that will NEVER exit on its own. The
+        # marker records "host pid, VMM pid": while the host lives the
+        # freeze is someone's work in progress; once it's dead, kill
+        # the recorded VMM (argv-checked against this rundir to guard
+        # pid reuse) and reap the bundle.
+        freezing = path / "freezing"
+        if freezing.exists():
+            owner = vmm = None
+            try:
+                owner_s, vmm_s = freezing.read_text().split()
+                owner, vmm = int(owner_s), int(vmm_s)
+            except (OSError, ValueError):
+                pass
+            if owner is not None:
+                try:
+                    os.kill(owner, 0)
+                    continue  # live owner: freeze in progress
+                except ProcessLookupError:
+                    pass
+                except (PermissionError, OSError):
+                    continue  # alive but not ours: leave it alone
+                if vmm is not None and _vfkit_alive(vmm, str(path)):
+                    try:
+                        os.kill(vmm, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(str(path))
+            continue
         # Frozen park (firecracker snapshots): no VMM is running, the
         # rundir IS the VM — vmstate + memory + disk clones. The marker
         # records the owning host process; while that pid lives the

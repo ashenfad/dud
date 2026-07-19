@@ -162,8 +162,12 @@ class VmPool:
             _, _, session = parked
             try:
                 # Frozen parks resume here (thaw = new VMM over the
-                # snapshot files); hot parks just prove liveness.
+                # snapshot files); hot parks just prove liveness. A
+                # thaw materializes a running VM the cap never counted
+                # (frozen = files), so make room first — same pressure
+                # valve as a fresh boot, and just as non-blocking.
                 if getattr(session, "frozen", False):
+                    self._make_room()
                     session.thaw()
                 else:
                     session.ping()
@@ -276,8 +280,13 @@ class VmPool:
                     if len(self._idle.get(key) or ()) >= n:
                         return
                     if self.max_total is not None:
+                        # Same arithmetic as _make_room: frozen parks
+                        # are files, not RAM — invisible to the cap.
                         total = len(self._bound) + sum(
-                            len(b) for b in self._idle.values()
+                            1
+                            for b in self._idle.values()
+                            for _, _, s in b
+                            if not getattr(s, "frozen", False)
                         )
                         if total >= self.max_total:
                             return  # the cap outranks the warm target

@@ -261,7 +261,14 @@ class Supervisor:
             return {}, []
         epoch = float(body["epoch"])
         ts = _timespec(int(epoch), int((epoch % 1.0) * 1e9))
-        _libc.clock_settime(_CLOCK_REALTIME, ctypes.byref(ts))
+        rc = _libc.clock_settime(_CLOCK_REALTIME, ctypes.byref(ts))
+        if rc != 0:
+            # Non-fatal (the session works, timestamps lie), but a
+            # silently stale clock is undebuggable — leave a trace.
+            sys.stderr.write(
+                f"[dud] resync clock_settime failed: errno "
+                f"{ctypes.get_errno()}\n"
+            )
         self._drop_template()
         self._worker_failures = 0
         self._start_template()

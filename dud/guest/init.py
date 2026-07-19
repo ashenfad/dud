@@ -167,6 +167,9 @@ def main(default_root: str = "/workspace") -> None:
         while True:
             reason = channel.serve()
             channel.close()
+            # mode=listen has no dial to re-run, so a freeze there
+            # falls through to poweroff (after having acked — no live
+            # transport uses listen; firecracker/vfkit both connect).
             if reason != "freeze" or mode == "listen":
                 break
             # Freeze/thaw (firecracker snapshots): the host acked our
