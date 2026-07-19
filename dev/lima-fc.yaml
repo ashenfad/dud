@@ -1,0 +1,29 @@
+# Lima VM for developing dud's firecracker rung on Apple Silicon.
+# Nested virtualization (M3+, macOS 15+) gives the guest a real
+# /dev/kvm; firecracker then runs natively, on-arch (arm64).
+#   limactl create --name=fc dev/lima-fc.yaml && limactl start fc
+vmType: "vz"
+nestedVirtualization: true
+images:
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+cpus: 6
+memory: "12GiB"
+disk: "60GiB"
+mountType: "virtiofs"
+mounts:
+- location: "~/git/dud"
+  writable: true
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux
+    usermod -aG kvm "{{.User}}" || true
+    apt-get update -q
+    apt-get install -yq e2fsprogs erofs-utils zstd
+- mode: user
+  script: |
+    #!/bin/bash
+    set -eux
+    command -v uv || curl -LsSf https://astral.sh/uv/install.sh | sh

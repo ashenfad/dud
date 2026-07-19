@@ -73,7 +73,8 @@ def test_fresh_push_resets_everything(session, tmp_path):
 
 def test_staging_matches_backend(session):
     """No silent fallback: the VM rung must actually run overlay."""
-    expected = {"subprocess": "scan", "vfkit": "overlay"}[_BACKEND]
+    expected = {"subprocess": "scan", "vfkit": "overlay",
+                "firecracker": "overlay"}[_BACKEND]
     assert session.ping().get("staging") == expected
 
 

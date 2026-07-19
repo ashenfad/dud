@@ -15,7 +15,8 @@ import pytest
 _BACKEND = os.environ.get("DUD_BACKEND", "subprocess")
 
 pytestmark = pytest.mark.skipif(
-    _BACKEND != "vfkit", reason="scratch volumes need the VM rung"
+    _BACKEND not in ("vfkit", "firecracker"),
+    reason="scratch volumes need a VM rung (block devices)",
 )
 
 
@@ -29,10 +30,11 @@ def blank():
 
 
 def _boot(scratch):
-    from dud.backends.vfkit import VfkitSession
+    import dud
 
-    return VfkitSession(
-        medium=os.environ.get("DUD_MEDIUM", "initramfs"), scratch=scratch
+    return dud.session(
+        _BACKEND, medium=os.environ.get("DUD_MEDIUM", "initramfs"),
+        scratch=scratch,
     )
 
 

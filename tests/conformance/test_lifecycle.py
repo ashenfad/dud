@@ -14,7 +14,8 @@ import pytest
 _BACKEND = os.environ.get("DUD_BACKEND", "subprocess")
 
 pytestmark = pytest.mark.skipif(
-    _BACKEND != "vfkit", reason="needs a killable VM process"
+    _BACKEND != "vfkit",
+    reason="exercises VmPool, which is vfkit-typed until the snapshot work",
 )
 
 

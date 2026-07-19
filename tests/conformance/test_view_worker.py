@@ -15,7 +15,8 @@ import pytest
 _BACKEND = os.environ.get("DUD_BACKEND", "subprocess")
 
 pytestmark = pytest.mark.skipif(
-    _BACKEND != "vfkit", reason="the view worker needs the VM rung (fork under PID 1)"
+    _BACKEND not in ("vfkit", "firecracker"),
+    reason="the view worker needs a VM rung (fork under PID 1)",
 )
 
 _MARKER = "import os\nworker = os.environ.get('DUD_VIEW_WORKER') == '1'"

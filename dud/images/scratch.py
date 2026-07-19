@@ -25,6 +25,7 @@ import io
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -158,14 +159,29 @@ def scratch_master(key: str, size_mib: int = 4096,
 
 
 def _clone_or_copy(src: Path, dest: Path) -> None:
-    """APFS clonefile when possible (instant, CoW), real copy where
-    the flag or filesystem doesn't support it. (The Linux twin is
-    ``cp --reflink=auto`` — one branch here when the firecracker rung
-    lands.)"""
-    r = subprocess.run(["cp", "-c", str(src), str(dest)],
+    """CoW clone when the platform can (APFS clonefile via ``cp -c``,
+    reflink on Linux XFS/btrfs via ``cp --reflink=auto``), real copy
+    otherwise — correctness first, speed when available."""
+    flag = "-c" if sys.platform == "darwin" else "--reflink=auto"
+    r = subprocess.run(["cp", flag, str(src), str(dest)],
                        capture_output=True)
     if r.returncode != 0:
         shutil.copyfile(src, dest)
+
+
+def promote_clone(master: Path, clone: Path, tag: str) -> None:
+    """Publish a VM's scratch clone as the new master (last-clean-wins
+    cache semantics; see DESIGN.md "The scratch plane"). Stages through
+    a promoter-unique temp: concurrent same-master promotions must not
+    rename each other's half-written copies over the master."""
+    if not clone.exists():
+        return
+    part = master.with_suffix(f".promote.{os.getpid()}.{tag}")
+    try:
+        _clone_or_copy(clone, part)
+        part.replace(master)
+    finally:
+        part.unlink(missing_ok=True)  # crash between clone and replace
 
 
 def _unpack_sparse(gz: bytes, dest: Path, size: int) -> None:

@@ -37,7 +37,7 @@ from typing import Any, Callable
 
 from ..errors import IsolationUnavailable  # noqa: F401 — canonical home is dud.errors
 from ..images import build as build_rootfs, dud_home
-from ..images.scratch import _clone_or_copy
+from ..images.scratch import _clone_or_copy, promote_clone
 from ..proto import Channel
 from .base import HostSession
 
@@ -342,20 +342,8 @@ class VfkitSession(HostSession):
         """
         if self._scratch_master is None or self._scratch_clone is None:
             return
-        if not self._scratch_clone.exists():
-            return
-        # Unique temp per promoter: concurrent same-master promotions
-        # (two viewer sessions of one published app parking at once)
-        # must not share a staging path — a shared name lets one
-        # replace the other's half-written copy over the master.
-        part = self._scratch_master.with_suffix(
-            f".promote.{os.getpid()}.{id(self):x}"
-        )
-        try:
-            _clone_or_copy(self._scratch_clone, part)
-            part.replace(self._scratch_master)
-        finally:
-            part.unlink(missing_ok=True)  # crash between clone and replace
+        promote_clone(self._scratch_master, self._scratch_clone,
+                      tag=f"{id(self):x}")
 
     # ---- teardown ------------------------------------------------------
 

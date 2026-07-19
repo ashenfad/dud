@@ -251,12 +251,17 @@ _BUILDER_IMAGE = "python:3.12-slim"
 
 
 def _build_erofs(fileset, home: Path, arch: str) -> bytes:
-    """Self-hosted mkfs: no mkfs.erofs on macOS, so build inside a VM."""
+    """mkfs.erofs directly where the host has it (Linux), inside a
+    builder VM where it doesn't (macOS) — same flags, same artifact."""
     import platform
+    import shutil
 
-    if platform.system() != "Darwin":  # pragma: no cover - future rungs
+    tool = shutil.which("mkfs.erofs")
+    if tool:
+        return _build_erofs_host(tool, fileset)
+    if platform.system() != "Darwin":  # pragma: no cover - odd hosts
         raise NotImplementedError(
-            "erofs builds currently require the vfkit builder VM (macOS)"
+            "no mkfs.erofs on PATH and the builder-VM path requires macOS"
         )
     from ..backends.vfkit import VfkitSession  # lazy: circular import
 
@@ -281,6 +286,32 @@ def _build_erofs(fileset, home: Path, arch: str) -> bytes:
         return session.diff().writes["rootfs.erofs"]
     finally:
         session.close()
+
+
+def _build_erofs_host(tool: str, fileset) -> bytes:
+    """Native mkfs.erofs: extract the fileset tar (same tar the VM
+    path pushes — same ``data``-filter semantics) and pack. --all-root
+    restores the root ownership that user-mode extraction loses."""
+    import io
+    import subprocess
+    import tarfile
+
+    with tempfile.TemporaryDirectory() as td:
+        with tarfile.open(
+            fileobj=io.BytesIO(_fileset_tar(fileset, prefix="src")), mode="r:"
+        ) as tf:
+            tf.extractall(td, filter="data")
+        out = Path(td) / "rootfs.erofs"
+        r = subprocess.run(
+            [tool, "--all-root", "-zlz4", "-T0", str(out),
+             str(Path(td) / "src")],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            raise RuntimeError(
+                f"mkfs.erofs failed:\n{r.stderr or r.stdout}"
+            )
+        return out.read_bytes()
 
 
 def _fileset_tar(fileset, prefix: str) -> bytes:

@@ -248,14 +248,32 @@ sandtrap, on the studio's actual analyst loop.
 
 ## Medium term
 
-### Firecracker rung (PLAN stage 5)
+### Firecracker rung (PLAN stage 5) — boots, in progress
 
-Needs a Linux+KVM host — untestable on this Mac, so it starts as a
-write-and-ship-to-Linux exercise: jailer, no-NIC default, cgroup
-budgets, and the piece vfkit can't offer — **snapshot/restore**
-(resume ≈ 5–20 ms, CoW memory), which changes the warm-pool economics
-entirely. The conformance suite is the contract; the backend should be
-mostly `HostSession` + transport, like vfkit was.
+The "untestable on this Mac" premise died: Apple silicon M3+ nested
+virtualization gives a Lima guest a real /dev/kvm, so the rung is
+developed and conformance-tested locally (`dev/lima-fc.yaml`;
+firecracker binary + native mkfs.erofs/mke2fs inside). The backend
+landed as designed — `HostSession` + transport: firecracker's
+HTTP-over-UDS API plane, guest-dial vsock via the `<uds>_<port>`
+convention, same pinned kernel asset. Three deltas from vfkit, all
+simplifications: erofs roots attach **read-only** (no per-boot clone;
+cross-VM page cache restored), no empty-initrd appeasement, extra
+disks attach truly read-only. `session(backend="vm")` resolves per
+platform, so consumer config never changes.
+
+Still open on this rung:
+
+- **Pooling / snapshot-restore** — deliberately deferred together:
+  firecracker snapshots make a parked VM a *file* (resume ≈ 5–20 ms,
+  CoW memory), which reshapes the pool rather than reusing its
+  vfkit-shaped internals; `pooled=True` fails loud until then. Needs
+  guest vsock redial-on-restore.
+- **Hardening posture**: jailer, no-NIC default, cgroup budgets — the
+  production-grade wrapper, not needed for the dev rung.
+- **amd64 pins** (kernel `vmlinux`, debs) — wanted for CI anyway:
+  GitHub's `ubuntu-latest` runners have /dev/kvm, so firecracker
+  conformance can run in plain hosted Actions on x86-64.
 
 ### Serving (PLAN stage 6)
 

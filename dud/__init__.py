@@ -26,6 +26,7 @@ __all__ = [
     "session",
     "Session",
     "VfkitSession",
+    "FirecrackerSession",
     "scratch_master",
     "blank_ext4",
     "Diff",
@@ -45,6 +46,7 @@ __all__ = [
 # and image machinery load only when reached for.
 _LAZY = {
     "VfkitSession": ("dud.backends.vfkit", "VfkitSession"),
+    "FirecrackerSession": ("dud.backends.firecracker", "FirecrackerSession"),
     "IsolationUnavailable": ("dud.errors", "IsolationUnavailable"),
     "SessionLost": ("dud.errors", "SessionLost"),
     "scratch_master": ("dud.images.scratch", "scratch_master"),
@@ -73,9 +75,10 @@ def session(
     - ``backend="subprocess"``: the rung-1 guest as a host process.
       Real bash/python/files, ZERO isolation (own-machine posture).
     - ``backend="vfkit"``: a disposable macOS microVM (HVF).
+    - ``backend="firecracker"``: a disposable Linux/KVM microVM.
     - ``backend="vm"``: the best VM rung for this host — vfkit on
-      macOS today, firecracker on Linux when that rung lands. Config
-      written against ``"vm"`` won't change when it does.
+      macOS, firecracker on Linux. Config written against ``"vm"``
+      never changes as rungs land.
 
     ``pooled=True`` (VM rungs only) acquires from the process-wide
     warm pool instead of booting; ``state`` is the content tag for
@@ -83,7 +86,13 @@ def session(
     back with ``resumed=True`` and the caller skips its push. Extra
     kwargs go to the backend constructor.
     """
-    if backend in ("vfkit", "vm"):
+    if backend == "vm":
+        # The best VM rung for this host: configs written against
+        # "vm" survive new rungs landing.
+        import platform
+
+        backend = "vfkit" if platform.system() == "Darwin" else "firecracker"
+    if backend == "vfkit":
         if pooled:
             from .backends.pool import shared_pool
 
@@ -93,8 +102,19 @@ def session(
         from .backends.vfkit import VfkitSession
 
         return VfkitSession(**kwargs)
+    if backend == "firecracker":
+        if pooled or state is not None:
+            raise NotImplementedError(
+                "firecracker pooling lands with the snapshot/restore work "
+                "(parked VMs become restorable files there)"
+            )
+        from .backends.firecracker import FirecrackerSession
+
+        return FirecrackerSession(**kwargs)
     if backend == "subprocess":
         if pooled or state is not None:
             raise ValueError("pooling is a VM-rung concept (rung 1 has no boot to skip)")
         return Session(**kwargs)
-    raise ValueError(f"unknown backend {backend!r} (subprocess | vfkit | vm)")
+    raise ValueError(
+        f"unknown backend {backend!r} (subprocess | vfkit | firecracker | vm)"
+    )

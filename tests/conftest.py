@@ -18,6 +18,10 @@ def _new_session(**kwargs):
         # (DUD_BACKEND=vfkit DUD_MEDIUM=erofs uv run pytest tests/conformance)
         kwargs.setdefault("medium", os.environ.get("DUD_MEDIUM", "initramfs"))
         return VfkitSession(**kwargs)
+    if backend == "firecracker":
+        from dud.backends.firecracker import FirecrackerSession
+        kwargs.setdefault("medium", os.environ.get("DUD_MEDIUM", "initramfs"))
+        return FirecrackerSession(**kwargs)
     if backend == "subprocess":
         from dud import Session
         return Session(**kwargs)
