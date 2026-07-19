@@ -10,14 +10,20 @@ the two producers:
     O(tree) per diff and 2x the tree in storage.
 
 ``OverlayStage``
-    The VM rungs' mechanics (stage 4-4): ``work/`` is an overlayfs
-    mount whose lowerdir is the pushed snapshot and whose upperdir *is*
-    the diff. Costs O(changes) per diff, 1x tree + changes in RAM, and
-    buys a *true* read-only workspace window for view execs (remount
-    r/o — enforcement, not post-hoc detection). Requires being PID 1 on
-    Linux with overlayfs in the kernel; anything short of that falls
-    back to ``ScanStage`` (``ping`` reports which one is live, so tests
-    can refuse to pass on a silent fallback).
+    The VM rungs' mechanics (stage 4-4): the workspace root *itself* is
+    an overlayfs mount whose lowerdir is the pushed snapshot and whose
+    upperdir *is* the diff. The staging trees live in a stash tmpfs
+    OUTSIDE the mount (``/run/dud-stage``), so the agent-visible root
+    contains exactly the workspace — no ``snap``/``upper`` internals to
+    confuse (or corrupt: mutating a mounted overlay's backing dirs is
+    kernel-documented undefined behavior, and guest code could reach
+    them when they lived inside the root). Costs O(changes) per diff,
+    1x tree + changes in RAM, and buys a *true* read-only workspace
+    window for view execs (remount r/o — enforcement, not post-hoc
+    detection). Requires being PID 1 on Linux with overlayfs in the
+    kernel; anything short of that falls back to ``ScanStage``
+    (``ping`` reports which one is live, so tests can refuse to pass
+    on a silent fallback).
 
 Overlay is mounted with ``redirect_dir=off,index=off,metacopy=off``:
 those features optimize cases we don't have and would complicate
@@ -258,45 +264,68 @@ class ScanStage:
 
 
 class OverlayStage:
-    """Overlayfs staging: O(changes) diffs, real read-only windows."""
+    """Overlayfs staging: O(changes) diffs, real read-only windows.
+
+    The merged mount lives AT ``root`` (the agent-visible workspace);
+    the backing trees live in the ``stash`` tmpfs outside it. Keeping
+    them out of the mount is load-bearing twice over: the workspace
+    listing contains exactly the workspace (the ``/workspace/snap`` vs
+    ``/workspace/work`` duplicate listings that confused agents are
+    gone, and stray writes beside them no longer skirt the diff), and
+    harvest reads ``upper``/``snap`` by path *while the overlay is
+    mounted* — paths inside the mount would resolve through the merged
+    view instead of the backing trees. (Root guest code can still
+    reach the stash by its own path; that's OS territory on a
+    disposable machine, not workspace state.)
+    """
 
     kind = "overlay"
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, stash: Path):
         self.root = root
-        self.snap = root / "snap"
-        self.upper = root / "upper"
-        self.ovlwork = root / "ovl-work"
-        self.work = root / "work"
+        self.work = root  # the workspace root IS the merged mount
+        self.stash = stash
+        self.snap = stash / "snap"
+        self.upper = stash / "upper"
+        self.ovlwork = stash / "ovl-work"
 
     @classmethod
-    def try_create(cls, root: Path) -> "OverlayStage | None":
+    def try_create(
+        cls, root: Path, stash: Path = Path("/run/dud-stage")
+    ) -> "OverlayStage | None":
         """Stand up the mount stack, or None (caller falls back to scan).
 
         Gated to Linux PID 1: that's the VM rung's signature, and it
         keeps a root-privileged subprocess rung on Linux from ever
-        mounting over pieces of a real host.
+        mounting over pieces of a real host. PID 1 also guarantees the
+        default stash parent: init mounts a tmpfs on ``/run`` before
+        the supervisor starts, so the stash is writable even on a
+        read-only erofs root.
         """
         if sys.platform != "linux" or os.getpid() != 1:
             return None
         if os.environ.get("DUD_NO_OVERLAY"):
             return None
-        st = cls(root)
+        st = cls(root, stash)
         try:
             root.mkdir(parents=True, exist_ok=True)
-            # tmpfs under everything: ramfs (the initramfs root) lacks
-            # the xattr support an overlay upperdir needs.
-            _mount("tmpfs", root, "tmpfs")
-            for d in (st.snap, st.upper, st.ovlwork, st.work):
+            stash.mkdir(parents=True, exist_ok=True)
+            # tmpfs under the staging trees: ramfs (the initramfs root)
+            # lacks the xattr support an overlay upperdir needs, and a
+            # dedicated mount keeps the stash independent of how /run
+            # itself is backed.
+            _mount("tmpfs", stash, "tmpfs")
+            for d in (st.snap, st.upper, st.ovlwork):
                 d.mkdir()
             st._mount_overlay()
             return st
         except OSError as e:
             sys.stderr.write(f"[dud] overlay staging unavailable: {e}\n")
-            try:
-                _umount(root)
-            except OSError:
-                pass
+            for target in (st.work, stash):
+                try:
+                    _umount(target)
+                except OSError:
+                    pass
             return None
 
     def _mount_overlay(self) -> None:
