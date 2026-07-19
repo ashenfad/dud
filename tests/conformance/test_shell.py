@@ -48,3 +48,31 @@ def test_timeout_kills(session):
 def test_workspace_env_var(session):
     r = session.shell("test -d \"$DUD_WORKSPACE\" && echo yes")
     assert r.transcript.strip() == "yes"
+
+
+def test_medium_env_vars_persist_across_calls(session):
+    """The env snapshot uses bash builtins, so it survives values the
+    external `env` binary choked on (its execve carried the whole
+    environment; one biggish var broke the ENTIRE snapshot)."""
+    session.shell("export MEDIUM=$(python3 -c 'print(\"m\" * 60000)') "
+                  "&& export MULTI=$'a\\nb=c'")
+    r = session.shell("echo len=${#MEDIUM}")
+    assert "len=60000" in r.transcript
+    r2 = session.python("import os\nmulti = os.environ.get('MULTI')")
+    assert r2.ok and r2.outputs["multi"] == "a\nb=c"
+
+
+def test_oversized_env_var_drops_alone(session):
+    """A single var past Linux's per-string execve cap (128 KB) cannot
+    cross later spawns; it must drop ALONE — not poison the snapshot
+    (everything else keeps persisting) and not break the session.
+    Uniform on every rung; big data belongs in files, not env."""
+    r0 = session.shell("export KEEP=kept "
+                       "&& export HUGE=$(python3 -c 'print(\"x\" * 300000)') "
+                       "&& echo len=${#HUGE}")
+    assert "len=300000" in r0.transcript  # visible within its own call
+    r = session.python("import os\n"
+                       "keep = os.environ.get('KEEP')\n"
+                       "huge = len(os.environ.get('HUGE', ''))")
+    assert r.ok and r.outputs["keep"] == "kept" and r.outputs["huge"] == 0
+    assert session.shell("echo still-works").transcript.strip() == "still-works"

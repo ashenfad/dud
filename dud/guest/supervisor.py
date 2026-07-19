@@ -37,6 +37,12 @@ from .staging import make_stage
 
 _RUNNER_DEFAULT_TIMEOUT = 30.0
 _SHELL_DEFAULT_TIMEOUT = 30.0
+_CTL_TIMEOUT = 5.0  # template control handshake budget
+# Consecutive worker-path failures before the template is presumed
+# fork-hostile (a warm import left live threads; children wedge) and
+# replaced. One failure can be the exec's own fault; two in a row
+# without a success is the pattern of a poisoned template.
+_WORKER_FAILURE_LIMIT = 2
 
 
 class _WorkerChild:
@@ -85,6 +91,7 @@ class Supervisor:
         # view execs route through it once ready, spawn-path until then.
         self._template: tuple[subprocess.Popen, socketlib.socket] | None = None
         self._template_ready = False
+        self._worker_failures = 0
         self._start_template()
         channel.handler = self.handle
 
@@ -161,12 +168,20 @@ class Supervisor:
         parent, child = socketlib.socketpair()
         try:
             payload = json.dumps({"cwd": cwd, "env": env}).encode()
-            ctl.settimeout(5.0)
-            ctl.sendmsg(
-                [struct.pack(">I", len(payload)) + payload],
+            ctl.settimeout(_CTL_TIMEOUT)
+            # fd + 4-byte length ride one sendmsg (atomic at this size);
+            # the payload follows via sendall — a single sendmsg of
+            # header+payload can send PARTIALLY under a timeout (seen
+            # at ~8 KB on macOS, ~208 KB in the guest), which would
+            # wedge the template mid-frame on any large session env.
+            sent = ctl.sendmsg(
+                [struct.pack(">I", len(payload))],
                 [(socketlib.SOL_SOCKET, socketlib.SCM_RIGHTS,
                   struct.pack("i", child.fileno()))],
             )
+            if sent != 4:
+                raise OSError(f"short ctl header send ({sent}/4)")
+            ctl.sendall(payload)
             pid_bytes = b""
             while len(pid_bytes) < 8:
                 chunk = ctl.recv(8 - len(pid_bytes))
@@ -274,8 +289,8 @@ class Supervisor:
             # The kill sweep above took the template with it (it's just
             # another non-PID-1 process — that's the hygiene contract).
             # Re-warm for the next session while it boots/pushes.
-            self._template = None
-            self._template_ready = False
+            self._drop_template()
+            self._worker_failures = 0
             self._start_template()
         return {}, []
 
@@ -323,7 +338,28 @@ class Supervisor:
             finally:
                 rchan.close()
                 self._reap(proc)
+        if forked is not None:
+            self._note_worker_outcome(result)
         return result, []
+
+    def _note_worker_outcome(self, result: dict) -> None:
+        """Circuit breaker: a template whose children keep timing out
+        or crashing without ever answering is presumed fork-hostile (a
+        warm import — torch, grpc — left live threads, so forked
+        children deadlock). Control-channel checks can't see this: the
+        fork *succeeds*, the child just never serves. Two consecutive
+        such failures replace the template; execs meanwhile (and any
+        exec while it re-warms) take the spawn path, which always
+        works — degradation stays structural."""
+        err = (result or {}).get("error")
+        if err and err.get("etype") in ("Timeout", "RunnerCrash"):
+            self._worker_failures += 1
+            if self._worker_failures >= _WORKER_FAILURE_LIMIT:
+                self._worker_failures = 0
+                self._drop_template()
+                self._start_template()
+        else:
+            self._worker_failures = 0
 
     # ---- runner pump -------------------------------------------------
 

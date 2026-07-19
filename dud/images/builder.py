@@ -267,6 +267,9 @@ def _build_erofs(fileset, home: Path, arch: str) -> bytes:
     session = VfkitSession(
         image=_BUILDER_IMAGE, arch=arch, home=home,
         debs=["erofs-utils"], memory_mib=mem,
+        # Structural, not heuristic: the erofs builder must never
+        # itself resolve to an erofs root (unbounded recursion).
+        medium="initramfs",
     )
     try:
         session.push_tree(tar)

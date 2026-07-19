@@ -40,24 +40,30 @@ _LEN = struct.Struct(">I")
 
 
 def _warm() -> None:
-    """Import every installed distribution's top-level modules,
-    best-effort. Failures (missing extras, platform guards, import
-    side effects) are skipped — warmth is an optimization, never a
-    correctness dependency."""
+    """Import every installed distribution's importable top-levels,
+    best-effort. ``packages_distributions()`` infers names from the
+    installed file lists, so modern wheels (meson-python numpy/pandas,
+    flit, hatchling) are covered — ``top_level.txt`` alone is a
+    setuptools legacy and misses them. Failures (missing extras,
+    platform guards, import side effects) are skipped — warmth is an
+    optimization, never a correctness dependency."""
     import importlib.metadata as md
 
     names: set[str] = set()
     try:
-        dists = list(md.distributions())
+        names.update(md.packages_distributions().keys())
     except Exception:
-        return
-    for dist in dists:
-        try:
-            top = dist.read_text("top_level.txt")
-        except Exception:
-            top = None
-        if top:
-            names.update(line.strip() for line in top.splitlines())
+        pass
+    try:
+        for dist in md.distributions():
+            try:
+                top = dist.read_text("top_level.txt")
+            except Exception:
+                top = None
+            if top:
+                names.update(line.strip() for line in top.splitlines())
+    except Exception:
+        pass
     for name in sorted(names):
         if not name or name.startswith("_") or name == "dud":
             continue

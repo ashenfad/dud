@@ -54,7 +54,13 @@ def _fingerprint(kwargs: dict[str, Any]) -> str:
     """Boot-identity hash, normalized against the constructor's defaults
     so sparse call-site kwargs and a session's fully-captured
     ``_pool_kwargs`` produce the SAME key (acquire must find what release
-    parked)."""
+    parked).
+
+    ``medium`` compares RAW, pre-resolution: ``"auto"`` and an explicit
+    ``"initramfs"`` are different keys even when auto resolves to
+    initramfs (resolution needs image inspection this hash must not
+    do). Self-consistent either way — just pick one style per app, or
+    mixed call sites warm separate buckets."""
     params = inspect.signature(VfkitSession.__init__).parameters
     ident: dict[str, Any] = {}
     for name, p in params.items():

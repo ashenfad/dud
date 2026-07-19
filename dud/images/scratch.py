@@ -25,6 +25,7 @@ import io
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 from ..errors import DudError
@@ -68,7 +69,7 @@ def blank_ext4(size_mib: int = 4096, home: str | Path | None = None,
     # Unique temp per baker: two processes racing the first bake must
     # not interleave mke2fs runs on one file (each rename below is a
     # complete image; last-wins is fine — they're identical blanks).
-    tmp = dest.with_suffix(f".part.{os.getpid()}")
+    tmp = dest.with_suffix(f".part.{os.getpid()}.{threading.get_ident()}")
     try:
         tool = _host_mke2fs()
         if tool:
@@ -106,7 +107,7 @@ def _bake_vm(tmp: Path, size_mib: int, home: Path, arch: str | None) -> None:
     from ..backends.vfkit import VfkitSession  # lazy: circular import
 
     session = VfkitSession(image=_BUILDER_IMAGE, arch=arch, home=home,
-                           debs=_SCRATCH_DEBS)
+                           debs=_SCRATCH_DEBS, medium="initramfs")
     try:
         r = session.shell(
             f"truncate -s {size_mib}M scratch.img"
@@ -147,7 +148,7 @@ def scratch_master(key: str, size_mib: int = 4096,
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     blank = blank_ext4(size_mib, home=home)
-    tmp = dest.with_suffix(f".part.{os.getpid()}")
+    tmp = dest.with_suffix(f".part.{os.getpid()}.{threading.get_ident()}")
     try:
         _clone_or_copy(blank, tmp)
         tmp.rename(dest)

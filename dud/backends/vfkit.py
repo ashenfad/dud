@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from ..errors import DudError
+from ..errors import IsolationUnavailable  # noqa: F401 — canonical home is dud.errors
 from ..images import build as build_rootfs, dud_home
 from ..images.scratch import _clone_or_copy
 from ..proto import Channel
@@ -44,9 +44,6 @@ from .base import HostSession
 _VSOCK_PORT = 1024
 _HOST_CID = 2
 
-
-class IsolationUnavailable(DudError, RuntimeError):
-    """The requested VM rung can't run here (platform/tooling/kernel)."""
 
 
 def _host_arch() -> str:

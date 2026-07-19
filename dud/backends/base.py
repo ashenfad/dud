@@ -22,23 +22,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from ..errors import DudError
+from ..errors import SessionLost  # noqa: F401 — canonical home is dud.errors
 from ..proto import Channel, ChannelClosed, ProtocolError
 from ..results import Diff, ExecError, PythonResult, ShellResult
 from ..values import decode_map, decode_value, encode_value
 
 
-class SessionLost(DudError, RuntimeError):
-    """The guest went away mid-request (VM died, channel EOF/reset).
-
-    The session object is unusable afterward. Recovery is the owner's
-    move — dud never holds the authoritative workspace tree, so only
-    the layer above can reopen a session and re-push state (see the
-    disposable thesis: any VM may vanish at any moment; DudExecutor's
-    recovery path is acquire + push + retry-once). Raised in place of
-    the transport-level errors so consumers write one ``except``, not
-    a taxonomy of socket failures.
-    """
 
 
 def _safe_diff_path(name: str) -> str:

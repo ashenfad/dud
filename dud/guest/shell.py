@@ -20,12 +20,20 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# The env dump uses only builtins (compgen/printf): the external `env`
+# binary would need the whole environment passed through execve, whose
+# Linux per-string cap (MAX_ARG_STRLEN, 128 KB) silently broke the
+# snapshot — and so env persistence — the moment any exported var got
+# big. Same NUL-delimited KEY=VAL wire format either way.
 _TRAP = (
     "trap '__dud_rc=$?; pwd > \"$__DUD_CWD__\"; "
-    "env -0 > \"$__DUD_ENV__\"' EXIT\n"
+    "for __dud_v in $(compgen -e); do "
+    "printf \"%s=%s\\0\" \"$__dud_v\" \"${!__dud_v}\"; done "
+    "> \"$__DUD_ENV__\"' EXIT\n"
 )
 
 _DROP_VARS = {"__DUD_CWD__", "__DUD_ENV__", "_", "SHLVL", "OLDPWD"}
+_MAX_ENV_ENTRY = 96 * 1024  # comfortably under Linux MAX_ARG_STRLEN
 
 
 @dataclass
@@ -100,6 +108,13 @@ def _replay(state: ShellState, cwd_file: Path, env_file: Path) -> None:
         return
     env: dict[str, str] = {}
     for entry in raw.split(b"\0"):
+        # A single env string past Linux's execve cap (MAX_ARG_STRLEN,
+        # 128 KB) can't cross any later spawn on the VM rung — carrying
+        # it would E2BIG every subsequent shell/python call. It drops
+        # ALONE (uniform on every rung for conformance parity); big
+        # data belongs in workspace files, not the environment.
+        if len(entry) > _MAX_ENV_ENTRY:
+            continue
         if b"=" in entry:
             k, _, v = entry.partition(b"=")
             key = k.decode(errors="replace")

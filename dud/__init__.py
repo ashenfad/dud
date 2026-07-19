@@ -45,8 +45,8 @@ __all__ = [
 # and image machinery load only when reached for.
 _LAZY = {
     "VfkitSession": ("dud.backends.vfkit", "VfkitSession"),
-    "IsolationUnavailable": ("dud.backends.vfkit", "IsolationUnavailable"),
-    "SessionLost": ("dud.backends.base", "SessionLost"),
+    "IsolationUnavailable": ("dud.errors", "IsolationUnavailable"),
+    "SessionLost": ("dud.errors", "SessionLost"),
     "scratch_master": ("dud.images.scratch", "scratch_master"),
     "blank_ext4": ("dud.images.scratch", "blank_ext4"),
 }

@@ -67,6 +67,33 @@ def test_worker_timeout_kills_child_not_worker(session):
     assert session.ping().get("view_worker") == "ready"
 
 
+def test_reset_guest_rewarms_template(session):
+    """The pooled park path: the reset kill-sweep takes the template;
+    the next session must find a fresh one warming, not a corpse."""
+    _await_worker(session)
+    session._ch.request("reset_guest", {})
+    _await_worker(session)
+    r = session.python(_MARKER, fs_readonly=True)
+    assert r.ok and r.outputs["worker"] is True
+
+
+def test_large_session_env_stays_on_worker_path(session):
+    """A total env bigger than the guest's socket buffer must cross
+    the ctl channel whole (the partial-sendmsg regression). Eight
+    60 KB vars: ~480 KB total, each under the per-string execve cap."""
+    _await_worker(session)
+    r0 = session.shell(
+        "for i in 1 2 3 4 5 6 7 8; do "
+        "export BLOB$i=$(python3 -c 'print(\"x\" * 60000)'); done && echo set"
+    )
+    assert "set" in r0.transcript
+    code = (_MARKER + "\nimport os\ntotal = sum("
+            "len(os.environ.get(f'BLOB{i}', '')) for i in range(1, 9))")
+    r = session.python(code, fs_readonly=True)
+    assert r.ok and r.outputs["worker"] is True  # warm, no fallback
+    assert r.outputs["total"] == 480000  # and the env arrived intact
+
+
 def test_template_death_degrades_then_rewarms(session):
     _await_worker(session)
     kill = (
