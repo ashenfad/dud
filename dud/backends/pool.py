@@ -15,9 +15,20 @@ process in the guest (see ``Supervisor.do_reset_guest``). Residue
 and the warmed imports are a feature; overlay-at-root is the eventual
 stricter reset (see ROADMAP).
 
-Scope: in-process only. A parked VM still dies with this process (the
-guest powers off when its channel drops); surviving host restarts is
-the separate detach/reconnect item.
+Scope: in-process only, deliberately. A VM dies with this process —
+channel EOF powers the guest off, vfkit exits with the guest — so a
+studio crash can't strand VMs. That linkage is an invariant, not a
+gap: state lives in kvgit and boots are ~1 s, so surviving restarts
+would buy almost nothing and cost the cascade that makes cleanup free
+(see ROADMAP "Deliberately not now").
+
+Capacity: the pool is a cache, not a semaphore — ``acquire`` never
+blocks. ``max_total`` adds demand-driven reclaim: before booting past
+the cap, tear down the global-LRU *idle* VM, then the LRU *bound* VM
+that isn't mid-request. A reclaimed owner's next call raises
+:class:`~dud.backends.base.SessionLost` and its recovery path
+(re-acquire + push from the provider) revives it — the disposable
+thesis as a capacity policy.
 """
 
 from __future__ import annotations
@@ -25,6 +36,7 @@ from __future__ import annotations
 import atexit
 import inspect
 import json
+import os
 import threading
 import time
 from typing import Any
@@ -62,10 +74,20 @@ class VmPool:
     ``close()``, or process exit.
     """
 
-    def __init__(self, max_idle: int = 2, ttl: float = 900.0):
+    def __init__(
+        self,
+        max_idle: int = 2,
+        ttl: float = 900.0,
+        max_total: int | None = None,
+    ):
         self.max_idle = max_idle
         self.ttl = ttl
+        self.max_total = max_total
         self._idle: dict[str, list[tuple[float, VfkitSession]]] = {}
+        # Bound = checked out and held by a session owner. Tracked so
+        # max_total can reclaim the LRU one under demand (id() keys:
+        # sessions aren't hashable-by-value and identity is the point).
+        self._bound: dict[int, VfkitSession] = {}
         self._targets: dict[str, tuple[int, dict[str, Any]]] = {}
         self._filling: set[str] = set()
         self._lock = threading.Lock()
@@ -96,14 +118,21 @@ class VmPool:
                                 matched = True
                                 break
                     if parked is None:
-                        parked = bucket.pop()  # oldest first
+                        # MRU: the newest parked VM has the hottest page
+                        # cache and warmest imports; the oldest idles
+                        # toward TTL/reclaim, which is how excess warmth
+                        # should shed.
+                        parked = bucket.pop(0)
             for s in stale:
                 self._teardown(s)
             if parked is None:
+                self._make_room()
                 self._maybe_refill(key)  # replace what we're about to boot
                 session = VfkitSession(**kwargs)
                 session._pool = self  # close() -> release
                 session.resumed = False
+                with self._lock:
+                    self._bound[id(session)] = session
                 return session
             _, _, session = parked
             try:
@@ -114,7 +143,51 @@ class VmPool:
             self._maybe_refill(key)  # top the level back up in background
             self._rebind(session, binding)
             session.resumed = matched
+            with self._lock:
+                self._bound[id(session)] = session
             return session
+
+    def _make_room(self) -> None:
+        """Demand-driven reclaim: called before booting a fresh VM when
+        ``max_total`` is set. Victims in preference order: the
+        global-LRU *idle* VM (nobody notices), then the LRU *bound* VM
+        with no request in flight (its owner's next call raises
+        ``SessionLost`` and recovers by re-acquiring + re-pushing —
+        ~1 s, landing on whoever has been quiet longest). If every VM
+        is mid-request we over-boot rather than block: the cap is a
+        pressure valve, not a semaphore. The in-flight check races an
+        owner's next call by design — the recovery path makes losing
+        that race an inconvenience, not an error."""
+        if self.max_total is None:
+            return
+        while True:
+            victim: VfkitSession | None = None
+            with self._lock:
+                total = len(self._bound) + sum(
+                    len(b) for b in self._idle.values()
+                )
+                if total < self.max_total:
+                    return
+                oldest: tuple[float, str, int] | None = None
+                for key, bucket in self._idle.items():
+                    for i, (t, _tag, _s) in enumerate(bucket):
+                        if oldest is None or t < oldest[0]:
+                            oldest = (t, key, i)
+                if oldest is not None:
+                    _, key, i = oldest
+                    _, _, victim = self._idle[key].pop(i)
+                else:
+                    quiet = [
+                        s for s in self._bound.values()
+                        if getattr(s, "_in_flight", 0) == 0
+                    ]
+                    if not quiet:
+                        return  # all mid-request: over-boot, don't block
+                    victim = min(
+                        quiet, key=lambda s: getattr(s, "last_used", 0.0)
+                    )
+                    self._bound.pop(id(victim), None)
+            self._teardown(victim)
 
     def prewarm(self, n: int, background: bool = True, **kwargs: Any) -> None:
         """Keep ``n`` idle VMs warm for this config: boot-and-park the
@@ -184,6 +257,8 @@ class VmPool:
         because push_tree wipes before extracting."""
         state = getattr(session, "park_state", None)
         session.park_state = None  # tags never survive a park cycle
+        with self._lock:
+            self._bound.pop(id(session), None)
         try:
             session._ch.request("reset_guest", {"keep_tree": bool(state)})
         except Exception:
@@ -223,6 +298,8 @@ class VmPool:
         # A parked session already ran close() once (that's what parked
         # it), so clear both the pool hook AND the closed latch — else
         # close() no-ops and the VM process would leak.
+        with self._lock:
+            self._bound.pop(id(session), None)
         session._pool = None
         session._closed = False
         try:
@@ -256,11 +333,18 @@ _shared_lock = threading.Lock()
 
 
 def shared_pool() -> VmPool:
-    """The process-wide default pool (what DudExecutor uses)."""
+    """The process-wide default pool (what DudExecutor uses).
+
+    ``$DUD_VM_MAX_TOTAL`` caps live VMs (bound + idle) with
+    demand-driven reclaim; unset means uncapped — macOS pages out
+    untouched guest memory, so idle VMs cost less than their headline
+    size and a hard cap is opt-in.
+    """
     global _shared
     with _shared_lock:
         if _shared is None:
-            _shared = VmPool()
+            cap = os.environ.get("DUD_VM_MAX_TOTAL")
+            _shared = VmPool(max_total=int(cap) if cap else None)
         return _shared
 
 

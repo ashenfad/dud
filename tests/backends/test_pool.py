@@ -35,6 +35,8 @@ class FakeVM:
         self.resumed = False
         self.dead = False
         self.torn_down = False
+        self._in_flight = 0
+        self.last_used = 0.0
         outer = self
 
         class Ch:
@@ -256,6 +258,60 @@ def test_affinity_prefers_match_over_older_vm(monkeypatch):
     b.close()  # b parked newest; a is the older entry
     got = p.acquire(image="x", state="commit-A")
     assert got is a and got.resumed is True
+
+
+def test_acquire_prefers_most_recently_parked(monkeypatch):
+    """MRU: the newest parked VM (hottest caches) serves next; the
+    oldest idles toward TTL/reclaim."""
+    p = _no_auto(_pool(monkeypatch, max_idle=2))
+    a = p.acquire(image="x")
+    b = p.acquire(image="x")
+    a.close()
+    b.close()  # b parked last = newest
+    assert p.acquire(image="x") is b
+
+
+def test_max_total_reclaims_idle_before_bound(monkeypatch):
+    p = _no_auto(_pool(monkeypatch, max_total=2))
+    a = p.acquire(image="x")
+    b = p.acquire(image="x")
+    a.close()  # a idle, b bound; total = 2 = cap
+    c = p.acquire(image="y")  # new fingerprint: must boot -> needs room
+    assert a.torn_down is True  # idle victim, owner-held b untouched
+    assert b.torn_down is False
+    assert c is not a
+
+
+def test_max_total_reclaims_lru_bound_when_no_idle(monkeypatch):
+    p = _no_auto(_pool(monkeypatch, max_total=2))
+    a = p.acquire(image="x")
+    b = p.acquire(image="x")
+    a.last_used = 10.0  # quiet longest
+    b.last_used = 20.0
+    c = p.acquire(image="y")
+    assert a.torn_down is True and b.torn_down is False
+    assert c is not a
+    # a's owner discovers the loss on next use, not via an exception here
+    assert a._pool is None
+
+
+def test_max_total_never_reclaims_mid_request(monkeypatch):
+    p = _no_auto(_pool(monkeypatch, max_total=1))
+    a = p.acquire(image="x")
+    a._in_flight = 1  # mid-request: untouchable
+    b = p.acquire(image="y")  # over-boots rather than blocking
+    assert a.torn_down is False
+    assert FakeVM.booted == 2
+
+
+def test_release_and_teardown_clear_bound_registry(monkeypatch):
+    p = _no_auto(_pool(monkeypatch))
+    a = p.acquire(image="x")
+    assert id(a) in p._bound
+    a.close()  # parked: bound -> idle
+    assert id(a) not in p._bound
+    b = p.acquire(image="x")
+    assert b is a and id(b) in p._bound
 
 
 def test_reset_guest_keep_tree_over_real_guest():

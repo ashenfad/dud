@@ -3,7 +3,7 @@
 Companion to [DESIGN.md](DESIGN.md) (rationale) and [PLAN.md](PLAN.md)
 (the original staging). PLAN froze the ladder before any code existed;
 this doc is the live view — what's built, what's next, and which items
-unblock which. Updated 2026-07-18.
+unblock which. Updated 2026-07-19.
 
 ## Where we are
 
@@ -142,30 +142,46 @@ in the guest — imports warm, fresh namespace per request (sandtrap
 served views from a warm process too, so this is parity, not a
 cheat). Pairs naturally with the stage-6 dispatch pool.
 
-### 3. VM lifecycle hardening
+### 3. ~~VM lifecycle hardening~~ shipped (2026-07-19)
 
-Cheap, high-value, mostly host-side:
+The organizing insight: **death recovery is the primitive, not a
+resilience feature**. Once any VM can vanish at any moment and its
+owner recovers uniformly (re-acquire + re-push + retry once), idle
+eviction and capacity pressure stop being separate mechanisms — they
+are just deliberate deaths.
 
 - ~~**Cross-session reuse**~~ **shipped**: `VmPool` keys warm VMs by
   boot fingerprint; same-spec sessions reopen in ~0 s (guest reset +
   tree push) instead of booting. Hygiene on release (`reset_guest`:
   trees wiped, boot env restored, stray guest processes killed);
   out-of-workspace residue survives by design within one user's
-  studio. In-process only — a parked VM still dies with the server.
-- **Restart survival**: the companion piece pooling exposes — detached
-  VMs + guest reconnect-on-EOF (today the guest powers off when the
-  channel drops) + deterministic socket paths, so warm VMs outlive
-  studio restarts. Needs a small vfkit re-bridge spike.
-- **Idle eviction**: studio holds a warm VM per open session forever
-  (2–4 GB each). Evict after idle; with the pool, eviction is just
-  early release — revival is a tree push.
-- **Death recovery**: a dead VM currently means dead-session errors
-  until reopen. The disposable thesis makes auto-reboot trivial —
-  detect channel loss, boot, re-push, retry the call once.
-- **Boot latency**: ~2.5 s of the 3 s is the guest retrying its vsock
-  dial until vfkit's bridge is ready. Find or add a readiness signal.
-  Matters less per-session now that reuse skips boots, but still paid
-  on pool misses and first opens.
+  studio.
+- ~~**Death recovery**~~ **shipped**: transport failures surface as
+  one typed error (`SessionLost`, raised at `HostSession._request`,
+  the single wire seam) and `DudExecutor` recovers in place — reopen
+  (warm-pool acquire), re-push the provider tree, re-assert cwd,
+  retry the call once. At-most-once-observed for state: the dead
+  attempt's diffs never landed and cache writes only commit on
+  success (repeated live-object hostcalls are the documented residue).
+- ~~**Capacity / idle eviction**~~ **shipped as demand-driven
+  reclaim**: sessions keep their VM bound across calls (zero per-call
+  tax; background processes and warm imports survive), but the pool
+  tracks bound VMs and — under a `max_total` cap (`$DUD_VM_MAX_TOTAL`,
+  opt-in) — reclaims before booting past it: global-LRU *idle* victim
+  first, then the LRU *bound* VM not mid-request. The reclaimed owner
+  pays ~1 s on its next call via the recovery path. No timers guessing
+  at idleness; cost lands only under real pressure, on whoever was
+  quiet longest. Idle buckets serve MRU (hottest page cache first) so
+  excess warmth ages out via TTL.
+- ~~**Crash hygiene**~~ **shipped**: rundirs record their vfkit pid;
+  the first boot in a process sweeps orphaned rundirs (sockets, logs,
+  APFS rootfs clones) whose recorded vfkit is gone — the on-disk
+  counterpart of the process-linkage invariant below.
+- **Boot latency**: ~2.5 s of the 3 s initramfs boot is the guest
+  retrying its vsock dial until vfkit's bridge is ready (erofs boots
+  in ~1 s). Find or add a readiness signal. Matters less now that
+  reuse skips boots and recovery is rare, but still paid on pool
+  misses and first opens.
 
 ### 4. Dogfood gate, now with real walls
 
@@ -222,6 +238,17 @@ semantics across rungs in one corpus.
 
 ## Deliberately not now
 
+- **Restart survival (detached VMs)** — decided against (2026-07-19).
+  VM lifetime is process-linked *as an invariant*: channel EOF powers
+  the guest off, vfkit exits with the guest, so even a `kill -9` of
+  the host cascades to full cleanup with no orphan reaper. Detaching
+  would remove exactly that safety and rebuild its guarantees by hand
+  (socket rediscovery, adopt protocols, stale-guest-runtime
+  handshakes) to save a ~1 s boot whose tree would be re-pushed from
+  kvgit anyway. The future where durable warmth matters is the
+  firecracker rung, where it arrives structurally: snapshots are
+  files, and files survive restarts without any process outliving
+  anything.
 - **Rung 1.5 (Seatbelt/Landlock around the subprocess rung)** — the VM
   rung landing on macOS removed most of its audience; revisit only if
   a Linux-dev-without-KVM constituency appears.

@@ -88,3 +88,70 @@ def test_medium_cmdline():
     extra = vfkit._medium_cmdline("erofs")
     assert "root=/dev/vda" in extra and "init=/init" in extra
     assert "ro" in extra.split() and "rootwait" in extra.split()
+
+
+def _rundir(tmp_path, name, pid=None, age=0.0):
+    import os
+    import time
+
+    d = tmp_path / (vfkit._RUNDIR_PREFIX + name)
+    d.mkdir()
+    if pid is not None:
+        (d / "pid").write_text(str(pid))
+    if age:
+        old = time.time() - age
+        os.utime(d, (old, old))
+    return d
+
+
+def test_sweep_removes_dir_with_dead_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(vfkit, "_vfkit_alive", lambda pid, rd: False)
+    d = _rundir(tmp_path, "dead", pid=12345)
+    removed = vfkit.sweep_stale_rundirs(tmp_path)
+    assert removed == [str(d)] and not d.exists()
+
+
+def test_sweep_keeps_dir_with_live_pid(tmp_path, monkeypatch):
+    monkeypatch.setattr(vfkit, "_vfkit_alive", lambda pid, rd: True)
+    d = _rundir(tmp_path, "live", pid=12345)
+    assert vfkit.sweep_stale_rundirs(tmp_path) == [] and d.exists()
+
+
+def test_sweep_spares_young_pidless_dir(tmp_path):
+    """No pidfile + young = a concurrent boot mid-setup, not a crash."""
+    d = _rundir(tmp_path, "booting")
+    assert vfkit.sweep_stale_rundirs(tmp_path) == [] and d.exists()
+
+
+def test_sweep_removes_old_pidless_dir(tmp_path):
+    """No pidfile + old = a host that died between mkdtemp and Popen."""
+    d = _rundir(tmp_path, "wreck", age=3600.0)
+    removed = vfkit.sweep_stale_rundirs(tmp_path)
+    assert removed == [str(d)] and not d.exists()
+
+
+def test_sweep_ignores_unrelated_dirs(tmp_path):
+    other = tmp_path / "not-a-vm-dir"
+    other.mkdir()
+    vfkit.sweep_stale_rundirs(tmp_path)
+    assert other.exists()
+
+
+def test_vfkit_alive_rejects_dead_and_reused_pids():
+    import os
+    import subprocess
+    import sys
+
+    assert vfkit._vfkit_alive(2 ** 30, "/tmp/dud-vm-x") is False
+    # A live pid whose command has nothing to do with the rundir is a
+    # pid-reuse collision, not our vfkit.
+    assert vfkit._vfkit_alive(os.getpid(), "/tmp/dud-vm-x") is False
+    # A live process whose argv carries the rundir counts as serving it.
+    marker = "/tmp/dud-vm-alive-test"
+    p = subprocess.Popen([sys.executable, "-c",
+                          f"import time; time.sleep(30)  # {marker}"])
+    try:
+        assert vfkit._vfkit_alive(p.pid, marker) is True
+    finally:
+        p.kill()
+        p.wait()

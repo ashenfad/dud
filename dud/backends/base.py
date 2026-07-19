@@ -18,12 +18,26 @@ import base64
 import io
 import posixpath
 import tarfile
+import time
 from pathlib import Path
 from typing import Any, Callable
 
-from ..proto import Channel, ProtocolError
+from ..proto import Channel, ChannelClosed, ProtocolError
 from ..results import Diff, ExecError, PythonResult, ShellResult
 from ..values import decode_map, decode_value, encode_value
+
+
+class SessionLost(RuntimeError):
+    """The guest went away mid-request (VM died, channel EOF/reset).
+
+    The session object is unusable afterward. Recovery is the owner's
+    move — dud never holds the authoritative workspace tree, so only
+    the layer above can reopen a session and re-push state (see the
+    disposable thesis: any VM may vanish at any moment; DudExecutor's
+    recovery path is acquire + push + retry-once). Raised in place of
+    the transport-level errors so consumers write one ``except``, not
+    a taxonomy of socket failures.
+    """
 
 
 def _safe_diff_path(name: str) -> str:
@@ -68,6 +82,31 @@ class HostSession:
         self.emits: list[tuple[str, Any]] = []
         self.on_emit = on_emit
         self._closed = False
+        # Liveness bookkeeping (read by VmPool's demand-driven reclaim):
+        # a bound VM with _in_flight == 0 is reclaimable, LRU by
+        # last_used. Maintained by _request, the single wire seam.
+        self._in_flight = 0
+        self.last_used = time.monotonic()
+
+    def _request(
+        self, verb: str, body: dict | None = None, bins: list[bytes] | None = None
+    ) -> tuple[dict, list[bytes]]:
+        """The one wire seam: every host->guest request goes through
+        here so activity tracking and death detection can't drift per
+        call site. Transport failures become :class:`SessionLost`;
+        guest-answered errors (``RemoteError``) pass through untouched —
+        an answering guest is alive."""
+        self.last_used = time.monotonic()
+        self._in_flight += 1
+        try:
+            return self._ch.request(verb, body, bins)
+        except (ChannelClosed, OSError) as e:
+            raise SessionLost(
+                f"guest lost during {verb!r}: {e or type(e).__name__}"
+            ) from e
+        finally:
+            self._in_flight -= 1
+            self.last_used = time.monotonic()
 
     # ---- guest-initiated services -------------------------------------
 
@@ -113,7 +152,7 @@ class HostSession:
     # ---- host API ------------------------------------------------------
 
     def push_tree(self, tar_bytes: bytes) -> None:
-        self._ch.request("push_tree", {}, [tar_bytes])
+        self._request("push_tree", {}, [tar_bytes])
 
     def push_dir(self, path: str | Path) -> None:
         buf = io.BytesIO()
@@ -128,7 +167,7 @@ class HostSession:
         self.push_tree(buf.getvalue())
 
     def shell(self, script: str, timeout: float = 30.0) -> ShellResult:
-        body, _ = self._ch.request(
+        body, _ = self._request(
             "exec_shell", {"script": script, "timeout": timeout}
         )
         return ShellResult(
@@ -157,7 +196,7 @@ class HostSession:
         if inputs:
             for k, v in inputs.items():
                 enc_inputs[k] = encode_value(v)
-        body, _ = self._ch.request(
+        body, _ = self._request(
             "exec_python",
             {"code": code, "inputs": enc_inputs, "timeout": timeout,
              "caps": caps or {}, "host_objects": sorted(self.host_objects),
@@ -180,7 +219,7 @@ class HostSession:
         )
 
     def diff(self, rebase: bool = False) -> Diff:
-        body, bins = self._ch.request("pull_diff", {"rebase": rebase})
+        body, bins = self._request("pull_diff", {"rebase": rebase})
         writes: dict[str, bytes] = {}
         if bins and bins[0]:
             with tarfile.open(fileobj=io.BytesIO(bins[0]), mode="r:*") as tf:
@@ -193,10 +232,10 @@ class HostSession:
         return Diff(writes=writes, deletes=deletes)
 
     def reset(self) -> None:
-        self._ch.request("reset_stage")
+        self._request("reset_stage")
 
     def ping(self) -> dict:
-        body, _ = self._ch.request("ping")
+        body, _ = self._request("ping")
         return body
 
     def close(self) -> None:  # pragma: no cover - overridden

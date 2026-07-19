@@ -74,6 +74,61 @@ def _vfkit_bin() -> str:
     return exe
 
 
+_RUNDIR_PREFIX = "dud-vm-"
+_swept = False
+
+
+def _vfkit_alive(pid: int, rundir: str) -> bool:
+    """Is ``pid`` a live vfkit serving ``rundir``? The command-line
+    check guards against pid reuse: every vfkit invocation carries its
+    rundir in its args (socketURL/console paths)."""
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return False
+    return rundir in out.stdout
+
+
+def sweep_stale_rundirs(root: str | Path = "/tmp") -> list[str]:
+    """Remove rundirs (sockets, logs, APFS rootfs clones) orphaned by a
+    host that died hard. Processes can't dangle — channel EOF powers
+    the guest off and vfkit exits with it — but their on-disk rundirs
+    can. A dir whose recorded vfkit pid is live is someone else's
+    running VM and is left alone; one with no pidfile is only removed
+    once it's old enough (10 min) to rule out a concurrent mid-boot."""
+    removed: list[str] = []
+    for path in Path(root).glob(_RUNDIR_PREFIX + "*"):
+        pidfile = path / "pid"
+        try:
+            pid = int(pidfile.read_text())
+        except (OSError, ValueError):
+            try:
+                age = time.time() - path.stat().st_mtime
+            except OSError:
+                continue
+            if age < 600:
+                continue
+        else:
+            if _vfkit_alive(pid, str(path)):
+                continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(str(path))
+    return removed
+
+
+def _sweep_once() -> None:
+    global _swept
+    if not _swept:
+        _swept = True
+        try:
+            sweep_stale_rundirs()
+        except OSError:
+            pass  # hygiene, never a boot blocker
+
+
 def _medium_boot_args(rootfs_path: Path, medium: str, rundir: str) -> list[str]:
     """VMM args that provide the rootfs, chosen by its medium."""
     if medium == "initramfs":
@@ -179,7 +234,8 @@ class VfkitSession(HostSession):
 
         # Short rundir: macOS AF_UNIX sun_path is capped at 104 chars, and
         # $TMPDIR is long, so anchor under /tmp explicitly.
-        self._rundir = tempfile.mkdtemp(dir="/tmp", prefix="dud-vm-")
+        _sweep_once()
+        self._rundir = tempfile.mkdtemp(dir="/tmp", prefix=_RUNDIR_PREFIX)
         self._sock_path = os.path.join(self._rundir, "vsock")
         self._console = os.path.join(self._rundir, "console.log")
 
@@ -217,6 +273,9 @@ class VfkitSession(HostSession):
         self._vfkit_log = open(os.path.join(self._rundir, "vfkit.log"), "wb")
         self._proc = subprocess.Popen(args, stdout=self._vfkit_log,
                                       stderr=subprocess.STDOUT)
+        # Liveness record for sweep_stale_rundirs (a future host process
+        # cleaning up after a crash of THIS one).
+        Path(self._rundir, "pid").write_text(str(self._proc.pid))
 
         conn = self._accept(boot_timeout)
         self._ch = Channel(conn, handler=self._handle)
