@@ -124,8 +124,15 @@ def main() -> None:
         pid = os.fork()
         if pid == 0:
             # Child: become one ordinary runner serving one request.
-            os.setsid()  # its own group: the supervisor killpg's on timeout
             try:
+                # Its own group: the supervisor killpg's on timeout. A
+                # child that can't get one MUST die (killpg against the
+                # template's group would take the template with it) —
+                # and die via _exit like every other child failure, not
+                # by unwinding through main(). setsid can fail for real
+                # on busy hosts: POSIX EPERM when any live process
+                # group's id equals this fresh child's (recycled) pid.
+                os.setsid()
                 # The template's auto-reaper must not leak into user
                 # code (it would steal subprocess.wait()'s statuses).
                 signal.signal(signal.SIGCHLD, signal.SIG_DFL)
