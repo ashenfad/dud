@@ -22,12 +22,13 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from ..errors import DudError
 from ..proto import Channel, ChannelClosed, ProtocolError
 from ..results import Diff, ExecError, PythonResult, ShellResult
 from ..values import decode_map, decode_value, encode_value
 
 
-class SessionLost(RuntimeError):
+class SessionLost(DudError, RuntimeError):
     """The guest went away mid-request (VM died, channel EOF/reset).
 
     The session object is unusable afterward. Recovery is the owner's

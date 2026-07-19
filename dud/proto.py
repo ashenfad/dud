@@ -28,6 +28,8 @@ from __future__ import annotations
 import json
 import socket
 import struct
+
+from .errors import DudError
 from typing import Callable
 
 PROTO_VERSION = 1
@@ -38,11 +40,11 @@ _LEN = struct.Struct(">I")
 Handler = Callable[[str, dict, list[bytes]], tuple[dict, list[bytes]]]
 
 
-class ProtocolError(Exception):
+class ProtocolError(DudError):
     """Framing or handshake violation. The channel is unusable after."""
 
 
-class RemoteError(Exception):
+class RemoteError(DudError):
     """The other side answered a request with ``kind: err``."""
 
     def __init__(self, verb: str, message: str, etype: str = "RemoteError"):

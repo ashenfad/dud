@@ -17,6 +17,9 @@ class ShellResult:
     def ok(self) -> bool:
         return self.exit_code == 0
 
+    def __bool__(self) -> bool:
+        return self.ok
+
 
 @dataclass(frozen=True)
 class ExecError:
@@ -34,6 +37,9 @@ class PythonResult:
     outputs: dict[str, Any] = field(default_factory=dict)
     outputs_skipped: dict[str, str] = field(default_factory=dict)
     error: ExecError | None = None
+
+    def __bool__(self) -> bool:
+        return self.ok
 
 
 @dataclass(frozen=True)

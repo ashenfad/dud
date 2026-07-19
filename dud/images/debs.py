@@ -28,11 +28,12 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..errors import DudError
 from . import rootfs
 from .cpio import FileSet
 
 
-class DebError(Exception):
+class DebError(DudError):
     """A deb fetch or unpack failed: transport, digest, or format."""
 
 

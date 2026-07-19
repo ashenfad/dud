@@ -35,7 +35,9 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from ..errors import DudError
 from ..images import build as build_rootfs, dud_home
+from ..images.scratch import _clone_or_copy
 from ..proto import Channel
 from .base import HostSession
 
@@ -43,7 +45,7 @@ _VSOCK_PORT = 1024
 _HOST_CID = 2
 
 
-class IsolationUnavailable(RuntimeError):
+class IsolationUnavailable(DudError, RuntimeError):
     """The requested VM rung can't run here (platform/tooling/kernel)."""
 
 
@@ -129,16 +131,6 @@ def _sweep_once() -> None:
             pass  # hygiene, never a boot blocker
 
 
-def _clone_or_copy(src: Path, dest: Path) -> None:
-    """APFS clonefile when possible (instant, CoW, zero extra disk),
-    real copy where the flag or filesystem doesn't support it —
-    correctness first, speed when available."""
-    r = subprocess.run(["cp", "-c", str(src), str(dest)],
-                       capture_output=True)
-    if r.returncode != 0:
-        shutil.copyfile(src, dest)
-
-
 def _scratch_device(medium: str, n_disks: int) -> str:
     """Guest name of the scratch volume: it is attached last, after
     the rootfs block device (erofs only) and any extra disks."""
@@ -201,7 +193,7 @@ class VfkitSession(HostSession):
         packages: list[str] | None = None,
         debs: list[str] | None = None,
         disks: list[str | Path] | None = None,
-        medium: str = "initramfs",
+        medium: str = "auto",
         scratch: str | Path | None = None,
         host_objects: dict[str, Any] | None = None,
         allow: dict[str, set[str]] | None = None,
@@ -382,7 +374,13 @@ class VfkitSession(HostSession):
         except Exception:
             pass
 
-    def close(self) -> None:
+    def close(self, park_state: str | None = None) -> None:
+        """Close the session. Pooled: parks the warm VM (``park_state``
+        tags the tree's content identity for a same-state resume —
+        equivalent to stamping ``self.park_state`` before closing).
+        Unpooled: graceful poweroff."""
+        if park_state is not None:
+            self.park_state = park_state
         if self._closed:
             return
         self._closed = True

@@ -18,8 +18,10 @@ import base64
 import json
 from typing import Any
 
+from .errors import DudError
 
-class NotRepresentable(ValueError):
+
+class NotRepresentable(DudError, ValueError):
     """Value has no codec form. Callers decide: skip+record, or raise."""
 
 

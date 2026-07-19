@@ -40,10 +40,11 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .errors import DudError
 from .images import dud_home
 
 
-class KernelFetchError(Exception):
+class KernelFetchError(DudError):
     """A kernel fetch failed: download, digest, tooling, or extraction."""
 
 

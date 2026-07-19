@@ -27,6 +27,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from ..errors import DudError
 from . import dud_home
 
 _CHUNK = 1 << 20
@@ -40,7 +41,7 @@ _BREW_MKE2FS = (
 )
 
 
-class ScratchError(Exception):
+class ScratchError(DudError):
     """A scratch volume bake failed."""
 
 
@@ -119,6 +120,51 @@ def _bake_vm(tmp: Path, size_mib: int, home: Path, arch: str | None) -> None:
     finally:
         session.close()
     _unpack_sparse(gz, tmp, size_mib << 20)
+
+
+def scratch_master(key: str, size_mib: int = 4096,
+                   home: str | Path | None = None) -> Path:
+    """The per-key writable master for ``key`` (a published-app token,
+    a commit hash, ...), created as a CoW clone of the blank on first
+    use. Pass the returned path as ``VfkitSession(scratch=...)`` —
+    each boot clones it again, and clean parks promote back into it.
+
+    Keys are sanitized for the filesystem with a short content hash
+    appended, so distinct keys can never collide. All masters live
+    under ``~/.dud/scratch/keys/`` — the natural seam for future
+    eviction/GC.
+    """
+    if not key:
+        raise ScratchError("scratch_master requires a non-empty key")
+    import hashlib
+    import re as _re
+
+    safe = _re.sub(r"[^A-Za-z0-9._-]", "_", key)[:80]
+    digest = hashlib.sha256(key.encode()).hexdigest()[:8]
+    home = Path(home) if home else dud_home()
+    dest = home / "scratch" / "keys" / f"{safe}-{digest}" / f"master-{size_mib}m.ext4"
+    if dest.exists():
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    blank = blank_ext4(size_mib, home=home)
+    tmp = dest.with_suffix(f".part.{os.getpid()}")
+    try:
+        _clone_or_copy(blank, tmp)
+        tmp.rename(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dest
+
+
+def _clone_or_copy(src: Path, dest: Path) -> None:
+    """APFS clonefile when possible (instant, CoW), real copy where
+    the flag or filesystem doesn't support it. (The Linux twin is
+    ``cp --reflink=auto`` — one branch here when the firecracker rung
+    lands.)"""
+    r = subprocess.run(["cp", "-c", str(src), str(dest)],
+                       capture_output=True)
+    if r.returncode != 0:
+        shutil.copyfile(src, dest)
 
 
 def _unpack_sparse(gz: bytes, dest: Path, size: int) -> None:

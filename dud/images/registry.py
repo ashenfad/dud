@@ -25,6 +25,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..errors import DudError
+
 _DEFAULT_REGISTRY = "registry-1.docker.io"
 _DOCKER_AUTH = "https://auth.docker.io/token"
 _DOCKER_SERVICE = "registry.docker.io"
@@ -44,7 +46,7 @@ _INDEX_TYPES = {
 }
 
 
-class RegistryError(Exception):
+class RegistryError(DudError):
     """A pull failed: transport, auth, digest mismatch, or no platform."""
 
 

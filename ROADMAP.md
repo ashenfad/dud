@@ -227,8 +227,21 @@ sandtrap, on the studio's actual analyst loop.
 
 ### 5. Ship track
 
-- Merge the stack (dud `stage-0` → main; nontainer
-  `apps-vm-contract`; studio `dud-executor`).
+- ~~API façade~~ **done** (2026-07-19): one front door —
+  ``dud.session(backend=..., pooled=..., state=...)`` absorbs the
+  backend switch every consumer was writing themselves (``"vm"``
+  = best VM rung for this host, so configs survive the firecracker
+  rung landing); lazy top-level re-exports (``VfkitSession``,
+  ``SessionLost``, ``IsolationUnavailable``, ``scratch_master``, ...);
+  a ``DudError`` spine under every public exception (historical bases
+  kept — existing ``except`` clauses unaffected);
+  ``scratch_master(key)`` settles scratch keying (per-key masters
+  under ``~/.dud/scratch/keys/``, the future GC seam);
+  ``close(park_state=...)``; result ``__bool__``; ``medium`` defaults
+  to ``"auto"``. Deep import paths keep working.
+- Merge the remaining stacks (nontainer `vm-recovery`; studio
+  `dud-executor`) — deliberately after the dud API is firm and on
+  PyPI.
 - PyPI: publish dud, flip nontainer's and studio's sibling-path
   sources to real deps, decide the version-pinning policy between the
   three.
