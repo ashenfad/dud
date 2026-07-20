@@ -63,14 +63,38 @@ rows                             # last expression echoes, REPL-style
     print(r.transcript)          # the echo
     print(r.outputs)             # harvested top-level bindings (codec values)
 
-    d = s.diff()                 # {'data/in.csv': b'a,b\n1,2\n'}, deletes=[]
+    d = s.diff()                 # Diff(writes={'data/in.csv': b'a,b\n1,2\n'},
+    #                            #      deletes=[])  — paths relative to the root
     # hand d to your versioned store; dud doesn't care what it is
 ```
+
+### Where the files live
+
+The guest mounts its workspace at **`/workspace`** (`session(...,
+workspace="/path")` to move it), and execs start there — so relative
+paths just work, and `/workspace/data/in.csv` is a real absolute path
+inside the VM. That matters because it's the *same* path the layer
+above teaches: nontainer's local sandbox presents its VFS at the same
+root, so agent code that hardcodes an absolute path means the same
+file whether it runs in-process or on a real machine.
+
+The root contains exactly the workspace. Staging internals live
+outside it, on a separate tmpfs, so a listing never shows dud's
+bookkeeping and a write anywhere under the root lands in the diff.
+Diff paths are relative to the root.
+
+(Rung 1 is the exception: a host temp dir can't claim `/workspace`,
+so the subprocess rung roots the workspace in its scratch dir —
+relative paths behave identically, absolute ones don't. A documented
+dev-posture gap.)
+
+### Pooling and parking
 
 `pooled=True` reuses VMs across sessions from a process-wide warm
 pool; `state="<your content hash>"` parks and resumes a workspace
 without re-pushing it. On macOS a parked VM stays hot; on firecracker
-it's frozen to disk — same contract, better economics.
+it's frozen to disk — zero RAM, files that outlive the process that
+made them. Same contract, better economics.
 
 Host objects cross the boundary as *names*, not references — guest
 code gets a proxy whose only power is making allowlisted calls:
@@ -99,6 +123,26 @@ The conformance suite in `tests/conformance/` is the contract: a rung
 that can't pass it unchanged isn't a rung. Requesting a rung the host
 can't provide raises (`IsolationUnavailable`) — nothing silently
 degrades.
+
+## What it costs
+
+Measured on the DS image (numpy/pandas/pyarrow/matplotlib/plotly),
+warm caches, erofs root:
+
+| | |
+|---|---|
+| boot to served channel | ~0.9 s |
+| guest RAM at boot | 79 MB (600 MB on the initramfs medium) |
+| `exec_python` | ~30 ms |
+| read-only view exec | ~117 ms, flat in import weight |
+| `diff()` with one change, 210 MB tree | ~1 ms |
+| pool hit (warm VM, same fingerprint) | no boot — reset + push |
+
+The shape behind the numbers: an immutable read-only root demand-pages
+from the host page cache instead of living in guest RAM; the workspace
+is an overlayfs mount, so a diff is a walk of what changed rather than
+a scan of the tree; and view execs fork from a warm import template
+instead of paying interpreter startup per request.
 
 ## Development
 
