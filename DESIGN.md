@@ -160,7 +160,9 @@ touched. On a *clean* park or shutdown the clone is promoted back to the
 master (clonefile + atomic rename; last-clean-wins — it's cache). A
 crashed VM's clone is discarded with its rundir, and the ext4 journal
 means a promoted-mid-flight volume mounts clean in-kernel, no guest
-fsck. The master's path is part of the VM's **boot fingerprint**, so a
+fsck. The master's path is part of the VM's **boot fingerprint** — the
+identity a pooled VM is keyed by, covering everything baked in at boot
+(image, memory, medium, scratch) — so a
 pooled VM only ever serves sessions keyed to the same scratch — no
 cross-key cache leakage through reuse.
 
@@ -327,22 +329,28 @@ list from an allowlist into a suggestion.
 
 ## Backend ladder
 
+The backends are ordered by how strong a boundary they put around agent
+code — a ladder, not a set of interchangeable peers — and this project
+calls a step on it a **rung**. (The API calls them `backend=`; these
+docs say "rung" where the ordering is the load-bearing part.)
+
 Same guest supervisor, same rootfs, same wire protocol on every rung —
 only the hypervisor differs. That invariant is what keeps it one
-product, and the conformance suite enforces it: a rung that can't pass
-the corpus unchanged isn't a rung.
+product, and the conformance suite enforces it: a backend that can't
+pass the corpus unchanged isn't a rung.
 
-| rung | platform | isolation | role |
-|---|---|---|---|
-| `subprocess` | any OS | none — guest runtime as a host process in a scratch dir | dev / CI / demo floor; `pip install dud` works everywhere with zero artifacts |
-| `vfkit` (Virtualization.framework) | macOS (HVF) | real Linux microVM | local dev with a real boundary |
-| `firecracker` | Linux + KVM | microVM + snapshot parking (jailer pending) | prod fleet; density |
+| rung | backend | platform | isolation | role |
+|---|---|---|---|---|
+| 1 | `subprocess` | any OS | none — guest runtime as a host process in a scratch dir | dev / CI / demo floor; `pip install dud` works everywhere with zero artifacts |
+| 2 | `vfkit` (Virtualization.framework) | macOS (HVF) | real Linux microVM | local dev with a real boundary |
+| 3 | `firecracker` | Linux + KVM | microVM + snapshot parking (jailer pending) | prod fleet; density |
 
-macOS dev is therefore **not mimicry** — rungs 2–3 run identical guests;
-only the VMM differs. Skew concentrates entirely in rung 1 (BSD
-userland: agents write GNU-isms like `sed -i`; and the workspace can't
-claim an absolute root, since a host temp dir isn't `/workspace`).
-Accept it for dev, note it in the tool primer.
+macOS dev is therefore **not mimicry** — the two VM rungs run identical
+guests; only the VMM differs. Skew concentrates entirely in
+`subprocess` (BSD userland: agents write GNU-isms like `sed -i`; and
+the workspace can't claim an absolute root, since a host temp dir isn't
+`/workspace`). Accept it for dev, note it in the agent's tool
+instructions.
 
 The macOS rung is vfkit rather than the originally-planned libkrun,
 which would have bridged macOS-dev and Linux-prod with one VMM: libkrun
@@ -374,7 +382,7 @@ loop. The one new dangling shape — a frozen bundle whose host died — is
 covered by a marker holding the owner pid, which the rundir sweep honors
 while the owner lives and reaps once it dies.
 
-Above both postures sits one pool contract: vfkit parks hot, firecracker
+Above both sits one pool contract: vfkit parks hot, firecracker
 parks frozen at zero RAM, same acquire/release, same affinity tags.
 
 sandtrap's fail-closed pattern transplants directly: requesting a rung
@@ -404,9 +412,9 @@ workspace the origin. Under dud:
   synthetic-prefix relocatability check survives untouched.
 - **Read-only GET views are a real mount**, not a wrapper. On VM rungs a
   view exec gets a genuine read-only remount of the workspace, so the
-  GET rule is enforced at write time by the kernel. Rung 1 has no such
+  GET rule is enforced at write time by the kernel. `subprocess` has no such
   machinery and enforces it post-hoc at host-side dispatch (reject the
-  diff) — the documented dev-posture gap.
+  diff) — a real gap, accepted because that backend is for development.
 
 ## Performance & economics
 
@@ -478,8 +486,9 @@ later rung — rent the machine, keep the state model.
   commit ships the provider's commit-to-commit diff into the existing
   lowerdir, not the whole tree. (kvgit computes these diffs natively;
   this is the one place the coupling deepens profitably.)
-- **Dev/prod skew** whenever someone develops on rung 1 and deploys on
-  rung 3; plus rung-1 BSD/GNU and absolute-path skew.
+- **Dev/prod skew** whenever someone develops on `subprocess` and
+  deploys on `firecracker`, plus that backend's BSD/GNU and
+  absolute-path skew.
 - **`outputs` narrows to codec-representable values.**
 
 ## Kill criteria

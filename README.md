@@ -8,7 +8,7 @@ is deliberately storage-blind, and the machines are deliberately dumb:
 all the smarts live in state, so any VM can vanish at any moment and
 nothing of value goes with it.
 
-> **Status: alpha, on PyPI, all three rungs live.** The subprocess backend
+> **Status: alpha, on PyPI, all three backends live.** The subprocess backend
 > (real bash, real Python, zero isolation — own-agent-own-laptop
 > posture), the vfkit microVM backend (macOS/HVF), and the firecracker
 > microVM backend (Linux/KVM) all pass the same conformance corpus
@@ -25,8 +25,8 @@ nothing of value goes with it.
 pip install dud
 ```
 
-That's the whole install for the subprocess rung (zero dependencies,
-zero isolation). The VM rungs each want two more things:
+That's the whole install for the subprocess backend (zero dependencies,
+zero isolation). The VM backends each want two more things:
 
 **macOS (vfkit):**
 
@@ -41,7 +41,7 @@ python -m dud.kernels       # the pinned guest kernel (~18 MB, digest-verified)
 
 Everything else — OCI image pulls, rootfs builds, scratch volumes —
 is pure Python and arrives on first use, cached under `~/.dud`.
-Requesting a rung the host can't provide fails loud
+Requesting a backend the host can't provide fails loud
 (`IsolationUnavailable`) with the missing piece named.
 
 ## Quick look
@@ -49,8 +49,9 @@ Requesting a rung the host can't provide fails loud
 ```python
 import dud
 
-# backend="subprocess" | "vfkit" | "firecracker" | "vm" (best VM rung
-# for this host — config written against "vm" survives new rungs)
+# backend="subprocess" | "vfkit" | "firecracker" | "vm" (the best VM
+# backend for this host — config written against "vm" keeps working
+# as new ones land)
 with dud.session("vm", image="python:3.12-slim") as s:
     s.shell("mkdir -p data && echo 'a,b\n1,2' > data/in.csv")
     r = s.python("""
@@ -83,18 +84,22 @@ outside it, on a separate tmpfs, so a listing never shows dud's
 bookkeeping and a write anywhere under the root lands in the diff.
 Diff paths are relative to the root.
 
-(Rung 1 is the exception: a host temp dir can't claim `/workspace`,
-so the subprocess rung roots the workspace in its scratch dir —
-relative paths behave identically, absolute ones don't. A documented
-dev-posture gap.)
+(The subprocess backend is the exception: a host temp dir can't claim
+`/workspace`, so it roots the workspace in its scratch dir —
+relative paths behave identically, absolute ones don't. Known gap,
+and it only bites if you develop against that backend and deploy on
+a VM one.)
 
 ### Pooling and parking
 
 `pooled=True` reuses VMs across sessions from a process-wide warm
-pool; `state="<your content hash>"` parks and resumes a workspace
-without re-pushing it. On macOS a parked VM stays hot; on firecracker
-it's frozen to disk — zero RAM, files that outlive the process that
-made them. Same contract, better economics.
+pool; `state="<your content hash>"` **parks** a VM — sets it aside
+still holding that exact tree — so the next session with the same
+content resumes it instead of booting and re-pushing.
+
+How a park is stored differs by backend, but the contract doesn't: on
+macOS the VM stays running, on firecracker it's snapshotted to disk —
+zero RAM, files that outlive the process that made them.
 
 Host objects cross the boundary as *names*, not references — guest
 code gets a proxy whose only power is making allowlisted calls:
@@ -110,19 +115,26 @@ host, and everything else rides a tagged json/bytes/file codec.
 
 ## The ladder
 
-Same guest supervisor, same wire protocol on every rung — only the
-substrate hardens:
+The backends aren't peers — they're ordered by how hard a boundary
+they put around agent code, and everything above them is identical.
+Same guest supervisor, same wire protocol, same conformance corpus;
+only the substrate hardens. Hence "the ladder", and **rung** for a
+step on it (these docs use "rung" where the ordering is the point and
+"backend" where you'd be typing it into `session(backend=...)`).
 
-| rung | platform | isolation |
-|---|---|---|
-| `subprocess` | any OS | none — dev/CI floor |
-| `vfkit` | macOS (HVF) | real Linux microVM |
-| `firecracker` | Linux/KVM | microVM + snapshot parking (jailer planned) |
+| rung | backend | platform | isolation |
+|---|---|---|---|
+| 1 | `subprocess` | any OS | none — dev/CI floor |
+| 2 | `vfkit` | macOS (HVF) | real Linux microVM |
+| 3 | `firecracker` | Linux/KVM | microVM + snapshot parking (jailer planned) |
 
-The conformance suite in `tests/conformance/` is the contract: a rung
-that can't pass it unchanged isn't a rung. Requesting a rung the host
-can't provide raises (`IsolationUnavailable`) — nothing silently
+The conformance suite in `tests/conformance/` is the contract: a
+backend that can't pass it unchanged isn't a rung. Requesting one the
+host can't provide raises (`IsolationUnavailable`) — nothing silently
 degrades.
+
+(If you know Kubernetes, this is the same idea as RuntimeClass: one
+workload contract, swappable isolation underneath.)
 
 ## What it costs
 
@@ -136,7 +148,7 @@ warm caches, erofs root:
 | `exec_python` | ~30 ms |
 | read-only view exec | ~117 ms, flat in import weight |
 | `diff()` with one change, 210 MB tree | ~1 ms |
-| pool hit (warm VM, same fingerprint) | no boot — reset + push |
+| pool hit (warm VM, same image + config) | no boot — reset + push |
 
 The shape behind the numbers: an immutable read-only root demand-pages
 from the host page cache instead of living in guest RAM; the workspace
@@ -151,7 +163,7 @@ uv sync --extra dev
 uv run pytest
 ```
 
-VM-rung conformance needs the rung's platform: on macOS,
+VM-backend conformance needs that backend's platform: on macOS,
 `DUD_BACKEND=vfkit uv run pytest tests/conformance`; the firecracker
 corpus runs on any Linux with `/dev/kvm` — including, on Apple
 silicon (M3+), a nested-virt Lima guest (`dev/lima-fc.yaml`,

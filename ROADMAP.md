@@ -6,7 +6,9 @@ Updated 2026-07-20.
 
 ## Where we are
 
-All three rungs are live and pass the same conformance corpus:
+All three backends are live and pass the same conformance corpus.
+(These docs call them *rungs* — they're ordered by isolation strength,
+not interchangeable; see the ladder in the [README](README.md).)
 
 | rung | status |
 |---|---|
@@ -23,13 +25,14 @@ parking on firecracker.
 
 ## Open
 
-### Firecracker rung
+### Firecracker backend
 
-- **Golden snapshots per fingerprint** — boot once, freeze clean, then
-  every pool miss thaws a clone instead of cold-booting. The remaining
-  half of the parking story.
-- **Hardening posture** — jailer, cgroup budgets. The production-grade
-  wrapper; not needed for the dev rung.
+- **Golden snapshots per boot fingerprint** (the identity a pooled VM
+  is keyed by: image, memory, medium, scratch) — boot once, freeze
+  clean, then every pool miss thaws a clone instead of cold-booting.
+  The remaining half of the parking story.
+- **Hardening** — jailer, cgroup budgets. The production-grade wrapper;
+  not needed for local development.
 - **amd64 pins** (kernel `vmlinux`, debs) — wanted for CI anyway, since
   GitHub's `ubuntu-latest` runners have `/dev/kvm`, so firecracker
   conformance could run in plain hosted Actions on x86-64.
@@ -94,9 +97,11 @@ Recorded so they don't get re-litigated.
   bulk to disk cache, so state stays small — kvgit's own assumption —
   and eager hydration (~0.4 s / 200 MB) stops mattering. Revisit only if
   large *source* data (uploads that are genuinely state) becomes common.
-- **Rung 1.5 (Seatbelt/Landlock around the subprocess rung)** — the VM
-  rung landing on macOS removed most of its audience. Revisit only if a
-  Linux-dev-without-KVM constituency appears.
+- **OS-level sandboxing around the subprocess backend**
+  (Seatbelt/Landlock — a half-step between "no isolation" and a real
+  VM) — the vfkit backend landing on macOS removed most of its
+  audience. Revisit only if a Linux-dev-without-KVM constituency
+  appears.
 - **Per-blob content addressing** — kvgit's concern (storage v4
   candidate), not dud's.
 - **Windows** — no rung, no plan.
