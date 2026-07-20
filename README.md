@@ -16,8 +16,8 @@ nothing of value goes with it.
 > packages, warm VM pooling with state affinity, a disk-backed scratch
 > plane, and snapshot parking on firecracker (a parked VM is inert
 > files — zero RAM, ~tens-of-ms resume) all work today. See
-> [DESIGN.md](DESIGN.md) for the rationale, [PLAN.md](PLAN.md) for the
-> original staging, and [ROADMAP.md](ROADMAP.md) for what's next.
+> [DESIGN.md](DESIGN.md) for why it's shaped this way and
+> [ROADMAP.md](ROADMAP.md) for what's left.
 
 ## Install
 
