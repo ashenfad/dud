@@ -321,11 +321,15 @@ class OverlayStage:
             return st
         except OSError as e:
             sys.stderr.write(f"[dud] overlay staging unavailable: {e}\n")
-            for target in (st.work, stash):
-                try:
-                    _umount(target)
-                except OSError:
-                    pass
+            # Only the stash can be ours to unmount: the overlay is a
+            # single syscall at the end of the try, so any path that
+            # lands here never mounted the root. Unmounting it anyway
+            # would silently eat someone else's mount (a virtiofs
+            # lowerdir, say) on an unrelated failure.
+            try:
+                _umount(stash)
+            except OSError:
+                pass
             return None
 
     def _mount_overlay(self) -> None:
