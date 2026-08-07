@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import logging
 import os
 import sys
 import tempfile
@@ -31,6 +32,8 @@ from . import registry, rootfs
 # v2: layered packages ship baked hash-based .pyc (imports were
 #     recompiling pandas per exec: ~1s per view GET); debs marker
 #     folded unconditionally into the spec hash.
+_log = logging.getLogger(__name__)
+
 PIPELINE_VERSION = 2
 
 # Rootfs media the backend can boot. The medium is folded into the spec
@@ -152,7 +155,15 @@ def build(
     )
 
     if rootfs_path.exists() and not force:
+        _log.debug("rootfs cache hit: %s (%s)", spec, medium)
         return result
+
+    # The one genuinely slow, genuinely invisible step in opening a
+    # session for the first time on an image: flatten, layer, serialize.
+    # Tens of seconds with nothing to look at unless we say so.
+    _log.info("building rootfs for %s (%s, medium=%s); first use of this "
+              "spec, later sessions reuse it", image.ref, resolved_arch,
+              medium)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     fileset = rootfs.build_fileset(image, workspace=workspace)
@@ -182,6 +193,8 @@ def build(
         "entries": len(fileset.nodes),
         "size": len(data),
     }, indent=2)
+    _log.info("built %s (%s, %.1f MB, %d entries)", spec, medium,
+              len(data) / (1 << 20), len(fileset.nodes))
     return result
 
 

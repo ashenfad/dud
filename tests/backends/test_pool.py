@@ -274,6 +274,77 @@ def test_prewarm_surfaces_a_boot_bug_instead_of_going_cold(monkeypatch):
     assert p._filling == set()  # the fill claim is released either way
 
 
+def test_bound_reclaim_warns_because_an_owner_pays_for_it(monkeypatch, caplog):
+    """Reclaiming a *bound* VM makes somebody's next call raise
+    SessionLost. Recoverable, but never something to work out by
+    inference from a latency spike."""
+    import logging
+
+    p = _no_auto(_pool(monkeypatch, max_total=1))
+    with caplog.at_level(logging.INFO, logger="dud.backends.pool"):
+        a = p.acquire(image="x")
+        p.acquire(image="y")  # forces reclaim of bound LRU `a`
+    assert a.torn_down
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "SessionLost" in warnings[0].getMessage()
+
+
+def test_idle_reclaim_is_only_informational(monkeypatch, caplog):
+    """Nobody holds an idle VM, so its reclaim is news, not a warning."""
+    import logging
+
+    p = _no_auto(_pool(monkeypatch, max_total=1))
+    a = p.acquire(image="x")
+    a.close()  # parks it idle
+    with caplog.at_level(logging.DEBUG, logger="dud.backends.pool"):
+        p.acquire(image="y")  # reclaims the idle VM to stay under the cap
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+    assert any("reclaiming an idle VM" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_prewarm_unavailable_says_so(monkeypatch, caplog):
+    """The silent-degradation case finding #7 was about: no KVM meant a
+    permanently cold pool and not one word about why."""
+    import logging
+
+    from dud.errors import IsolationUnavailable
+
+    class NoKvm(FakeVM):
+        def __init__(self, **kw):
+            raise IsolationUnavailable("/dev/kvm is not accessible")
+
+    p = _no_auto(_pool(monkeypatch, session_cls=NoKvm))
+    with caplog.at_level(logging.INFO, logger="dud.backends.pool"):
+        p.prewarm(1, background=False, image="x")
+    assert any("prewarm unavailable" in r.getMessage() and "kvm" in
+               r.getMessage().lower() for r in caplog.records)
+
+
+def test_library_attaches_no_handlers(monkeypatch):
+    """Where records go is the embedder's call, so dud configures
+    nothing and attaches nothing — it only ever emits.
+
+    Not "the library is silent": WARNING and above still reach stderr
+    through ``logging.lastResort`` when nobody has configured logging
+    at all, which is stdlib behavior and the right default for the two
+    warnings this module raises.
+    """
+    import logging
+
+    p = _no_auto(_pool(monkeypatch, max_total=1))
+    a = p.acquire(image="x")
+    p.acquire(image="y")  # exercises the WARNING path
+    a.close()
+    for name in ("dud", "dud.backends.pool", "dud.images.builder",
+                 "dud.images.registry"):
+        lg = logging.getLogger(name)
+        assert lg.handlers == [], f"{name} attached a handler"
+        assert lg.propagate, f"{name} broke propagation to the embedder"
+        assert lg.level == logging.NOTSET, f"{name} forced a level"
+
+
 def test_prewarm_refills_after_drain(monkeypatch):
     p = _no_auto(_pool(monkeypatch))
     p.prewarm(1, background=False, image="x")

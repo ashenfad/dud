@@ -50,6 +50,7 @@ from __future__ import annotations
 import atexit
 import inspect
 import json
+import logging
 import os
 import threading
 import time
@@ -57,6 +58,14 @@ from typing import Any
 
 from ..errors import DudError
 from .vfkit import VfkitSession
+
+# Everything the pool does on the failure side is recoverable, which is
+# exactly why it is worth reporting: silent recovery is indistinguishable
+# from "boots are mysteriously slow". DEBUG carries routine bookkeeping
+# (hits, misses, TTL), INFO the recoveries a fresh boot papers over, and
+# WARNING the two losses somebody actually pays for — a reclaimed VM
+# that still has an owner, and warmth that could not be parked.
+_log = logging.getLogger(__name__)
 
 # Host-side binding kwargs: per-session state rebound on reuse, never
 # part of the VM's identity.
@@ -149,11 +158,15 @@ class VmPool:
                         # toward TTL/reclaim, which is how excess warmth
                         # should shed.
                         parked = bucket.pop(0)
+            if stale:
+                _log.debug("TTL expired %d idle VM(s)", len(stale))
             for s in stale:
                 self._teardown(s)
             if parked is None:
                 self._make_room()
                 self._maybe_refill(key)  # replace what we're about to boot
+                _log.debug("pool miss: booting a fresh %s",
+                           self.session_cls.__name__)
                 session = self.session_cls(**kwargs)
                 session._pool = self  # close() -> release
                 session.resumed = False
@@ -173,8 +186,11 @@ class VmPool:
                 else:
                     session.ping()
             except Exception:  # noqa: BLE001 — any failure means "not usable"
+                _log.info("parked VM did not come back; booting fresh",
+                          exc_info=True)
                 self._teardown(session)
                 continue  # dead while parked: boot fresh next loop
+            _log.debug("pool hit (resumed=%s)", matched)
             self._maybe_refill(key)  # top the level back up in background
             self._rebind(session, binding)
             session.resumed = matched
@@ -223,17 +239,35 @@ class VmPool:
                 if oldest is not None:
                     _, key, i = oldest
                     _, _, victim = self._idle[key].pop(i)
+                    bound = False
                 else:
                     quiet = [
                         s for s in self._bound.values()
                         if getattr(s, "_in_flight", 0) == 0
                     ]
                     if not quiet:
+                        _log.debug(
+                            "at max_total=%s with every VM mid-request; "
+                            "over-booting rather than blocking", self.max_total,
+                        )
                         return  # all mid-request: over-boot, don't block
                     victim = min(
                         quiet, key=lambda s: getattr(s, "last_used", 0.0)
                     )
                     self._bound.pop(id(victim), None)
+                    bound = True
+            if bound:
+                # The one reclaim somebody feels: this VM has an owner,
+                # and their next call raises SessionLost. Recoverable by
+                # design, but never something to discover by inference.
+                _log.warning(
+                    "at max_total=%s: reclaiming a VM still held by a "
+                    "session; its next call will raise SessionLost",
+                    self.max_total,
+                )
+            else:
+                _log.info("at max_total=%s: reclaiming an idle VM",
+                          self.max_total)
             self._teardown(victim)
 
     def prewarm(self, n: int, background: bool = True, **kwargs: Any) -> None:
@@ -293,13 +327,14 @@ class VmPool:
                             return  # the cap outranks the warm target
                 try:
                     session = self.session_cls(**boot_kwargs)
-                except (DudError, OSError):
+                except (DudError, OSError) as e:
                     # The environment can't prewarm (no kernel, no KVM,
                     # no vfkit): expected, and prewarming is optional.
                     # Deliberately NOT blind — a TypeError from bad
                     # boot kwargs is a bug, and letting it out of this
                     # daemon thread puts a traceback on stderr instead
                     # of silently leaving the pool permanently cold.
+                    _log.info("prewarm unavailable, pool stays cold: %s", e)
                     return
                 # Zero-RAM prewarm where the backend can: a frozen
                 # freshly-booted VM is warmth as a file.
@@ -307,10 +342,13 @@ class VmPool:
                     if hasattr(session, "freeze"):
                         session.freeze()
                 except Exception:  # noqa: BLE001 — unfreezable: discard it
+                    _log.warning("prewarmed VM could not freeze; discarding",
+                                 exc_info=True)
                     try:
                         session.close()
                     except Exception:  # noqa: BLE001 — cleanup, already failing
-                        pass
+                        _log.debug("close failed on an unfreezable prewarm",
+                                   exc_info=True)
                     return
                 session._pool = self
                 with self._lock:
@@ -337,6 +375,8 @@ class VmPool:
         try:
             session._ch.request("reset_guest", {"keep_tree": bool(state)})
         except Exception:  # noqa: BLE001 — an unresettable guest is not reusable
+            _log.info("guest reset failed on release; discarding instead of "
+                      "parking", exc_info=True)
             self._teardown(session)
             return
         # A successful reset means the guest is alive and synced: an
@@ -346,7 +386,8 @@ class VmPool:
         try:
             session.promote_scratch()
         except Exception:  # noqa: BLE001 — scratch is cache; a miss is not an error
-            pass
+            _log.debug("scratch promotion failed; next boot starts cold",
+                       exc_info=True)
         # Frozen posture: park as files, not as a process. The reset
         # already ran, so what freezes is a clean guest; thaw at the
         # next acquire resumes it in tens of ms with imports warm.
@@ -354,6 +395,8 @@ class VmPool:
             try:
                 session.freeze()
             except Exception:  # noqa: BLE001 — an unfreezable VM can't be parked
+                _log.warning("freeze failed on release; discarding the VM "
+                             "instead of parking it", exc_info=True)
                 self._teardown(session)
                 return
         key = _fingerprint(session._pool_kwargs, self.session_cls)
@@ -403,7 +446,7 @@ class VmPool:
         try:
             session.close()
         except Exception:  # noqa: BLE001 — disposal must not leak a VM
-            pass
+            _log.debug("close failed during teardown", exc_info=True)
 
     def _expire_locked(self) -> list[VfkitSession]:
         """Prune expired idle VMs; returns them for the CALLER to tear

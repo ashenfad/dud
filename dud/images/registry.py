@@ -18,6 +18,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import logging
 import platform
 import urllib.error
 import urllib.parse
@@ -27,6 +28,8 @@ from pathlib import Path
 
 from ..atomic import staged, write_json
 from ..errors import DudError
+
+_log = logging.getLogger(__name__)
 
 _DEFAULT_REGISTRY = "registry-1.docker.io"
 _DOCKER_AUTH = "https://auth.docker.io/token"
@@ -223,6 +226,7 @@ class Registry:
         # digest below verifies what THIS writer read, which is only
         # the same thing as what landed on disk if nobody shared the
         # staging path. See dud.atomic.
+        _log.debug("downloading blob %s", digest)
         h = hashlib.sha256()
         with staged(dest) as tmp:
             with self._get(ref, f"blobs/{digest}", "*/*") as r, \
@@ -253,11 +257,19 @@ class Registry:
         cache = self._resolution_path(r, arch)
         try:
             manifest, digest = self._resolve(r, arch)
-        except RegistryError:
+        except RegistryError as e:
             if not cache.exists():
                 raise
             cached = json.loads(cache.read_text())
             manifest, digest = cached["manifest"], cached["digest"]
+            # Worth saying out loud: the tag is now pinned to whatever it
+            # meant at the last successful resolve, so an image that
+            # moved upstream will not be picked up until the registry is
+            # reachable again.
+            _log.warning(
+                "registry unreachable (%s); reusing the cached resolution "
+                "for %s — %s stays pinned to %s", e, r, r.reference, digest,
+            )
         else:
             cache.parent.mkdir(parents=True, exist_ok=True)
             write_json(cache, {"digest": digest, "manifest": manifest})
