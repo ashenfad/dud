@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .backends.base import public_methods
 from .backends.subprocess import Session
 from .errors import DudError
 from .proto import PROTO_VERSION, ProtocolError, RemoteError
@@ -24,6 +25,7 @@ __all__ = [
     "__version__",
     "session",
     "Session",
+    "public_methods",
     "VfkitSession",
     "FirecrackerSession",
     "scratch_master",

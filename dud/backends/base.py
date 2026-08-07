@@ -15,6 +15,7 @@ implements :meth:`close`.
 from __future__ import annotations
 
 import base64
+import inspect
 import io
 import logging
 import posixpath
@@ -34,11 +35,74 @@ from ..values import decode_map, decode_value, encode_value
 _log = logging.getLogger(__name__)
 
 
+def public_methods(obj: Any) -> frozenset[str]:
+    """Every public callable on ``obj``, as a concrete set.
+
+    The honest way to say "expose this whole object"::
+
+        allow={"db": dud.public_methods(my_db)}
+
+    Deliberately a helper rather than a wildcard. A wildcard would put a
+    permissive branch back into :meth:`HostSession._hostcall` — the one
+    thing the fail-closed allowlist exists to remove — and it would be
+    the easiest thing to type, which is how the old permissive default
+    became what everyone shipped. A resolved set costs one call and
+    keeps three properties a wildcard can't:
+
+    - the gate stays a plain membership test, with nothing to audit;
+    - ``session.allow`` stays data you can print, log, and assert on;
+    - it snapshots *now*, so a method added later by a plugin or a
+      monkeypatch is not granted retroactively.
+
+    Reads attributes statically: a ``@property`` whose getter opens a
+    connection must not fire merely because someone asked what this
+    object exposes.
+    """
+    names = set()
+    for name in dir(obj):
+        if name.startswith("_"):
+            continue  # never callable over hostcall anyway
+        try:
+            attr = inspect.getattr_static(obj, name)
+        except AttributeError:
+            continue
+        if callable(attr):
+            names.add(name)
+    return frozenset(names)
+
+
+def _clean_methods(name: str, value: Any) -> frozenset[str]:
+    """One allow entry, validated and frozen into a set of names."""
+    if isinstance(value, (str, bytes)):
+        # `allow={"db": "query"}` — the braces got dropped. Left alone
+        # this silently becomes a SUBSTRING match, so a one-character
+        # typo quietly widens the grant (`db.q` passes `"q" in "query"`).
+        raise PolicyError(
+            f"allow[{name!r}] is a string; it must be a set of method "
+            f"names. Did you mean {{{value!r}}}? A bare string matches "
+            f"by substring, which would allow more than it names."
+        )
+    try:
+        methods = frozenset(value)
+    except TypeError:
+        raise PolicyError(
+            f"allow[{name!r}] must be a set of method names, got "
+            f"{type(value).__name__}"
+        ) from None
+    bad = sorted(m for m in methods if not isinstance(m, str))
+    if bad:
+        raise PolicyError(
+            f"allow[{name!r}] contains non-string method names: {bad}"
+        )
+    return methods
+
+
 def require_allowlist(
     host_objects: dict[str, Any] | None,
-    allow: dict[str, set[str]] | None,
-) -> None:
-    """Refuse a host object that has no ``allow`` entry.
+    allow: dict[str, Any] | None,
+) -> dict[str, frozenset[str]]:
+    """Refuse a host object that has no ``allow`` entry; return the
+    normalized allowlist.
 
     Fail closed, like every other policy decision here (a rung the host
     can't provide raises rather than degrading). The allowlist is the
@@ -49,24 +113,34 @@ def require_allowlist(
     ``allow={"db": set()}`` is a legitimate registration with no
     callable methods: explicitly nothing, which is the point. Entries
     naming objects that aren't registered are left alone, so one policy
-    dict can be shared across sessions that expose different subsets.
+    dict can be shared across sessions that expose different subsets —
+    though they are still checked, because a malformed entry is a bug
+    wherever it sits.
+
+    Normalizing to frozensets is what makes the gate's membership test
+    mean what it looks like. It also closes an accidental escape hatch:
+    any object with a ``__contains__`` that answered True used to pass
+    every method, invisibly and unauditably.
     """
     for name in host_objects or {}:
         if name not in (allow or {}):
             raise PolicyError(
                 f"host object {name!r} was registered without an allow "
                 f"entry. Pass allow={{{name!r}: {{'method', ...}}}} naming "
-                f"the methods guest code may call — or {{{name!r}: set()}} "
-                f"to register it with none. dud will not infer a policy "
-                f"for a live host object."
+                f"the methods guest code may call, "
+                f"allow={{{name!r}: dud.public_methods(obj)}} for all of "
+                f"them, or {{{name!r}: set()}} for none. dud will not "
+                f"infer a policy for a live host object."
             )
-    unknown = sorted(set(allow or {}) - set(host_objects or {}))
+    clean = {n: _clean_methods(n, v) for n, v in (allow or {}).items()}
+    unknown = sorted(set(clean) - set(host_objects or {}))
     if unknown:
         # Not an error: a shared policy dict outliving any one session's
         # object set is a reasonable pattern. Still the first thing to
         # check when an allowlist appears not to apply.
         _log.debug("allow entries for unregistered host objects: %s",
                    ", ".join(unknown))
+    return clean
 
 
 def _safe_diff_path(name: str) -> str:
@@ -107,10 +181,9 @@ class HostSession:
         cache: dict[str, bytes] | None = None,
         on_emit: Callable[[str, Any], None] | None = None,
     ):
-        require_allowlist(host_objects, allow)
         self.cache: dict[str, bytes] = cache if cache is not None else {}
         self.host_objects = host_objects or {}
-        self.allow = allow or {}
+        self.allow = require_allowlist(host_objects, allow)
         self.emits: list[tuple[str, Any]] = []
         self.on_emit = on_emit
         self._closed = False
@@ -171,9 +244,9 @@ class HostSession:
         name, method = body.get("obj", ""), body.get("method", "")
         if name not in self.host_objects:
             raise self._denied(f"no host object {name!r}")
-        # `allow.get(name) or ()` rather than the constructor's guarantee:
-        # a registration mutated in after construction (the pool rebinds
-        # both fields on reuse) must land on deny, not on wide open.
+        # `.get(name) or ()` rather than trusting the constructor: these
+        # fields are publicly assignable, and a registration mutated in
+        # afterwards must land on deny, not on wide open.
         allowed = self.allow.get(name) or ()
         if method not in allowed:
             raise self._denied(f"{name}.{method} is not allowlisted")
