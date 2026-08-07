@@ -136,6 +136,20 @@ def test_registering_without_an_allowlist_is_refused(make_session):
         make_session(host_objects={"db": FakeDb()})
 
 
+def test_public_methods_grants_the_whole_object(make_session):
+    """The honest way to say "expose all of it" — a resolved set, not a
+    wildcard, so the gate stays a plain membership test and the grant
+    stays inspectable. The private rule still outranks it."""
+    import dud
+
+    db = FakeDb()
+    with make_session(host_objects={"db": db},
+                      allow={"db": dud.public_methods(db)}) as s:
+        assert s.python("rows = db.query()").ok
+        r = s.python("getattr(db, '_secret')()")
+        assert not r.ok  # underscore names are never callable
+
+
 def test_empty_allowlist_registers_an_object_with_no_methods(make_session):
     """Explicitly nothing is a legitimate policy; only silence is not."""
     db = FakeDb()

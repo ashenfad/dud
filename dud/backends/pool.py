@@ -431,10 +431,10 @@ class VmPool:
         # these fields bypass the constructor entirely, and a security
         # default that holds on a fresh boot but lapses on a pool hit is
         # the worst possible shape for one.
-        require_allowlist(binding["host_objects"], binding["allow"])
+        allow = require_allowlist(binding["host_objects"], binding["allow"])
         session.cache = binding["cache"] if binding["cache"] is not None else {}
         session.host_objects = binding["host_objects"] or {}
-        session.allow = binding["allow"] or {}
+        session.allow = allow
         session.on_emit = binding["on_emit"]
         session.emits = []
         session._closed = False

@@ -113,9 +113,22 @@ s.python("db.drop_all()")                       # PermissionError, host-side
 `allow` is **required** for every registered object, and fails closed
 like everything else here — registering one without an entry raises
 `PolicyError` at construction rather than quietly granting every public
-method. Use `allow={"db": set()}` to register an object with none.
-Underscore-prefixed names are never callable regardless of what the
-allowlist says.
+method. Underscore-prefixed names are never callable regardless of what
+the allowlist says.
+
+To expose a whole object, resolve it rather than wildcarding it:
+
+```python
+allow={"db": dud.public_methods(my_db)}   # every public callable, as a set
+allow={"db": set()}                        # registered, nothing callable
+```
+
+`public_methods` returns a plain `frozenset`, so the grant stays
+something you can print, log and assert on, and it snapshots what
+exists *now* — a method added later by a plugin or a monkeypatch isn't
+granted retroactively. There is deliberately no `"*"`: a wildcard would
+be the easiest thing to type, which is how the old permissive default
+became what everyone shipped.
 
 No pickle ever crosses the wire; cache values are opaque bytes to the
 host, and everything else rides a tagged json/bytes/file codec.
