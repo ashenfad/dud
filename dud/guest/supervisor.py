@@ -127,8 +127,11 @@ class _WorkerChild:
     only needs alive/dead), and kill is the same killpg the spawn path
     uses (the child setsid's after fork)."""
 
-    def __init__(self, pid: int):
+    def __init__(self, pid: int, stdout=None):
         self.pid = pid
+        # Named `stdout` to match Popen: _pump_runner and _reap read the
+        # tap off either shape without caring which spawned the runner.
+        self.stdout = stdout
         self.returncode: int | None = None
 
     def poll(self):
@@ -247,6 +250,11 @@ class Supervisor:
             return None
         _proc, ctl = self._template
         parent, child = socketlib.socketpair()
+        # The forked child's stdout/stderr. A spawned runner gets this
+        # from Popen; a forked one would otherwise inherit the
+        # template's console, and its transcript would die with it on a
+        # timeout — the exact gap this pipe closes.
+        tap_r, tap_w = os.pipe()
         try:
             payload = json.dumps({"cwd": cwd, "env": env}).encode()
             ctl.settimeout(_CTL_TIMEOUT)
@@ -258,7 +266,7 @@ class Supervisor:
             sent = ctl.sendmsg(
                 [struct.pack(">I", len(payload))],
                 [(socketlib.SOL_SOCKET, socketlib.SCM_RIGHTS,
-                  struct.pack("i", child.fileno()))],
+                  struct.pack("ii", child.fileno(), tap_w))],
             )
             if sent != 4:
                 raise OSError(f"short ctl header send ({sent}/4)")
@@ -273,11 +281,18 @@ class Supervisor:
         except OSError:
             parent.close()
             child.close()
+            os.close(tap_r)
+            os.close(tap_w)
             self._drop_template()
             self._start_template()
             return None
         child.close()
-        return parent, _WorkerChild(int.from_bytes(pid_bytes, "big"))
+        os.close(tap_w)  # the child holds the write end now
+        worker = _WorkerChild(
+            int.from_bytes(pid_bytes, "big"),
+            stdout=os.fdopen(tap_r, "rb", buffering=0),
+        )
+        return parent, worker
 
     # ---- dispatch ----------------------------------------------------
 
@@ -517,7 +532,7 @@ class Supervisor:
         # end: an unread pipe fills at 64 KB and blocks the writer, so
         # draining is what keeps a chatty exec from deadlocking. Kept
         # only if the exec dies without answering.
-        tap = getattr(proc, "stdout", None)  # forked workers have none
+        tap = getattr(proc, "stdout", None)  # spawned or forked, both have one
         spill = _Spill()
         watch = [sock] + ([tap] if tap is not None else [])
         while True:
@@ -595,15 +610,15 @@ class Supervisor:
             # reaper); we just make sure the group is dead. Waiting
             # here would race the template's reap for no benefit.
             self._kill(proc)
-            return
-        if proc.poll() is None:
-            self._kill(proc)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        # getattr, not attribute access: this method also takes forked
-        # workers and test doubles, neither of which owns a pipe.
+        else:
+            if proc.poll() is None:
+                self._kill(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        # Both shapes carry a tap now, and it leaks per exec if we skip
+        # it on either. getattr because test doubles carry neither.
         tap = getattr(proc, "stdout", None)
         if tap is not None:
             try:

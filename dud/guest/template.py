@@ -84,11 +84,15 @@ def _reap() -> None:
         pass
 
 
-def _recv_request(ctl: socket.socket) -> tuple[dict, int] | None:
-    """One control frame: (request, exec-socket fd). None on EOF."""
+def _recv_request(ctl: socket.socket) -> tuple[dict, int, int | None] | None:
+    """One control frame: (request, exec-socket fd, output-pipe fd).
+
+    The output pipe is optional so the frame stays readable if a
+    supervisor ever sends only the exec socket.
+    """
     fds = array.array("i")
     try:
-        msg, ancdata, _flags, _addr = ctl.recvmsg(4, socket.CMSG_LEN(4))
+        msg, ancdata, _flags, _addr = ctl.recvmsg(4, socket.CMSG_LEN(8))
     except OSError:
         return None
     if not msg:
@@ -105,7 +109,8 @@ def _recv_request(ctl: socket.socket) -> tuple[dict, int] | None:
         buf.extend(chunk)
     if not fds:
         return None
-    return json.loads(bytes(buf).decode()), fds[0]
+    return (json.loads(bytes(buf).decode()), fds[0],
+            fds[1] if len(fds) > 1 else None)
 
 
 def main() -> None:
@@ -123,11 +128,20 @@ def main() -> None:
         got = _recv_request(ctl)
         if got is None:
             return  # supervisor went away (or a torn frame): power down
-        req, exec_fd = got
+        req, exec_fd, out_fd = got
         pid = os.fork()
         if pid == 0:
             # Child: become one ordinary runner serving one request.
             try:
+                if out_fd is not None:
+                    # Stand in for the stdout/stderr a spawned runner
+                    # gets from Popen, so a forked view exec that hangs
+                    # or dies reports the same partial transcript. Also
+                    # routes the pre-exit traceback below to the caller
+                    # rather than only to the console.
+                    os.dup2(out_fd, 1)
+                    os.dup2(out_fd, 2)
+                    os.close(out_fd)
                 # Its own group: the supervisor killpg's on timeout. A
                 # child that can't get one MUST die (killpg against the
                 # template's group would take the template with it) —
@@ -167,6 +181,8 @@ def main() -> None:
                 os._exit(1)
             os._exit(0)
         os.close(exec_fd)
+        if out_fd is not None:
+            os.close(out_fd)  # the child owns it; the template must not
         ctl.sendall(pid.to_bytes(8, "big"))
 
 
