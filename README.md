@@ -156,6 +156,35 @@ is an overlayfs mount, so a diff is a walk of what changed rather than
 a scan of the tree; and view execs fork from a warm import template
 instead of paying interpreter startup per request.
 
+## Seeing what it's doing
+
+Most of what the pool does on the failure side is *recoverable* — a
+dead parked VM boots fresh, a failed reset discards instead of parking,
+an unprewarmable host just runs cold. Recovered silently, all of those
+look identical from the outside: boots are mysteriously slow. So dud
+logs them, on the stdlib `dud.*` hierarchy:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)      # or attach your own handler
+```
+
+| level | what lands there |
+|---|---|
+| `DEBUG` | pool hits and misses, TTL expiry, blob downloads, scratch promotion misses |
+| `INFO` | recoveries a fresh boot papers over, and the first build of a rootfs (the one genuinely slow step) |
+| `WARNING` | the two losses somebody pays for: a reclaimed VM that still has an owner, and warmth that couldn't be parked |
+
+dud attaches no handlers and sets no levels — where records go is
+yours. `logging.getLogger("dud").setLevel(logging.DEBUG)` turns the
+whole tree up; the per-module loggers (`dud.backends.pool`,
+`dud.images.builder`, `dud.images.registry`) narrow it.
+
+The guest is the exception: it has no logger to attach to, so guest and
+init diagnostics go to the VM console (captured in the session's
+rundir) and surface in the `IsolationUnavailable` message on a failed
+boot.
+
 ## Development
 
 ```bash

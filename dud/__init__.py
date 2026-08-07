@@ -20,9 +20,8 @@ from .proto import PROTO_VERSION, ProtocolError, RemoteError
 from .results import Diff, ExecError, PythonResult, ShellResult
 from .values import NotRepresentable
 
-__version__ = "0.0.1"
-
 __all__ = [
+    "__version__",
     "session",
     "Session",
     "VfkitSession",
@@ -54,7 +53,28 @@ _LAZY = {
 }
 
 
+def _installed_version() -> str:
+    """Read the version from installed package metadata.
+
+    Derived, never written down here: a literal is a second place to
+    bump at release time, and the one that used to live here spent two
+    releases reporting 0.0.1 because only pyproject got touched.
+    Lazy for the same reason as everything else in ``_LAZY`` —
+    ``importlib.metadata`` is not free, and almost nobody asks.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("dud")
+    except PackageNotFoundError:
+        # Imported from a source tree that was never installed (a bare
+        # PYTHONPATH run). Say so rather than inventing a number.
+        return "0+unknown"
+
+
 def __getattr__(name: str):
+    if name == "__version__":
+        return _installed_version()
     target = _LAZY.get(name)
     if target is None:
         raise AttributeError(f"module 'dud' has no attribute {name!r}")
