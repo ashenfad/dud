@@ -22,13 +22,12 @@ from __future__ import annotations
 
 import gzip
 import io
-import os
 import shutil
 import subprocess
 import sys
-import threading
 from pathlib import Path
 
+from ..atomic import staged
 from ..errors import DudError
 from . import dud_home
 
@@ -67,19 +66,15 @@ def blank_ext4(size_mib: int = 4096, home: str | Path | None = None,
     if dest.exists():
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    # Unique temp per baker: two processes racing the first bake must
-    # not interleave mke2fs runs on one file (each rename below is a
-    # complete image; last-wins is fine — they're identical blanks).
-    tmp = dest.with_suffix(f".part.{os.getpid()}.{threading.get_ident()}")
-    try:
+    # Staged per baker: two processes racing the first bake must not
+    # interleave mke2fs runs on one file. Last-wins is fine here —
+    # they're identical blanks.
+    with staged(dest) as tmp:
         tool = _host_mke2fs()
         if tool:
             _bake_host(tool, tmp, size_mib)
         else:
             _bake_vm(tmp, size_mib, home, arch)
-        tmp.rename(dest)
-    finally:
-        tmp.unlink(missing_ok=True)  # failed bake leaves no residue
     return dest
 
 
@@ -149,12 +144,8 @@ def scratch_master(key: str, size_mib: int = 4096,
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     blank = blank_ext4(size_mib, home=home)
-    tmp = dest.with_suffix(f".part.{os.getpid()}.{threading.get_ident()}")
-    try:
+    with staged(dest) as tmp:
         _clone_or_copy(blank, tmp)
-        tmp.rename(dest)
-    finally:
-        tmp.unlink(missing_ok=True)
     return dest
 
 
@@ -176,12 +167,11 @@ def promote_clone(master: Path, clone: Path, tag: str) -> None:
     rename each other's half-written copies over the master."""
     if not clone.exists():
         return
-    part = master.with_suffix(f".promote.{os.getpid()}.{tag}")
-    try:
+    # ``tag`` carries the promoting session's identity: one thread can
+    # own several sessions keyed to one master, so pid+thread alone
+    # wouldn't separate their staging paths.
+    with staged(master, tag=f"promote.{tag}") as part:
         _clone_or_copy(clone, part)
-        part.replace(master)
-    finally:
-        part.unlink(missing_ok=True)  # crash between clone and replace
 
 
 def _unpack_sparse(gz: bytes, dest: Path, size: int) -> None:

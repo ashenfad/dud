@@ -25,6 +25,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..atomic import staged, write_json
 from ..errors import DudError
 
 _DEFAULT_REGISTRY = "registry-1.docker.io"
@@ -216,16 +217,23 @@ class Registry:
         dest = self.blobs / hexd
         if dest.exists():
             return dest
-        tmp = dest.with_suffix(".part")
+        # Staged per-writer: a blob cache trusts its own filenames (a
+        # cached blob IS its digest and is never re-hashed), so a torn
+        # write published here would poison every later pull. The
+        # digest below verifies what THIS writer read, which is only
+        # the same thing as what landed on disk if nobody shared the
+        # staging path. See dud.atomic.
         h = hashlib.sha256()
-        with self._get(ref, f"blobs/{digest}", "*/*") as r, open(tmp, "wb") as f:
-            while chunk := r.read(1 << 20):
-                h.update(chunk)
-                f.write(chunk)
-        if h.hexdigest() != hexd:
-            tmp.unlink(missing_ok=True)
-            raise RegistryError(f"digest mismatch for {digest}: got {h.hexdigest()}")
-        tmp.rename(dest)
+        with staged(dest) as tmp:
+            with self._get(ref, f"blobs/{digest}", "*/*") as r, \
+                    open(tmp, "wb") as f:
+                while chunk := r.read(1 << 20):
+                    h.update(chunk)
+                    f.write(chunk)
+            if h.hexdigest() != hexd:
+                raise RegistryError(
+                    f"digest mismatch for {digest}: got {h.hexdigest()}"
+                )
         return dest
 
     # ---- public ------------------------------------------------------
@@ -252,9 +260,7 @@ class Registry:
             manifest, digest = cached["manifest"], cached["digest"]
         else:
             cache.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache.with_suffix(".part")
-            tmp.write_text(json.dumps({"digest": digest, "manifest": manifest}))
-            tmp.rename(cache)
+            write_json(cache, {"digest": digest, "manifest": manifest})
         config_path = self._blob(r, manifest["config"]["digest"])
         config = json.loads(config_path.read_bytes())
         layers = [self._blob(r, lyr["digest"]) for lyr in manifest["layers"]]

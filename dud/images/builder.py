@@ -17,13 +17,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import os
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..atomic import staged, write_json
 from . import registry, rootfs
 
 # Bump when the flatten/inject/cpio logic changes shape in a way that
@@ -161,10 +161,13 @@ def build(
     if deb_names:
         _layer_debs(fileset, list(deb_names), resolved_arch, home)
     data = _serialize(fileset, medium, home, resolved_arch)
-    tmp = rootfs_path.with_suffix(".part")
-    tmp.write_bytes(data)
-    tmp.rename(rootfs_path)
-    result.meta_path.write_text(json.dumps({
+    # Two builders of one spec race here whenever the cache is cold —
+    # the pool's background refill and a foreground boot do exactly
+    # that — and the artifact is what a VM boots from, so a torn one is
+    # an unbootable guest with a valid-looking cache entry.
+    with staged(rootfs_path) as tmp:
+        tmp.write_bytes(data)
+    write_json(result.meta_path, {
         "spec": spec,
         "ref": result.ref,
         "digest": result.digest,
@@ -178,7 +181,7 @@ def build(
         "pipeline_version": PIPELINE_VERSION,
         "entries": len(fileset.nodes),
         "size": len(data),
-    }, indent=2))
+    }, indent=2)
     return result
 
 
