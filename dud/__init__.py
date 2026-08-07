@@ -35,6 +35,7 @@ __all__ = [
     "DudError",
     "SessionLost",
     "IsolationUnavailable",
+    "PolicyError",
     "NotRepresentable",
     "ProtocolError",
     "RemoteError",
@@ -48,6 +49,7 @@ _LAZY = {
     "FirecrackerSession": ("dud.backends.firecracker", "FirecrackerSession"),
     "IsolationUnavailable": ("dud.errors", "IsolationUnavailable"),
     "SessionLost": ("dud.errors", "SessionLost"),
+    "PolicyError": ("dud.errors", "PolicyError"),
     "scratch_master": ("dud.images.scratch", "scratch_master"),
     "blank_ext4": ("dud.images.scratch", "blank_ext4"),
 }

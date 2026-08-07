@@ -16,18 +16,57 @@ from __future__ import annotations
 
 import base64
 import io
+import logging
 import posixpath
 import tarfile
 import time
 from pathlib import Path
 from typing import Any, Callable
 
+from ..errors import PolicyError
 from ..errors import SessionLost  # noqa: F401 — canonical home is dud.errors
 from ..proto import Channel, ChannelClosed, ProtocolError
 from ..results import Diff, ExecError, PythonResult, ShellResult
 from ..values import decode_map, decode_value, encode_value
 
+# Denials are policy events, not noise: a guest reaching for something
+# outside its allowlist is exactly what an embedder wants to see.
+_log = logging.getLogger(__name__)
 
+
+def require_allowlist(
+    host_objects: dict[str, Any] | None,
+    allow: dict[str, set[str]] | None,
+) -> None:
+    """Refuse a host object that has no ``allow`` entry.
+
+    Fail closed, like every other policy decision here (a rung the host
+    can't provide raises rather than degrading). The allowlist is the
+    *only* fine-grained gate between agent code and a live host object,
+    so "unspecified" cannot mean "everything" — that was the one place
+    dud failed open, and the default is what most callers ship.
+
+    ``allow={"db": set()}`` is a legitimate registration with no
+    callable methods: explicitly nothing, which is the point. Entries
+    naming objects that aren't registered are left alone, so one policy
+    dict can be shared across sessions that expose different subsets.
+    """
+    for name in host_objects or {}:
+        if name not in (allow or {}):
+            raise PolicyError(
+                f"host object {name!r} was registered without an allow "
+                f"entry. Pass allow={{{name!r}: {{'method', ...}}}} naming "
+                f"the methods guest code may call — or {{{name!r}: set()}} "
+                f"to register it with none. dud will not infer a policy "
+                f"for a live host object."
+            )
+    unknown = sorted(set(allow or {}) - set(host_objects or {}))
+    if unknown:
+        # Not an error: a shared policy dict outliving any one session's
+        # object set is a reasonable pattern. Still the first thing to
+        # check when an allowlist appears not to apply.
+        _log.debug("allow entries for unregistered host objects: %s",
+                   ", ".join(unknown))
 
 
 def _safe_diff_path(name: str) -> str:
@@ -48,8 +87,10 @@ class HostSession:
     - ``cache``: dict[str, bytes] of opaque pickled values (guest-side
       pickles). Mutations land only after a successful exec.
     - ``host_objects``: name -> live object; guests reach them solely via
-      hostcall. ``allow`` maps name -> permitted method names (default:
-      all public callables — rung-1 cooperative posture).
+      hostcall. ``allow`` maps name -> permitted method names and is
+      **required** for every registered object — see
+      :func:`require_allowlist`. ``allow={"db": set()}`` registers one
+      with no callable methods.
     - ``on_emit``: callback(name, value) for guest emits; also collected
       in ``self.emits``. Emits are *events*, not state: they arrive live
       mid-exec and are kept even when the exec later fails — unlike
@@ -66,6 +107,7 @@ class HostSession:
         cache: dict[str, bytes] | None = None,
         on_emit: Callable[[str, Any], None] | None = None,
     ):
+        require_allowlist(host_objects, allow)
         self.cache: dict[str, bytes] = cache if cache is not None else {}
         self.host_objects = host_objects or {}
         self.allow = allow or {}
@@ -128,12 +170,17 @@ class HostSession:
     def _hostcall(self, body: dict) -> dict:
         name, method = body.get("obj", ""), body.get("method", "")
         if name not in self.host_objects:
-            raise PermissionError(f"no host object {name!r}")
-        allowed = self.allow.get(name)
-        if allowed is not None and method not in allowed:
-            raise PermissionError(f"{name}.{method} is not allowlisted")
+            raise self._denied(f"no host object {name!r}")
+        # `allow.get(name) or ()` rather than the constructor's guarantee:
+        # a registration mutated in after construction (the pool rebinds
+        # both fields on reuse) must land on deny, not on wide open.
+        allowed = self.allow.get(name) or ()
+        if method not in allowed:
+            raise self._denied(f"{name}.{method} is not allowlisted")
         if method.startswith("_"):
-            raise PermissionError(f"{name}.{method}: private methods are never callable")
+            raise self._denied(
+                f"{name}.{method}: private methods are never callable"
+            )
         target = getattr(self.host_objects[name], method, None)
         if not callable(target):
             raise AttributeError(f"{name}.{method} is not a callable method")
@@ -143,6 +190,19 @@ class HostSession:
         if result is None:
             return {}
         return {"result": encode_value(result)}
+
+    @staticmethod
+    def _denied(reason: str) -> PermissionError:
+        """Refuse a hostcall, and say so where an embedder can see it.
+
+        Guest code reaching past its allowlist is the one thing on this
+        boundary worth an unprompted look, whether it's a bug or an
+        agent probing. ``PermissionError`` stays the raised type: it
+        crosses to the guest as a RemoteError and consumers already
+        catch it.
+        """
+        _log.warning("hostcall denied: %s", reason)
+        return PermissionError(reason)
 
     # ---- host API ------------------------------------------------------
 

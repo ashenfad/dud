@@ -111,10 +111,62 @@ def test_sparse_and_default_kwargs_share_a_fingerprint(monkeypatch):
 
 def test_binding_kwargs_are_not_identity(monkeypatch):
     p = _pool(monkeypatch)
-    a = p.acquire(image="x", host_objects={"db": object()})
+    a = p.acquire(image="x", host_objects={"db": object()},
+                  allow={"db": set()})
     a.close()
-    b = p.acquire(image="x", host_objects={"other": object()})
+    b = p.acquire(image="x", host_objects={"other": object()},
+                  allow={"other": set()})
     assert b is a  # host_objects differ, VM identity doesn't
+
+
+def test_allowlist_does_not_lapse_on_a_pool_hit(monkeypatch):
+    """Reuse rebinds host_objects/allow straight onto a parked session,
+    bypassing the constructor. A fail-closed default that holds on a
+    fresh boot and lapses on a warm one is worse than none."""
+    import pytest
+
+    from dud.errors import PolicyError
+
+    p = _pool(monkeypatch)
+    a = p.acquire(image="x", host_objects={"db": object()},
+                  allow={"db": {"query"}})
+    a.close()  # parks it
+    with pytest.raises(PolicyError):
+        p.acquire(image="x", host_objects={"db": object()})
+    # The parked VM stays parked: a refused acquire hands out nothing.
+    b = p.acquire(image="x", host_objects={"db": object()},
+                  allow={"db": {"query"}})
+    assert b is a and FakeVM.booted == 1
+
+
+def test_rebind_checks_at_the_assignment_point(monkeypatch):
+    """Not merely via acquire: the guard sits where the fields land."""
+    import pytest
+
+    from dud.errors import PolicyError
+
+    p = _pool(monkeypatch)
+    a = p.acquire(image="x", host_objects={"db": object()},
+                  allow={"db": set()})
+    with pytest.raises(PolicyError):
+        p._rebind(a, {"host_objects": {"db": object()}, "allow": None,
+                      "cache": None, "on_emit": None})
+
+
+def test_a_bad_allowlist_costs_nobody_a_vm(monkeypatch):
+    """The check runs before _make_room, which under max_total can
+    reclaim somebody else's session — no sense paying that for a config
+    error that was going to raise regardless."""
+    import pytest
+
+    from dud.errors import PolicyError
+
+    p = _no_auto(_pool(monkeypatch, max_total=1))
+    held = p.acquire(image="x")
+    with pytest.raises(PolicyError):
+        p.acquire(image="y", host_objects={"db": object()})
+    assert held.torn_down is False
+    assert FakeVM.booted == 1
 
 
 def test_failed_reset_tears_down_instead_of_parking(monkeypatch):

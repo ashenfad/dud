@@ -307,6 +307,17 @@ VM there is no my-process, and the question decomposes:
 | ticks, memory limit, timeout | RAM/CPU at boot, wall-clock kill |
 | `host_objects` gating | the `hostcall` allowlist — the only fine-grained policy that survives, host-side, where a real boundary wants it |
 
+Being the only surviving fine-grained policy is what makes that
+allowlist mandatory rather than optional. It gates a *live host
+object* — the one thing on this boundary that isn't disposable — so an
+absent entry raises (`PolicyError`) instead of granting every public
+method. It shipped permissive at first, on the rung-1 reasoning that
+the caller and the agent were the same person; that stopped being true
+the moment a VM rung existed, and a default nobody types is the one
+most deployments run. Fail-closed here matches `IsolationUnavailable`:
+the parts of this system that answer "what may this code reach" do not
+guess.
+
 So the image spec *is* the config surface: a base ref, layered pip
 packages (prebuilt guest-arch wheels), layered pinned debs for system
 tools, and a medium. Spec hash → cached artifact, built once and reused.

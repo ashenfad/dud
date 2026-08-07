@@ -24,6 +24,18 @@ class SessionLost(DudError, RuntimeError):
     """
 
 
+class PolicyError(DudError, ValueError):
+    """A session was configured with policy dud refuses to guess at.
+
+    Today that means one thing: a host object registered without an
+    ``allow`` entry. The allowlist is the only fine-grained policy
+    between agent code and a live host object (DESIGN.md, "Policy
+    collapses to the image"), so an absent one is a question, not a
+    default. Raised at construction — the whole point is that it never
+    becomes a runtime surprise.
+    """
+
+
 class IsolationUnavailable(DudError, RuntimeError):
     """The requested VM rung can't run here (platform/tooling/kernel).
 

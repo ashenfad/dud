@@ -115,9 +115,34 @@ def test_hostcall_denied_method(make_session):
 
 def test_hostcall_private_always_denied(make_session):
     db = FakeDb()
-    with make_session(host_objects={"db": db}) as s:
+    # Underscore names are refused even when the allowlist names them:
+    # the private rule outranks the policy, it isn't an absence of one.
+    with make_session(host_objects={"db": db}, allow={"db": {"_secret"}}) as s:
         r = s.python("getattr(db, '_secret')()")
         assert not r.ok
+
+
+def test_registering_without_an_allowlist_is_refused(make_session):
+    """The default that used to hand a guest every public method.
+
+    Fail closed at construction, like a rung the host can't provide —
+    an unspecified policy is a question, not a permission.
+    """
+    import pytest
+
+    from dud.errors import PolicyError
+
+    with pytest.raises(PolicyError, match="without an allow entry"):
+        make_session(host_objects={"db": FakeDb()})
+
+
+def test_empty_allowlist_registers_an_object_with_no_methods(make_session):
+    """Explicitly nothing is a legitimate policy; only silence is not."""
+    db = FakeDb()
+    with make_session(host_objects={"db": db}, allow={"db": set()}) as s:
+        r = s.python("db.query()")
+        assert not r.ok and "not allowlisted" in r.error.message
+        assert db.log == []
 
 
 def test_hostcall_unknown_object(session):
@@ -142,7 +167,8 @@ def test_hostcall_arg_types(value, make_session):
         def echo(self, v):
             return v
 
-    with make_session(host_objects={"echo": EchoObj()}) as s:
+    with make_session(host_objects={"echo": EchoObj()},
+                      allow={"echo": {"echo"}}) as s:
         r = s.python("out = echo.echo(v)", inputs={"v": value})
         assert r.ok, r.error
         assert r.outputs.get("out") == value
