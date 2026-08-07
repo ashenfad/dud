@@ -35,6 +35,17 @@ booted from a real Linux image — slots in as the executor, and:
   the emulation stack serves worst are the data-science workloads
   nontainer-studio ships as its flagship loop.
 
+That third point has a corollary worth stating plainly, because it
+outlives the fidelity argument: the emulation stack tops out at what
+Python semantics can express. sandtrap gates Python ASTs, monkeyfs is a
+Python VFS, termish emulates a shell — a second language means
+rebuilding all three. A machine has no such ceiling. Whatever makes C
+extensions work is the same thing that makes node work; reach is not a
+feature that gets added twice. dud can't collect on that yet (the
+rootfs pipeline hard-requires a `python:*-slim` layout, and the only
+runner is the Python one), but both are build-time constraints rather
+than architectural ones.
+
 The emulation stack was scaffolding for the workspace contract on
 machines we couldn't afford to make real. A real machine retires the
 scaffolding, not the contract.
@@ -501,23 +512,6 @@ later rung — rent the machine, keep the state model.
   deploys on `firecracker`, plus that backend's BSD/GNU and
   absolute-path skew.
 - **`outputs` narrows to codec-representable values.**
-
-## Kill criteria
-
-Kept here so the project stays honest. If the studio remains
-single-user, localhost, trusted-data, and published apps stay behind
-known audiences, the existing emulation stack is sufficient and dud is a
-distraction. dud earns its existence when any of these are true:
-
-- serving agent-authored apps to anonymous users,
-- untrusted data flowing through agent turns routinely,
-- DS workloads hitting the monkeyfs fidelity wall in practice,
-- wanting duckdb / polars / torch-class dependencies.
-
-The behavioral half of this gate — running the studio's real analyst
-loop under a VM rung and comparing against sandtrap — has still not been
-run. The project proceeded on fidelity evidence instead. That's a debt,
-not a verdict.
 
 ## Open questions
 

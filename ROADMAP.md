@@ -73,10 +73,13 @@ rendering) across rungs in one corpus — become valuable exactly here.
   and first opens.
 - **Studio still defaults to initramfs**; flipping it to `medium="auto"`
   is a one-arg decision, worth bundling with eager-warming work.
-- **The dogfood gate was never run.** The behavioral half of DESIGN's
-  kill criteria (`dogfood/analyst_agent.py`, needs a model key) — real
-  fidelity *and* real isolation versus sandtrap, on the studio's actual
-  analyst loop. We proceeded on fidelity evidence instead.
+- **No side-by-side numbers against sandtrap.** nontainer-studio
+  harnesses run against dud and the substrate carries real agent loops,
+  so this is no longer a question of whether the approach works — but
+  the same loop has never been run both ways with numbers worth
+  quoting. Worth having whenever a claim needs backing; blocking
+  nothing. (An older note here pointed at a `dogfood/analyst_agent.py`
+  in this repo that never existed — the harnesses live in the studio.)
 
 ## Deliberately not now
 
