@@ -41,10 +41,23 @@ Python semantics can express. sandtrap gates Python ASTs, monkeyfs is a
 Python VFS, termish emulates a shell — a second language means
 rebuilding all three. A machine has no such ceiling. Whatever makes C
 extensions work is the same thing that makes node work; reach is not a
-feature that gets added twice. dud can't collect on that yet (the
-rootfs pipeline hard-requires a `python:*-slim` layout, and the only
-runner is the Python one), but both are build-time constraints rather
-than architectural ones.
+feature that gets added twice.
+
+dud can't collect on that yet, and the distance divides into three
+levels worth keeping apart. Running a non-Python *program* is a
+build-time question only: `exec_shell` is already language-blind — real
+bash, real binaries, diff out — so it wants nothing but an image, and
+the only thing in the way is `rootfs.py` requiring a `python:*-slim`
+layout. Giving a second language the *runner* contract (harvested
+outputs, cache, host proxies, last-expression echo) costs more than a
+rootfs: `exec_python` is a verb on the wire, the supervisor spawns
+`sys.executable -m dud.guest.runner` by name, and the warm fork
+template is Python's too. That is protocol and dispatch work — additive
+rather than a redesign, since a runner is just a process speaking JSON
+over a socketpair and a second one would speak the same — but it is
+real work on both sides of the boundary. Only the third level is
+architectural: dropping the interpreter requirement altogether means a
+supervisor that isn't Python.
 
 The emulation stack was scaffolding for the workspace contract on
 machines we couldn't afford to make real. A real machine retires the
