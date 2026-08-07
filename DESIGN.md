@@ -293,23 +293,34 @@ execs spawn. The asymmetry is deliberate: views are the latency-visible
 path (a preview GET blocks a human), where regular execs are already
 amortized against an LLM round trip.
 
-### Prints and budget-aware rendering
+### Prints: raw material, not an observation budget
 
 sandtrap's `snapshot_prints` captures raw print objects so the host can
 render them sized to the observation budget. The objects can't cross the
-boundary — so the budget and renderer move instead:
+boundary, so what dud ships instead is a structured stream:
 
-- The observation budget rides in the exec request; the runner does the
-  per-type smart rendering (DataFrame head/tail, array shape+dtype)
-  **guest-side**, where the objects live.
-- `prints` is a structured stream: each entry rendered at a per-entry
-  cap, tagged with metadata (`type`, `shape`/`len`). The host composes
-  the final observation within the total budget by allocating across
-  entries — per-object intelligence guest-side, cross-entry allocation
-  host-side. (The Jupyter split: repr at the kernel, MIME bundles on the
-  wire, client composes.) Entries ride the same `Value` codec as outputs.
-- Entries exceeding their cap spill full renderings to a file and carry
-  a `file` ref — "show me more" is a read, not a re-execution.
+- `prints` is a list of entries, each carrying the printed text plus
+  metadata the text alone would lose (`type`, and `shape`/`len` where
+  the object had one). Entries ride the same `Value` codec as outputs.
+- `caps` in the exec request are **resource guards, not a budget**: a
+  per-entry ceiling, an entry-count ceiling, a total across entries, and
+  one on the transcript. They exist so a runaway print loop can't flood
+  vsock or balloon a supervisor that is PID 1 — the same class of thing
+  as the wall-clock kill and the RAM cap at boot. They are set high
+  enough not to be a policy in disguise.
+- **Deciding what the model should see is the host's job.** dud has no
+  business ranking an agent's output, and the layer above already knows
+  the observation budget, the model, and the turn. It receives every
+  entry with its metadata and allocates across them.
+
+What is deliberately *not* here: per-type smart rendering (DataFrame
+head/tail, array shape+dtype). That would need the live object, so it
+could only ever live guest-side — and it is the one piece of this that
+genuinely cannot move up. It is unbuilt, and `str(obj)` truncated at
+the guard is what ships today. Recorded because the difference matters
+if it ever gets built: rendering must be guest-side, budgeting must not
+be. A previous version of this document described the budgeting half as
+though dud performed it, which it never has.
 
 Rejected: holding the interpreter alive for a `render_more(id, budget)`
 RPC. It makes VM lifetime a correctness concern again — trading the
