@@ -330,6 +330,16 @@ class HostSession:
         that's a real remount — writes fail inside the exec; on scan
         staging it's unenforced (rung-1 documented gap), so consumers
         should keep a post-hoc diff check where it matters.
+
+        ``caps`` are resource guards on what an exec may send back —
+        ``stdout`` (transcript), ``entry`` (one print), ``entries``
+        (count), ``total`` (across entries). They exist to stop a
+        runaway print loop flooding the channel, not to size an
+        observation: choosing what a model should see is the caller's
+        job, and it gets every entry plus its metadata to do it with.
+        The defaults sit far above any plausible observation, so raising
+        them is rarely the answer; lowering them is a way to bound a
+        specific untrusted exec.
         """
         enc_inputs = {}
         if inputs:

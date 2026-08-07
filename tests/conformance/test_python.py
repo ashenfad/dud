@@ -53,6 +53,38 @@ def test_prints_entry_cap(session):
     assert len(r.transcript) > 100
 
 
+def test_default_caps_do_not_shape_an_ordinary_observation(session):
+    """The guards sit above anything a caller would plausibly want to
+    show a model, so the host — not dud — decides what gets trimmed.
+    10k characters used to be truncated twice over by the old 2 KB
+    entry / 20 KB transcript defaults."""
+    r = session.python("print('x' * 10000)")
+    assert r.ok, r.error
+    assert not r.prints[0]["truncated"]
+    assert len(r.prints[0]["text"]) == 10000
+    assert "truncated at" not in r.transcript
+
+
+def test_total_cap_bounds_the_entry_stream(session):
+    """entry * entries multiplies, so a total is what actually guards
+    the supervisor's memory. Dropped entries are counted, not silent."""
+    r = session.python(
+        "for _ in range(200):\n    print('y' * 1000)\n",
+        caps={"total": 5_000, "entry": 1_000, "entries": 500},
+    )
+    assert r.ok, r.error
+    assert sum(len(p["text"]) for p in r.prints) <= 6_000
+    assert r.prints_dropped > 0
+
+
+def test_caps_can_still_be_tightened_per_exec(session):
+    """Guards are a floor the caller can lower for an untrusted exec,
+    even though they are not an observation budget."""
+    r = session.python("print('z' * 5000)", caps={"stdout": 100})
+    assert r.ok, r.error
+    assert "truncated at 100 chars" in r.transcript
+
+
 def test_error_reports_traceback(session):
     r = session.python("def f():\n    raise ValueError('boom')\nf()")
     assert not r.ok

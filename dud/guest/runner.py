@@ -38,6 +38,17 @@ from ..values import decode_map, encode_map, encode_value
 
 _RUNNER_FILE = "<session>"
 
+# Resource guards, deliberately not an observation budget: what a model
+# should see is the host's call, and it has the budget, the model and
+# the turn to decide with. These only stop a runaway print loop from
+# flooding the channel or ballooning a PID-1 supervisor, so they sit far
+# above any plausible observation — the old 20 KB / 2 KB / 200 defaults
+# were quietly making that decision on the host's behalf.
+_CAP_STDOUT = 1 << 20   # 1 MiB of transcript
+_CAP_ENTRY = 1 << 14    # 16 KiB per print
+_CAP_ENTRIES = 2_000    # entries in the structured stream
+_CAP_TOTAL = 1 << 21    # 2 MiB across entries — bounds entry * count
+
 
 class _TeeBuffer(io.StringIO):
     """The transcript buffer, mirrored out of the process as it fills.
@@ -208,22 +219,39 @@ def _meta_for(obj: Any) -> dict:
 
 
 class PrintCapture:
-    def __init__(self, stdout: io.StringIO, entry_cap: int, max_entries: int):
+    """Collects prints as structured entries under resource guards.
+
+    The guards are not an observation budget — deciding what a model
+    should see belongs to the host, which knows the budget, the model
+    and the turn. These exist so a runaway print loop cannot flood the
+    channel or balloon a supervisor that is PID 1 on a VM rung, and are
+    set high enough that they should never be what shapes an
+    observation. See DESIGN.md, "Prints: raw material".
+    """
+
+    def __init__(self, stdout: io.StringIO, entry_cap: int,
+                 max_entries: int, total_cap: int):
         self.stdout = stdout
         self.entry_cap = entry_cap
         self.max_entries = max_entries
+        # Without a total, the real ceiling is entry_cap * max_entries,
+        # which multiplies into hundreds of MB at guard-sized values.
+        self.total_cap = total_cap
         self.entries: list[dict] = []
         self.dropped = 0
+        self._total = 0
 
     def _add(self, text: str, meta: dict, echo: bool = False) -> None:
-        if len(self.entries) >= self.max_entries:
+        if len(self.entries) >= self.max_entries or self._total >= self.total_cap:
             self.dropped += 1
             return
         truncated = len(text) > self.entry_cap
-        entry = {"text": text[: self.entry_cap], "truncated": truncated, **meta}
+        text = text[: self.entry_cap]
+        entry = {"text": text, "truncated": truncated, **meta}
         if echo:
             entry["echo"] = True
         self.entries.append(entry)
+        self._total += len(text)
 
     def print_fn(self, *args, sep=" ", end="\n", file=None, flush=False):
         text = sep.join(str(a) for a in args)
@@ -289,9 +317,10 @@ def _flatten_ui(g: dict) -> None:
 def run(channel: Channel, req: dict) -> dict:
     code = req["code"]
     caps = req.get("caps", {})
-    stdout_cap = int(caps.get("stdout", 20_000))
-    entry_cap = int(caps.get("entry", 2_000))
-    max_entries = int(caps.get("entries", 200))
+    stdout_cap = int(caps.get("stdout", _CAP_STDOUT))
+    entry_cap = int(caps.get("entry", _CAP_ENTRY))
+    max_entries = int(caps.get("entries", _CAP_ENTRIES))
+    total_cap = int(caps.get("total", _CAP_TOTAL))
 
     # Workspace-root imports, cwd-independent: filesystem modules resolve
     # from the workspace root (`import app.api...` works after `cd app`),
@@ -304,7 +333,7 @@ def run(channel: Channel, req: dict) -> dict:
     # Captured before redirect_stdout swaps it out: this is the fd the
     # supervisor is reading, and the only way anything escapes a kill.
     stdout_buf = _TeeBuffer(sys.stdout)
-    prints = PrintCapture(stdout_buf, entry_cap, max_entries)
+    prints = PrintCapture(stdout_buf, entry_cap, max_entries, total_cap)
 
     g: dict[str, Any] = {"__name__": "__dud__", "__builtins__": __builtins__}
     injected = {"__name__", "__builtins__", "print", "cache", "emit"}
