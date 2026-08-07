@@ -39,6 +39,40 @@ from ..values import decode_map, encode_map, encode_value
 _RUNNER_FILE = "<session>"
 
 
+class _TeeBuffer(io.StringIO):
+    """The transcript buffer, mirrored out of the process as it fills.
+
+    Everything written here is also pushed to the inherited stdout —
+    which the supervisor holds the read end of — and flushed, because
+    block buffering on a pipe would leave it sitting in memory that a
+    kill destroys.
+
+    On a normal exec the mirror is redundant: the run response carries
+    this buffer's contents, capped and structured, and the supervisor
+    throws its copy away. It exists for the two exits that never send a
+    response — a timeout and a crash — where the buffer dies with the
+    process and the mirror is the only surviving evidence of how far
+    the code got. Those are the failure modes a real machine invites
+    (C extensions segfault, allocations OOM), and the moment output is
+    worth the most.
+    """
+
+    def __init__(self, mirror):
+        super().__init__()
+        self._mirror = mirror
+
+    def write(self, s: str) -> int:
+        n = super().write(s)
+        try:
+            self._mirror.write(s)
+            self._mirror.flush()
+        except (OSError, ValueError, AttributeError):
+            # No mirror (closed, or none inherited): the in-process
+            # transcript still works, we just lose the failure copy.
+            pass
+        return n
+
+
 class CacheView(MutableMapping):
     """dict-like over the host cache: lazy read-through, local
     write-back. Pickling happens only here, guest-side; the host
@@ -267,7 +301,9 @@ def run(channel: Channel, req: dict) -> dict:
     if workspace and workspace not in sys.path:
         sys.path.insert(0, workspace)
 
-    stdout_buf = io.StringIO()
+    # Captured before redirect_stdout swaps it out: this is the fd the
+    # supervisor is reading, and the only way anything escapes a kill.
+    stdout_buf = _TeeBuffer(sys.stdout)
     prints = PrintCapture(stdout_buf, entry_cap, max_entries)
 
     g: dict[str, Any] = {"__name__": "__dud__", "__builtins__": __builtins__}

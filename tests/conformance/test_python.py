@@ -70,6 +70,50 @@ def test_timeout_kills_runner(session):
     assert not r.ok and r.error.etype == "Timeout"
 
 
+def test_timeout_keeps_what_was_printed(session):
+    """A hang is when the transcript is worth the most: it says how far
+    the code got. It used to come back empty, so the only way to learn
+    anything was to re-run with more prints, blind."""
+    r = session.python(
+        "print('reached step 1')\nimport time\ntime.sleep(30)", timeout=1.0
+    )
+    assert not r.ok and r.error.etype == "Timeout"
+    assert "reached step 1" in r.transcript
+
+
+def test_crash_keeps_what_was_printed(session):
+    """Same for a runner that dies without answering — the failure mode
+    a real machine invites, since C extensions segfault and allocations
+    get OOM-killed."""
+    r = session.python("print('reached step 2')\nimport os\nos._exit(1)")
+    assert not r.ok and r.error.etype == "RunnerCrash"
+    assert "reached step 2" in r.transcript
+
+
+def test_chatty_hang_does_not_deadlock(session):
+    """The output escapes through a pipe, and an undrained pipe blocks
+    its writer at 64 KB. Printing well past that and then hanging must
+    still time out on schedule, keeping the tail."""
+    r = session.python(
+        "for i in range(20000):\n"
+        "    print(f'line {i} ' + 'y' * 40)\n"
+        "import time\n"
+        "time.sleep(30)\n",
+        timeout=3.0,
+    )
+    assert not r.ok and r.error.etype == "Timeout"
+    assert r.transcript.endswith("y\n")  # the tail, not the head
+    assert "earlier output dropped" in r.transcript
+
+
+def test_successful_exec_transcript_is_not_duplicated(session):
+    """The mirror the failure paths read is discarded on success — the
+    response carries the authoritative, capped transcript."""
+    r = session.python("print('once')")
+    assert r.ok, r.error
+    assert r.transcript == "once\n"
+
+
 def test_session_survives_runner_timeout(session):
     session.python("import time\ntime.sleep(30)", timeout=1.0)
     r = session.python("x = 1")

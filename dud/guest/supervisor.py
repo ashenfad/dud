@@ -45,6 +45,7 @@ from .staging import make_stage
 _RUNNER_DEFAULT_TIMEOUT = 30.0
 _SHELL_DEFAULT_TIMEOUT = 30.0
 _CTL_TIMEOUT = 5.0  # template control handshake budget
+_SPILL_CAP = 64 * 1024  # tail of a failed exec's output, kept for the report
 
 # clock_settime plumbing for do_resync (guest PID 1 is root; the
 # subprocess rung never takes this path).
@@ -60,6 +61,62 @@ class _timespec(ctypes.Structure):
 # replaced. One failure can be the exec's own fault; two in a row
 # without a success is the pattern of a poisoned template.
 _WORKER_FAILURE_LIMIT = 2
+
+
+class _Spill:
+    """The tail of a dying runner's output.
+
+    Kept as the TAIL rather than the head: when an exec hangs or
+    crashes, what it printed last is what says where it got to. Bounded
+    because this buffer lives in the supervisor, which is PID 1 on a VM
+    rung — an unbounded one would turn a runaway print loop into a
+    memory attack on the machine itself.
+    """
+
+    def __init__(self, cap: int = _SPILL_CAP):
+        self._cap = cap
+        self._buf = bytearray()
+        self._dropped = False
+
+    def read(self, tap) -> bool:
+        """One non-blocking read; False at EOF or on a dead pipe."""
+        try:
+            chunk = os.read(tap.fileno(), 65536)
+        except (OSError, ValueError):
+            return False
+        if not chunk:
+            return False
+        self._buf += chunk
+        if len(self._buf) > self._cap:
+            del self._buf[: len(self._buf) - self._cap]
+            self._dropped = True
+        return True
+
+    def drain(self, tap, budget: float = 0.5) -> None:
+        """Take whatever the pipe still holds now its writer is dead.
+
+        Bounded by a deadline as well as by EOF: a grandchild that
+        survived the process-group kill would hold the write end open,
+        and a failed exec must still answer.
+        """
+        if tap is None:
+            return
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            try:
+                ready, _, _ = select.select([tap], [], [], 0)
+            except (OSError, ValueError):
+                return
+            if not ready or not self.read(tap):
+                return
+
+    def text(self) -> str:
+        if not self._buf:
+            return ""
+        out = self._buf.decode("utf-8", errors="replace")
+        if self._dropped:
+            out = f"… [earlier output dropped at {self._cap} bytes]\n{out}"
+        return out
 
 
 class _WorkerChild:
@@ -398,6 +455,12 @@ class Supervisor:
             parent, proc = forked
         else:
             parent, child = socketlib.socketpair()
+            # A pipe for the runner's stdout/stderr, drained as the exec
+            # runs (see _pump_runner). Two things ride it: the mirrored
+            # transcript, and anything native that never reaches Python's
+            # stderr at all — a glibc "Segmentation fault", the kernel's
+            # OOM kill notice. Both are exactly what a failed exec needs
+            # to report and currently throws away.
             proc = subprocess.Popen(
                 [sys.executable, "-m", "dud.guest.runner",
                  str(child.fileno())],
@@ -405,6 +468,8 @@ class Supervisor:
                 cwd=cwd,
                 env=env,
                 start_new_session=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
             )
             child.close()
         rchan = Channel(parent)
@@ -448,25 +513,35 @@ class Supervisor:
     def _pump_runner(self, rchan: Channel, rid: int, proc, timeout: float) -> dict:
         deadline = time.monotonic() + timeout
         sock = rchan._sock
+        # The runner's mirrored output. Read continuously, not at the
+        # end: an unread pipe fills at 64 KB and blocks the writer, so
+        # draining is what keeps a chatty exec from deadlocking. Kept
+        # only if the exec dies without answering.
+        tap = getattr(proc, "stdout", None)  # forked workers have none
+        spill = _Spill()
+        watch = [sock] + ([tap] if tap is not None else [])
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 self._kill(proc)
+                spill.drain(tap)
                 return {
-                    "ok": False, "transcript": "", "prints": [],
+                    "ok": False, "transcript": spill.text(), "prints": [],
                     "outputs": {}, "outputs_skipped": {},
                     "error": {"etype": "Timeout",
                               "message": f"exceeded {timeout}s (killed)"},
                 }
-            ready, _, _ = select.select([sock], [], [], min(remaining, 0.25))
-            if not ready:
+            ready, _, _ = select.select(watch, [], [], min(remaining, 0.25))
+            if tap is not None and tap in ready and not spill.read(tap):
+                watch.remove(tap)  # EOF: stop selecting on a dead pipe
+            if sock not in ready:
                 if proc.poll() is not None:
-                    return self._crash_result(proc)
+                    return self._crash_result(proc, spill, tap)
                 continue
             try:
                 msg, mbins = rchan._recv_msg()
             except ChannelClosed:
-                return self._crash_result(proc)
+                return self._crash_result(proc, spill, tap)
             kind = msg.get("kind")
             if kind == "req":
                 try:
@@ -491,7 +566,7 @@ class Supervisor:
                     }
                 return msg.get("body", {})
 
-    def _crash_result(self, proc) -> dict:
+    def _crash_result(self, proc, spill=None, tap=None) -> dict:
         # The ChannelClosed path arrives here without ever polling, so
         # give the exit status a moment to land before reporting it.
         try:
@@ -499,8 +574,10 @@ class Supervisor:
         except subprocess.TimeoutExpired:
             pass
         code = proc.returncode if proc.returncode is not None else "(unreaped)"
+        spill = spill if spill is not None else _Spill()
+        spill.drain(tap)
         return {
-            "ok": False, "transcript": "", "prints": [],
+            "ok": False, "transcript": spill.text(), "prints": [],
             "outputs": {}, "outputs_skipped": {},
             "error": {"etype": "RunnerCrash",
                       "message": f"runner exited {code} without a result"},
@@ -525,6 +602,14 @@ class Supervisor:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             pass
+        # getattr, not attribute access: this method also takes forked
+        # workers and test doubles, neither of which owns a pipe.
+        tap = getattr(proc, "stdout", None)
+        if tap is not None:
+            try:
+                tap.close()  # the read end is ours to release
+            except OSError:
+                pass
 
 
 def main() -> None:
