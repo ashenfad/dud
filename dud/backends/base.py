@@ -66,6 +66,13 @@ def public_methods(obj: Any) -> frozenset[str]:
             attr = inspect.getattr_static(obj, name)
         except AttributeError:
             continue
+        if isinstance(attr, (classmethod, staticmethod)):
+            # Static lookup hands back the descriptor, and a bare
+            # `classmethod` object is not itself callable — so testing
+            # it directly would drop a perfectly ordinary public method
+            # from a helper whose contract is "all of them". Unwrapping
+            # __func__ invokes nothing, so the property guarantee holds.
+            attr = attr.__func__
         if callable(attr):
             names.add(name)
     return frozenset(names)
@@ -89,10 +96,14 @@ def _clean_methods(name: str, value: Any) -> frozenset[str]:
             f"allow[{name!r}] must be a set of method names, got "
             f"{type(value).__name__}"
         ) from None
-    bad = sorted(m for m in methods if not isinstance(m, str))
+    bad = [m for m in methods if not isinstance(m, str)]
     if bad:
+        # Sort the reprs, not the values: {7, None} has no ordering, and
+        # a TypeError here would escape the PolicyError contract that
+        # callers of this function are told to rely on.
         raise PolicyError(
-            f"allow[{name!r}] contains non-string method names: {bad}"
+            f"allow[{name!r}] contains non-string method names: "
+            f"{', '.join(sorted(map(repr, bad)))}"
         )
     return methods
 
