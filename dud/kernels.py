@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -40,6 +41,7 @@ import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from .atomic import write_json
 from .errors import DudError
 from .images import dud_home
 
@@ -225,8 +227,11 @@ def install(
             raise KernelFetchError(
                 f"kernel digest mismatch: got {got}, want {spec.image_sha256}"
             )
-        image.rename(d / "Image")
-    (d / "meta.json").write_text(json.dumps(asdict(spec), indent=2))
+        os.replace(image, d / "Image")
+    # After the Image, and atomically: meta.json is what installed()
+    # reads to decide the kernel is already there, so it must never
+    # name a spec the Image beside it doesn't satisfy.
+    write_json(d / "meta.json", asdict(spec), indent=2)
     return d / "Image"
 
 

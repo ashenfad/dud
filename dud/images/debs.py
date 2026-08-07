@@ -28,6 +28,7 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..atomic import staged
 from ..errors import DudError
 from . import rootfs
 from .cpio import FileSet
@@ -121,23 +122,24 @@ def fetch_deb(spec: DebSpec, home: Path) -> Path:
     if dest.exists():
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".part")
     h = hashlib.sha256()
-    try:
-        with urllib.request.urlopen(spec.url, timeout=120) as r, \
-                open(tmp, "wb") as f:
-            while chunk := r.read(1 << 20):
-                h.update(chunk)
-                f.write(chunk)
-    except OSError as e:
-        raise DebError(f"fetch {spec.url} failed: {e}") from e
-    if h.hexdigest() != spec.sha256:
-        tmp.unlink(missing_ok=True)
-        raise DebError(
-            f"{spec.name}: digest mismatch (got {h.hexdigest()}, "
-            f"want {spec.sha256})"
-        )
-    tmp.rename(dest)
+    # Same discipline as registry blobs: this cache is shared with them
+    # and equally never re-hashed, so the staging path must be ours
+    # alone (see dud.atomic).
+    with staged(dest) as tmp:
+        try:
+            with urllib.request.urlopen(spec.url, timeout=120) as r, \
+                    open(tmp, "wb") as f:
+                while chunk := r.read(1 << 20):
+                    h.update(chunk)
+                    f.write(chunk)
+        except OSError as e:
+            raise DebError(f"fetch {spec.url} failed: {e}") from e
+        if h.hexdigest() != spec.sha256:
+            raise DebError(
+                f"{spec.name}: digest mismatch (got {h.hexdigest()}, "
+                f"want {spec.sha256})"
+            )
     return dest
 
 

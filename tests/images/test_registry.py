@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 
 import pytest
 
@@ -155,6 +156,80 @@ def test_expired_token_retried_once_with_fresh_auth(tmp_path, monkeypatch):
     resp = reg._get(ref, "blobs/sha256:abc", "*/*")
     assert resp.read() == b"ok"
     assert calls == ["Bearer stale", "Bearer fresh"]
+
+
+def test_concurrent_writers_cannot_publish_a_torn_blob(tmp_path, monkeypatch):
+    """Two pulls of one digest must not corrupt the cached blob.
+
+    Routine, not exotic: the pool's background refill boots a session
+    on the same key a foreground acquire is already booting, so both
+    reach for the same layer with a cold cache. The danger is that the
+    digest check verifies the bytes a writer SENT — if writers shared a
+    staging path, the second one's truncating open would punch a hole
+    in the first one's file, that check would still pass, and the torn
+    blob would be published under a name nothing ever re-verifies.
+    """
+    reg = Registry(tmp_path)
+    content = b"layer-content:" + bytes(range(256)) * 64
+    hexd = hashlib.sha256(content).hexdigest()
+    digest = f"sha256:{hexd}"
+    ref = ImageRef.parse("python:3.12-slim")
+
+    slow_has_written = threading.Event()  # slow's staging file exists
+    fast_finished = threading.Event()     # fast has published and gone
+
+    class _Body:
+        def __init__(self, chunks, pause_before_last=False):
+            self._chunks = list(chunks)
+            self._pause = pause_before_last
+
+        def read(self, _n=None):
+            if not self._chunks:
+                return b""
+            if self._pause and len(self._chunks) == 1:
+                # Our first chunk is on disk and our file is still open:
+                # the exact window where a second writer sharing the
+                # path would truncate underneath us.
+                slow_has_written.set()
+                fast_finished.wait(timeout=10)
+            return self._chunks.pop(0)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_get(self, r, path, accept):
+        if threading.current_thread().name == "slow":
+            return _Body([content[:100], content[100:]], pause_before_last=True)
+        slow_has_written.wait(timeout=10)  # open our file mid-slow-write
+        return _Body([content])
+
+    monkeypatch.setattr(Registry, "_get", fake_get)
+
+    errors: list[Exception] = []
+
+    def pull_blob():
+        try:
+            reg._blob(ref, digest)
+        except Exception as e:  # noqa: BLE001 — reported below
+            errors.append(e)
+        finally:
+            if threading.current_thread().name == "fast":
+                fast_finished.set()
+
+    threads = [
+        threading.Thread(target=pull_blob, name=name) for name in ("slow", "fast")
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+
+    assert not errors, errors
+    assert (reg.blobs / hexd).read_bytes() == content
+    assert not list(reg.blobs.glob("*.part*")), "staging residue left behind"
 
 
 def test_pull_cache_is_per_arch(tmp_path, monkeypatch):
