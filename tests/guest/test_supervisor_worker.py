@@ -82,9 +82,12 @@ def test_large_env_payload_crosses_ctl_intact(sup):
     def peer():
         req = tpl_mod._recv_request(theirs)
         assert req is not None
-        body, fd = req
+        body, fd, out_fd = req
         got.update(body)
+        got["out_fd"] = out_fd
         os.close(fd)
+        if out_fd is not None:
+            os.close(out_fd)
         theirs.sendall((424242).to_bytes(8, "big"))
         theirs.close()
 
@@ -97,7 +100,12 @@ def test_large_env_payload_crosses_ctl_intact(sup):
     parent, child = res
     assert child.pid == 424242
     assert got["env"]["BLOB"] == blob
+    # Both fds ride the same control frame: the exec socket and the
+    # child's output pipe, whose read end the worker now carries.
+    assert got["out_fd"] is not None
+    assert child.stdout is not None
     parent.close()
+    child.stdout.close()
 
 
 def test_failure_breaker_replaces_template_after_two_strikes(sup):

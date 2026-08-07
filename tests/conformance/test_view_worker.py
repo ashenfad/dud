@@ -68,6 +68,19 @@ def test_worker_timeout_kills_child_not_worker(session):
     assert session.ping().get("view_worker") == "ready"
 
 
+def test_worker_timeout_keeps_what_was_printed(session):
+    """Forked view execs get the same partial transcript spawned ones
+    do. A forked child inherits the template's console rather than a
+    Popen pipe, so without an explicit one its output would die with
+    it — and views are the latency-visible path, where a timeout is a
+    human waiting on a preview that never came."""
+    _await_worker(session)
+    r = session.python("print('view reached step 1')\nimport time\ntime.sleep(30)",
+                       timeout=2.0, fs_readonly=True)
+    assert not r.ok and r.error.etype == "Timeout"
+    assert "view reached step 1" in r.transcript
+
+
 def test_reset_guest_rewarms_template(session):
     """The pooled park path: the reset kill-sweep takes the template;
     the next session must find a fresh one warming, not a corpse."""
