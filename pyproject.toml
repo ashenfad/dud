@@ -49,8 +49,9 @@ testpaths = ["tests"]
 # on every branch at once. These four are what was actually being
 # enforced before that: real errors and undefined names, not style.
 #
-# Several of the newly-default rules would be worth adopting (BLE001
-# especially, given how many best-effort `except Exception` paths the
-# pool and teardown code carries). That's a deliberate commit with the
-# fixes beside it, not something a `pip install` should decide.
-select = ["E4", "E7", "E9", "F"]
+# Additions past that baseline are deliberate, one rule at a time:
+#   BLE001 — every `except Exception` is either narrowed to the types
+#            that path actually expects, or carries a `# noqa: BLE001 —
+#            <reason>` saying why breadth is the right call. The rule
+#            earns its place by making the next one an argued choice.
+select = ["E4", "E7", "E9", "F", "BLE001"]

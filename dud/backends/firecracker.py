@@ -307,7 +307,7 @@ class FirecrackerSession(HostSession):
                 self._proc.kill()
         try:
             self._fc_log.close()
-        except Exception:
+        except OSError:
             pass
 
     # ---- freeze / thaw ---------------------------------------------------
@@ -458,7 +458,7 @@ class FirecrackerSession(HostSession):
             # the snapshot dies with its rundir.
             try:
                 self._fc_log.close()
-            except Exception:
+            except OSError:
                 pass
             shutil.rmtree(self._rundir, ignore_errors=True)
             return
@@ -466,11 +466,11 @@ class FirecrackerSession(HostSession):
         try:
             self._ch.request("shutdown")
             clean = True
-        except Exception:
+        except Exception:  # noqa: BLE001 — a guest mid-death answers anything
             pass
         try:
             self._ch.close()
-        except Exception:
+        except OSError:
             pass
         try:
             self._proc.wait(timeout=8)
@@ -485,6 +485,6 @@ class FirecrackerSession(HostSession):
         for closeable in (self._srv, self._fc_log):
             try:
                 closeable.close()
-            except Exception:
+            except OSError:
                 pass
         shutil.rmtree(self._rundir, ignore_errors=True)

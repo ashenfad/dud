@@ -196,7 +196,7 @@ class PrintCapture:
         target = file if file is not None else self.stdout
         try:
             target.write(text + end)
-        except Exception:
+        except Exception:  # noqa: BLE001 — `file=` is an arbitrary agent object
             pass
         if file is None or file is self.stdout:
             meta = _meta_for(args[0]) if len(args) == 1 else {"type": "tuple"}

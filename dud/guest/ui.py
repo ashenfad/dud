@@ -35,7 +35,7 @@ def flatten_rich(ui: dict, workspace: str) -> set[str]:
     for name, value in list(ui.items()):
         try:
             rel = _materialize(str(name), value, workspace)
-        except Exception:
+        except Exception:  # noqa: BLE001 — third-party serializers raise anything
             rel = None  # a rich value that failed to serialize: leave it be
         if rel is not None:
             handled.add(name)

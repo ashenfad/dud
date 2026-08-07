@@ -414,7 +414,7 @@ class VfkitSession(HostSession):
                 self._proc.kill()
         try:
             self._vfkit_log.close()
-        except Exception:
+        except OSError:
             pass
 
     def close(self, park_state: str | None = None) -> None:
@@ -437,11 +437,11 @@ class VfkitSession(HostSession):
         try:
             self._ch.request("shutdown")
             clean = True
-        except Exception:
+        except Exception:  # noqa: BLE001 — a guest mid-death answers anything
             pass
         try:
             self._ch.close()
-        except Exception:
+        except OSError:
             pass
         try:
             self._proc.wait(timeout=8)
@@ -458,6 +458,6 @@ class VfkitSession(HostSession):
         for closeable in (self._srv, self._vfkit_log):
             try:
                 closeable.close()
-            except Exception:
+            except OSError:
                 pass
         shutil.rmtree(self._rundir, ignore_errors=True)
