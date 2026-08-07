@@ -110,6 +110,13 @@ s.python("rows = db.query(filter='active')")   # ok
 s.python("db.drop_all()")                       # PermissionError, host-side
 ```
 
+`allow` is **required** for every registered object, and fails closed
+like everything else here — registering one without an entry raises
+`PolicyError` at construction rather than quietly granting every public
+method. Use `allow={"db": set()}` to register an object with none.
+Underscore-prefixed names are never callable regardless of what the
+allowlist says.
+
 No pickle ever crosses the wire; cache values are opaque bytes to the
 host, and everything else rides a tagged json/bytes/file codec.
 

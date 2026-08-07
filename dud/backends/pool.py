@@ -57,6 +57,7 @@ import time
 from typing import Any
 
 from ..errors import DudError
+from .base import require_allowlist
 from .vfkit import VfkitSession
 
 # Everything the pool does on the failure side is recoverable, which is
@@ -137,6 +138,10 @@ class VmPool:
         ``resumed=True`` — its tree already IS that state, so the caller
         skips the push and just continues. Any other VM (or a fresh
         boot) comes back ``resumed=False``."""
+        # Before anything expensive: a bad allowlist must not cost a VM.
+        # _make_room() below can reclaim somebody else's session to fit a
+        # boot that is about to raise in the constructor anyway.
+        require_allowlist(kwargs.get("host_objects"), kwargs.get("allow"))
         key = _fingerprint(kwargs, self.session_cls)
         binding = {k: kwargs.get(k) for k in _BINDING_KEYS}
         while True:
@@ -422,6 +427,11 @@ class VmPool:
     # ---- internals ----------------------------------------------------
 
     def _rebind(self, session: VfkitSession, binding: dict[str, Any]) -> None:
+        # Checked again at the assignment point, not just in acquire:
+        # these fields bypass the constructor entirely, and a security
+        # default that holds on a fresh boot but lapses on a pool hit is
+        # the worst possible shape for one.
+        require_allowlist(binding["host_objects"], binding["allow"])
         session.cache = binding["cache"] if binding["cache"] is not None else {}
         session.host_objects = binding["host_objects"] or {}
         session.allow = binding["allow"] or {}
