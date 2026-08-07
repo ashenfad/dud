@@ -139,7 +139,7 @@ class Supervisor:
             theirs.close()
             self._template = (proc, ours)
             self._template_ready = False
-        except Exception:
+        except Exception:  # noqa: BLE001 — no template just means the spawn path
             self._template = None
 
     def _drop_template(self) -> None:

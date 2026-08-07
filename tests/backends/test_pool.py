@@ -244,6 +244,36 @@ def test_prewarm_boots_and_parks(monkeypatch):
     assert a.requests == []  # prewarmed VMs are pristine, no reset needed
 
 
+def test_prewarm_swallows_an_unbootable_environment(monkeypatch):
+    """No kernel / no KVM / no vfkit: prewarming is an optimization, so
+    the deficit simply goes unfilled."""
+    from dud.errors import IsolationUnavailable
+
+    class NoKvm(FakeVM):
+        def __init__(self, **kw):
+            raise IsolationUnavailable("/dev/kvm is not accessible")
+
+    p = _no_auto(_pool(monkeypatch, session_cls=NoKvm))
+    p.prewarm(1, background=False, image="x")  # returns quietly
+    assert p._idle.get(_key(image="x"), []) == []
+
+
+def test_prewarm_surfaces_a_boot_bug_instead_of_going_cold(monkeypatch):
+    """A bad kwarg is a caller error, not a hostile environment. Letting
+    it out beats a pool that stays silently cold forever — which is what
+    a blind `except Exception` here used to buy."""
+    import pytest
+
+    class BadKwarg(FakeVM):
+        def __init__(self, **kw):
+            raise TypeError("unexpected keyword argument 'medum'")
+
+    p = _no_auto(_pool(monkeypatch, session_cls=BadKwarg))
+    with pytest.raises(TypeError):
+        p.prewarm(1, background=False, image="x")
+    assert p._filling == set()  # the fill claim is released either way
+
+
 def test_prewarm_refills_after_drain(monkeypatch):
     p = _no_auto(_pool(monkeypatch))
     p.prewarm(1, background=False, image="x")

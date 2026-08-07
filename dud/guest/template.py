@@ -49,20 +49,23 @@ def _warm() -> None:
     optimization, never a correctness dependency."""
     import importlib.metadata as md
 
+    # Blind by intent throughout: dist metadata in a flattened image is
+    # third-party data of unknown quality, and every failure here costs
+    # at most one un-warmed package (see the docstring).
     names: set[str] = set()
     try:
         names.update(md.packages_distributions().keys())
-    except Exception:
+    except Exception:  # noqa: BLE001 — warmth only, never fatal
         pass
     try:
         for dist in md.distributions():
             try:
                 top = dist.read_text("top_level.txt")
-            except Exception:
+            except Exception:  # noqa: BLE001 — warmth only, never fatal
                 top = None
             if top:
                 names.update(line.strip() for line in top.splitlines())
-    except Exception:
+    except Exception:  # noqa: BLE001 — warmth only, never fatal
         pass
     for name in sorted(names):
         if not name or name.startswith("_") or name == "dud":

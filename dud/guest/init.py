@@ -83,7 +83,7 @@ def _log(msg: str) -> None:
     try:
         sys.stderr.write(f"[dud-init] {msg}\n")
         sys.stderr.flush()
-    except Exception:
+    except (OSError, ValueError):
         pass
 
 

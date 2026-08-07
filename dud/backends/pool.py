@@ -55,6 +55,7 @@ import threading
 import time
 from typing import Any
 
+from ..errors import DudError
 from .vfkit import VfkitSession
 
 # Host-side binding kwargs: per-session state rebound on reuse, never
@@ -171,7 +172,7 @@ class VmPool:
                     session.thaw()
                 else:
                     session.ping()
-            except Exception:
+            except Exception:  # noqa: BLE001 — any failure means "not usable"
                 self._teardown(session)
                 continue  # dead while parked: boot fresh next loop
             self._maybe_refill(key)  # top the level back up in background
@@ -292,17 +293,23 @@ class VmPool:
                             return  # the cap outranks the warm target
                 try:
                     session = self.session_cls(**boot_kwargs)
-                except Exception:
-                    return  # best-effort: no kernel / no KVM -> no prewarm
+                except (DudError, OSError):
+                    # The environment can't prewarm (no kernel, no KVM,
+                    # no vfkit): expected, and prewarming is optional.
+                    # Deliberately NOT blind — a TypeError from bad
+                    # boot kwargs is a bug, and letting it out of this
+                    # daemon thread puts a traceback on stderr instead
+                    # of silently leaving the pool permanently cold.
+                    return
                 # Zero-RAM prewarm where the backend can: a frozen
                 # freshly-booted VM is warmth as a file.
                 try:
                     if hasattr(session, "freeze"):
                         session.freeze()
-                except Exception:
+                except Exception:  # noqa: BLE001 — unfreezable: discard it
                     try:
                         session.close()
-                    except Exception:
+                    except Exception:  # noqa: BLE001 — cleanup, already failing
                         pass
                     return
                 session._pool = self
@@ -329,7 +336,7 @@ class VmPool:
             self._bound.pop(id(session), None)
         try:
             session._ch.request("reset_guest", {"keep_tree": bool(state)})
-        except Exception:
+        except Exception:  # noqa: BLE001 — an unresettable guest is not reusable
             self._teardown(session)
             return
         # A successful reset means the guest is alive and synced: an
@@ -338,7 +345,7 @@ class VmPool:
         # contract — a failed promotion is a cold cache, not an error.
         try:
             session.promote_scratch()
-        except Exception:
+        except Exception:  # noqa: BLE001 — scratch is cache; a miss is not an error
             pass
         # Frozen posture: park as files, not as a process. The reset
         # already ran, so what freezes is a clean guest; thaw at the
@@ -346,7 +353,7 @@ class VmPool:
         if hasattr(session, "freeze"):
             try:
                 session.freeze()
-            except Exception:
+            except Exception:  # noqa: BLE001 — an unfreezable VM can't be parked
                 self._teardown(session)
                 return
         key = _fingerprint(session._pool_kwargs, self.session_cls)
@@ -395,7 +402,7 @@ class VmPool:
         session._closed = False
         try:
             session.close()
-        except Exception:
+        except Exception:  # noqa: BLE001 — disposal must not leak a VM
             pass
 
     def _expire_locked(self) -> list[VfkitSession]:

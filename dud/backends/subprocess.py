@@ -69,7 +69,7 @@ class Session(HostSession):
         self._closed = True
         try:
             self._ch.request("shutdown")
-        except Exception:
+        except Exception:  # noqa: BLE001 — a guest mid-death answers anything
             pass
         self._ch.close()
         try:
