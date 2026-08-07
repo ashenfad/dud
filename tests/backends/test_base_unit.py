@@ -73,6 +73,14 @@ class _Obj:
     def drop_all(self):
         return "dropped"
 
+    @classmethod
+    def from_url(cls, url):
+        return cls()
+
+    @staticmethod
+    def ping():
+        return "pong"
+
     def _secret(self):
         return "s"
 
@@ -84,7 +92,18 @@ class _Obj:
 
 
 def test_public_methods_collects_public_callables():
-    assert public_methods(_Obj()) == frozenset({"query", "drop_all"})
+    assert public_methods(_Obj()) == frozenset(
+        {"query", "drop_all", "from_url", "ping"}
+    )
+
+
+def test_public_methods_includes_class_and_static_methods():
+    """Static lookup hands back the descriptor, and a bare `classmethod`
+    object is not itself callable — testing it directly would silently
+    drop an ordinary public method from a whole-object grant."""
+    granted = public_methods(_Obj())
+    assert "from_url" in granted   # classmethod
+    assert "ping" in granted       # staticmethod
 
 
 def test_public_methods_reads_statically():
@@ -122,6 +141,13 @@ def test_non_iterable_allow_is_rejected():
 def test_non_string_members_are_rejected():
     with pytest.raises(PolicyError, match="non-string method names"):
         require_allowlist({"db": _Obj()}, {"db": {"query", 7}})
+
+
+def test_unorderable_bad_members_still_raise_policy_error():
+    """{7, None} has no ordering, so sorting the values themselves
+    would raise TypeError and escape the PolicyError contract."""
+    with pytest.raises(PolicyError, match="non-string method names"):
+        require_allowlist({"db": _Obj()}, {"db": {"query", 7, None}})
 
 
 def test_contains_object_no_longer_grants_everything():
