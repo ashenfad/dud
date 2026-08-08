@@ -73,8 +73,20 @@ def test_total_cap_bounds_the_entry_stream(session):
         caps={"total": 5_000, "entry": 1_000, "entries": 500},
     )
     assert r.ok, r.error
-    assert sum(len(p["text"]) for p in r.prints) <= 6_000
+    assert sum(len(p["text"]) for p in r.prints) <= 5_000  # a hard bound
     assert r.prints_dropped > 0
+
+
+def test_total_cap_bounds_a_single_oversized_entry(session):
+    """Checked against the remaining budget, not the running total —
+    otherwise the first entry sails past any total in full, and a guard
+    you can't lower to bound an untrusted exec isn't a guard."""
+    r = session.python("print('x' * 10000)", caps={"total": 500})
+    assert r.ok, r.error
+    assert len(r.prints[0]["text"]) == 500
+    assert r.prints[0]["truncated"]
+    # ...and the transcript is still governed only by its own cap
+    assert len(r.transcript) > 500
 
 
 def test_caps_can_still_be_tightened_per_exec(session):
