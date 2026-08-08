@@ -242,11 +242,17 @@ class PrintCapture:
         self._total = 0
 
     def _add(self, text: str, meta: dict, echo: bool = False) -> None:
-        if len(self.entries) >= self.max_entries or self._total >= self.total_cap:
+        # Against the REMAINING budget, not the running total: checking
+        # before the append lets each entry overshoot by its own length,
+        # so a single oversized print would sail past any total. The
+        # guard has to bound one exec to be worth lowering.
+        remaining = self.total_cap - self._total
+        if len(self.entries) >= self.max_entries or remaining <= 0:
             self.dropped += 1
             return
-        truncated = len(text) > self.entry_cap
-        text = text[: self.entry_cap]
+        limit = min(self.entry_cap, remaining)
+        truncated = len(text) > limit
+        text = text[:limit]
         entry = {"text": text, "truncated": truncated, **meta}
         if echo:
             entry["echo"] = True
