@@ -40,6 +40,10 @@ jobs:
       run: |
         pytest tests/ -v
 
+    # The whole tree, not just dud/. Linting only the package let six
+    # findings accumulate in tests/ unnoticed — invisible precisely
+    # because CI never looked. The rule set is pinned in pyproject, so
+    # this stays stable across ruff releases.
     - name: Run linter
       run: |
-        ruff check dud/
+        ruff check .

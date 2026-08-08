@@ -516,7 +516,7 @@ def test_max_total_never_reclaims_mid_request(monkeypatch):
     p = _no_auto(_pool(monkeypatch, max_total=1))
     a = p.acquire(image="x")
     a._in_flight = 1  # mid-request: untouchable
-    b = p.acquire(image="y")  # over-boots rather than blocking
+    p.acquire(image="y")  # over-boots rather than blocking
     assert a.torn_down is False
     assert FakeVM.booted == 2
 

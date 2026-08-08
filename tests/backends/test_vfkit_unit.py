@@ -223,7 +223,6 @@ def test_sweep_freezing_dead_owner_kills_orphaned_vmm(tmp_path, monkeypatch):
     """The one hole process-linkage can't cover: a host that died
     between Pause and the VMM kill leaves a paused VMM that can NEVER
     see EOF. The sweep must finish the job."""
-    import os
     import signal as sigmod
 
     killed = []
