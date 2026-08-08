@@ -259,3 +259,33 @@ def test_render_budget_applies_to_the_echo(session):
     assert r.ok, r.error
     echo = [p for p in r.prints if p.get("echo")][0]
     assert echo["elided"] is True
+
+
+def test_workspace_module_cannot_break_rendering(session):
+    """The renderer resolves from the IMAGE. cwd is the workspace and
+    `python -m` puts cwd on sys.path, so a stray reprobate.py beside the
+    agent's own code used to shadow the real package — and a shadow
+    without `render` raised AttributeError out of print(), failing an
+    exec whose only crime was printing."""
+    session.shell("echo 'x = 1' > reprobate.py")
+    try:
+        r = session.python("print('hello')", render_budget=60)
+        assert r.ok, r.error
+        assert r.transcript == "hello\n"
+    finally:
+        session.shell("rm -f reprobate.py")
+
+
+def test_render_budget_holds_across_many_arguments(session):
+    """A per-argument floor multiplies by the argument count: this used
+    to run ~5x past the caller's number and then meet the entry guard as
+    a mid-token cut, which is what rendering exists to avoid."""
+    if session.ping()["renderer"] != "reprobate":
+        import pytest
+
+        pytest.skip("image has no reprobate")
+    r = session.python("print(*range(100))", render_budget=60)
+    assert r.ok, r.error
+    text = r.prints[0]["text"]
+    assert len(text) < 60 * 2  # bounded by the budget, not by arg count
+    assert "more" in text  # the remainder is counted, not silently cut
