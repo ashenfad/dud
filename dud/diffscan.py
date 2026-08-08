@@ -9,6 +9,12 @@ shape from its upperdir (see :mod:`dud.guest.staging`).
 Copies are cheap at agent-workspace scale (MBs). Symlinks are not
 followed and not preserved (v0); empty directories do not round-trip
 through diffs (files imply their parents).
+
+Permission bits *do* survive: ``make_tar`` records them and
+:class:`~dud.results.Diff` carries them out. Both producers share this
+tar, so that holds on every rung without either of them knowing about
+it — which is why modes cost nothing here while symlinks would cost a
+change in each.
 """
 
 from __future__ import annotations

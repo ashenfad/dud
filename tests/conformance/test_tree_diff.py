@@ -147,3 +147,65 @@ def test_fs_readonly_exec_blocks_writes(session, tmp_path):
     r2 = session.python("open('after.txt', 'w').write('fine')")
     assert r2.ok
     assert session.diff().writes.get("after.txt") == b"fine"
+
+
+# ---- permission bits ---------------------------------------------------
+
+
+def test_executable_bit_survives_the_diff(session):
+    """The round trip used to be quietly destructive: an agent runs
+    chmod +x, the checkpoint stores bytes, and next session the script
+    isn't executable. The mode crossed the wire the whole time — the
+    host decode just dropped it."""
+    session.shell("printf '#!/bin/sh\\necho hi\\n' > run.sh && chmod +x run.sh")
+    d = session.diff()
+    assert "run.sh" in d.writes
+    assert d.modes["run.sh"] == 0o755
+    assert d.mode("run.sh") == 0o755
+
+
+def test_ordinary_files_carry_no_mode(session):
+    """Only departures from the plain-file default are recorded, so the
+    map stays empty in the common case and a consumer that ignores it
+    behaves exactly as it did before."""
+    session.shell("echo plain > notes.txt")
+    d = session.diff()
+    assert "notes.txt" in d.writes
+    assert "notes.txt" not in d.modes
+    assert d.mode("notes.txt") == 0o644
+
+
+def test_setuid_is_not_carried_across_the_boundary(session):
+    """Permission bits only. A diff is not a place to smuggle setuid
+    into whatever restores it."""
+    session.shell("echo x > sneaky && chmod 4755 sneaky")
+    d = session.diff()
+    assert d.modes["sneaky"] == 0o755  # the setuid bit is gone
+    assert d.modes["sneaky"] & 0o7000 == 0
+
+
+def test_diff_keeps_the_raw_archive(session):
+    """Lossless escape hatch: symlinks and xattrs aren't in this shape
+    yet, and a consumer needing one shouldn't wait for a new field."""
+    import io
+    import tarfile
+
+    session.shell("echo hi > a.txt && chmod +x a.txt")
+    d = session.diff()
+    assert d.tar
+    with tarfile.open(fileobj=io.BytesIO(d.tar), mode="r:*") as tf:
+        member = tf.getmember("a.txt")
+    assert member.mode & 0o777 == 0o755
+
+
+def test_mode_round_trips_back_into_a_session(session, tmp_path):
+    """End to end: what comes out of a diff can be put back and still
+    run. This is the property the checkpoint boundary needs."""
+    session.shell("printf '#!/bin/sh\\necho ran\\n' > tool.sh && chmod +x tool.sh")
+    d = session.diff()
+
+    # Push the archive straight back, the way a provider that kept it
+    # would — the same bytes, so nothing had a chance to be lost.
+    session.push_tree(d.tar)
+    r = session.shell("./tool.sh")
+    assert "ran" in r.transcript, r.transcript

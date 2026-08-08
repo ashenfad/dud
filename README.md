@@ -65,9 +65,18 @@ rows                             # last expression echoes, REPL-style
     print(r.outputs)             # harvested top-level bindings (codec values)
 
     d = s.diff()                 # Diff(writes={'data/in.csv': b'a,b\n1,2\n'},
-    #                            #      deletes=[])  — paths relative to the root
+    #                            #      deletes=[], modes={})  — paths relative
+    #                            #      to the root
     # hand d to your versioned store; dud doesn't care what it is
 ```
+
+`modes` carries permission bits for the paths that have a non-default
+one — `chmod +x` has to survive a checkpoint, or the script an agent
+made executable isn't executable next session. Only departures from
+`0o644` appear, so it's empty in the common case; `d.mode(path)` reads
+it with the default filled in. `d.tar` keeps the guest's raw archive
+for anything this shape doesn't carry yet (symlinks and empty
+directories don't round-trip today).
 
 ### Where the files live
 

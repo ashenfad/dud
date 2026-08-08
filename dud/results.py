@@ -49,11 +49,35 @@ class Diff:
     ``writes`` maps relative path -> content bytes; ``deletes`` lists
     relative paths removed. This is the producer-agnostic wire shape:
     scan-diff (rung 1) and overlayfs harvest (rungs 2-3) both emit it.
+
+    ``modes`` carries the POSIX permission bits for entries in
+    ``writes``, and exists because losing them makes the round trip
+    quietly destructive: an agent runs ``chmod +x deploy.sh``, the
+    checkpoint stores bytes, and next session the script isn't
+    executable. Only paths whose mode differs from the plain-file
+    default appear, so the common case stays empty and a consumer that
+    ignores it behaves exactly as before.
+
+    ``tar`` is the raw archive the guest produced — the same bytes
+    ``writes`` was decoded from. Kept because it is lossless by
+    construction: symlinks, hardlinks and xattrs aren't in this shape
+    yet, and a consumer that needs one shouldn't have to wait for the
+    dataclass to grow a field. Decoding it is the consumer's business.
     """
 
     writes: dict[str, bytes] = field(default_factory=dict)
     deletes: list[str] = field(default_factory=list)
+    modes: dict[str, int] = field(default_factory=dict)
+    tar: bytes = b""
 
     @property
     def empty(self) -> bool:
         return not self.writes and not self.deletes
+
+    def mode(self, path: str, default: int = 0o644) -> int:
+        """Permission bits for ``path``, or the plain-file default.
+
+        Saves every consumer the same ``modes.get(p, 0o644)``, and keeps
+        the default in one place if it ever needs to change.
+        """
+        return self.modes.get(path, default)
