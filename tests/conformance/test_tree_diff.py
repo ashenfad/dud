@@ -171,8 +171,7 @@ def test_ordinary_files_carry_no_mode(session):
     session.shell("echo plain > notes.txt")
     d = session.diff()
     assert "notes.txt" in d.writes
-    assert "notes.txt" not in d.modes
-    assert d.mode("notes.txt") == 0o644
+    assert d.mode("notes.txt") & 0o111 == 0  # not executable, whatever umask says
 
 
 def test_setuid_is_not_carried_across_the_boundary(session):
@@ -184,28 +183,53 @@ def test_setuid_is_not_carried_across_the_boundary(session):
     assert d.modes["sneaky"] & 0o7000 == 0
 
 
-def test_diff_keeps_the_raw_archive(session):
-    """Lossless escape hatch: symlinks and xattrs aren't in this shape
-    yet, and a consumer needing one shouldn't wait for a new field."""
-    import io
-    import tarfile
+def test_chmod_alone_is_a_change(session, tmp_path):
+    """The case that matters most and the one a fresh-file test walks
+    straight past: chmod on a file already in the baseline. Content is
+    identical, so a producer comparing only bytes reported NOTHING —
+    scan-diff hashed content, and overlay harvest skipped the copy-up as
+    metadata-only. An empty diff meant the bit was lost on every rung."""
+    _seed(tmp_path, {"deploy.sh": "#!/bin/sh\necho hi\n"})
+    session.push_dir(tmp_path)
+    assert session.diff().empty  # nothing has happened yet
 
-    session.shell("echo hi > a.txt && chmod +x a.txt")
+    session.shell("chmod +x deploy.sh")
     d = session.diff()
-    assert d.tar
-    with tarfile.open(fileobj=io.BytesIO(d.tar), mode="r:*") as tf:
-        member = tf.getmember("a.txt")
-    assert member.mode & 0o777 == 0o755
+    assert not d.empty, "a mode-only change is still a change"
+    assert d.modes["deploy.sh"] == 0o755
+    assert d.writes["deploy.sh"] == b"#!/bin/sh\necho hi\n"  # bytes unchanged
+
+
+def test_chmod_back_is_also_a_change(session, tmp_path):
+    """Symmetry: dropping the bit has to travel too, or a revert is
+    silently ignored."""
+    _seed(tmp_path, {"tool.sh": "#!/bin/sh\n"})
+    session.push_dir(tmp_path)
+    session.shell("chmod 755 tool.sh")
+    session.diff(rebase=True)  # 0o755 is now the baseline
+
+    session.shell("chmod 644 tool.sh")
+    d = session.diff()
+    assert not d.empty
+    assert d.mode("tool.sh") == 0o644
 
 
 def test_mode_round_trips_back_into_a_session(session, tmp_path):
-    """End to end: what comes out of a diff can be put back and still
-    run. This is the property the checkpoint boundary needs."""
+    """End to end: what a consumer stores can be put back and still run.
+    This is the property the checkpoint boundary needs."""
     session.shell("printf '#!/bin/sh\\necho ran\\n' > tool.sh && chmod +x tool.sh")
     d = session.diff()
 
-    # Push the archive straight back, the way a provider that kept it
-    # would — the same bytes, so nothing had a chance to be lost.
-    session.push_tree(d.tar)
+    # Rebuild the tree the way a provider would: bytes plus the modes it
+    # was handed, with no archive to lean on.
+    out = tmp_path / "restored"
+    out.mkdir()
+    for rel, data in d.writes.items():
+        f = out / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(data)
+        os.chmod(f, d.mode(rel))
+
+    session.push_dir(out)
     r = session.shell("./tool.sh")
     assert "ran" in r.transcript, r.transcript

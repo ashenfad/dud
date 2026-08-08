@@ -394,24 +394,25 @@ class HostSession:
         body, bins = self._request("pull_diff", {"rebase": rebase})
         writes: dict[str, bytes] = {}
         modes: dict[str, int] = {}
-        tar = bins[0] if bins else b""
-        if tar:
-            with tarfile.open(fileobj=io.BytesIO(tar), mode="r:*") as tf:
+        if bins and bins[0]:
+            with tarfile.open(fileobj=io.BytesIO(bins[0]), mode="r:*") as tf:
                 for member in tf.getmembers():
                     if member.isfile():
                         f = tf.extractfile(member)
                         if f is not None:
                             path = _safe_diff_path(member.name)
                             writes[path] = f.read()
-                            # Permission bits only: type and the setuid
-                            # family are not this shape's business, and
-                            # a diff is not a place to smuggle setuid
-                            # across a trust boundary.
+                            # Permission bits only. The guest runs as
+                            # root, so a setuid bit here is agent-chosen
+                            # and would cross into whatever restores the
+                            # diff — masking is the boundary doing its
+                            # job, and is why the raw archive is not
+                            # exposed anywhere it could be re-extracted.
                             perms = member.mode & 0o777
                             if perms != _DEFAULT_FILE_MODE:
                                 modes[path] = perms
         deletes = [_safe_diff_path(d) for d in body.get("deletes", [])]
-        return Diff(writes=writes, deletes=deletes, modes=modes, tar=tar)
+        return Diff(writes=writes, deletes=deletes, modes=modes)
 
     def reset(self) -> None:
         self._request("reset_stage")

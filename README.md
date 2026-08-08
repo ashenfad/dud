@@ -74,9 +74,10 @@ rows                             # last expression echoes, REPL-style
 one — `chmod +x` has to survive a checkpoint, or the script an agent
 made executable isn't executable next session. Only departures from
 `0o644` appear, so it's empty in the common case; `d.mode(path)` reads
-it with the default filled in. `d.tar` keeps the guest's raw archive
-for anything this shape doesn't carry yet (symlinks and empty
-directories don't round-trip today).
+it with the default filled in. A mode change on its own counts as a
+change, so `chmod +x` on an otherwise untouched file still shows up.
+
+Symlinks and empty directories do not round-trip today.
 
 ### Where the files live
 

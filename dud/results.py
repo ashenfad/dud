@@ -58,17 +58,17 @@ class Diff:
     default appear, so the common case stays empty and a consumer that
     ignores it behaves exactly as before.
 
-    ``tar`` is the raw archive the guest produced — the same bytes
-    ``writes`` was decoded from. Kept because it is lossless by
-    construction: symlinks, hardlinks and xattrs aren't in this shape
-    yet, and a consumer that needs one shouldn't have to wait for the
-    dataclass to grow a field. Decoding it is the consumer's business.
+    Symlinks and empty directories still do not round-trip; both
+    producers drop them before anything reaches this shape. There is
+    deliberately no raw-archive escape hatch for them: the archive is
+    built from the same regular-file list, so it could not carry them
+    either — and exposing it would hand a consumer guest-controlled
+    setuid bits that ``modes`` masks off here.
     """
 
     writes: dict[str, bytes] = field(default_factory=dict)
     deletes: list[str] = field(default_factory=list)
     modes: dict[str, int] = field(default_factory=dict)
-    tar: bytes = b""
 
     @property
     def empty(self) -> bool:
