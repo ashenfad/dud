@@ -44,9 +44,14 @@ _IGNORE_DIRS = {"__pycache__"}
 _IGNORE_SUFFIXES = (".pyc", ".pyo")
 
 
-def index_tree(root: Path) -> dict[str, str]:
-    """relpath -> sha256 for every regular file under root."""
-    out: dict[str, str] = {}
+def index_tree(root: Path) -> dict[str, tuple[str, int]]:
+    """relpath -> (sha256, permission bits) for every regular file.
+
+    The mode is part of the identity, not decoration: ``chmod +x`` on an
+    otherwise untouched file changes nothing about its content, and an
+    index that only hashed bytes reported that as no change at all.
+    """
+    out: dict[str, tuple[str, int]] = {}
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
         for name in filenames:
@@ -55,14 +60,16 @@ def index_tree(root: Path) -> dict[str, str]:
             p = Path(dirpath) / name
             if p.is_symlink() or not p.is_file():
                 continue
-            out[str(p.relative_to(root))] = _hash_file(p)
+            out[str(p.relative_to(root))] = (
+                _hash_file(p), p.stat().st_mode & 0o777
+            )
     return out
 
 
 def scan_diff(work: Path, baseline: Path) -> tuple[list[str], list[str]]:
-    """(writes, deletes) of work relative to baseline, by content."""
+    """(writes, deletes) of work relative to baseline, by content+mode."""
     wi, bi = index_tree(work), index_tree(baseline)
-    writes = sorted(p for p, h in wi.items() if bi.get(p) != h)
+    writes = sorted(p for p, ident in wi.items() if bi.get(p) != ident)
     deletes = sorted(p for p in bi if p not in wi)
     return writes, deletes
 

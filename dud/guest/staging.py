@@ -129,6 +129,17 @@ def _same_content(a: Path, b: Path) -> bool:
         return False
 
 
+def _same_mode(a: Path, b: Path) -> bool:
+    """Permission bits match. Paired with :func:`_same_content` to decide
+    whether a copy-up carried any change at all — ``chmod +x`` copies a
+    file up with identical bytes, and treating that as unchanged loses
+    the one thing that did change."""
+    try:
+        return (a.stat().st_mode & 0o777) == (b.stat().st_mode & 0o777)
+    except OSError:
+        return False
+
+
 def harvest(
     upper: Path,
     snap: Path,
@@ -140,8 +151,11 @@ def harvest(
     Parity rules (must match what scan-diff would report):
       - deletions expand to per-file entries (a whiteout or opaque
         marker over a directory becomes one delete per lower file);
-      - a copied-up file whose content equals the snapshot's is NOT a
-        write (overlay copies up on metadata-only touches);
+      - a copied-up file whose content AND permission bits equal the
+        snapshot's is NOT a write (overlay copies up on metadata-only
+        touches). Mode has to be part of that test, not just content:
+        ``chmod +x`` copies a file up with identical bytes, and calling
+        that unchanged drops the only thing that changed;
       - ignore rules (__pycache__, *.pyc/pyo) apply to both sides;
       - symlinks and empty dirs don't round-trip (diffscan v0 parity) —
         but an upper symlink SHADOWING lower content still deletes it
@@ -193,8 +207,8 @@ def harvest(
     deletes: set[str] = set()
     for rel, p in sorted(upper_files.items()):
         lower = snap / rel
-        if _same_content(p, lower):
-            continue  # metadata-only copy-up: merged content unchanged
+        if _same_content(p, lower) and _same_mode(p, lower):
+            continue  # copy-up that carried nothing: same bytes, same mode
         writes.append(rel)
         if lower.is_dir():
             # dir -> file transition: the whiteout was consumed by the
