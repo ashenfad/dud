@@ -34,6 +34,11 @@ from ..values import decode_map, decode_value, encode_value
 # outside its allowlist is exactly what an embedder wants to see.
 _log = logging.getLogger(__name__)
 
+# What an ordinary file gets when nothing says otherwise. Diff.modes
+# records only departures from it, so the map stays empty for the
+# overwhelmingly common case and consumers that ignore it are unchanged.
+_DEFAULT_FILE_MODE = 0o644
+
 
 def public_methods(obj: Any) -> frozenset[str]:
     """Every public callable on ``obj``, as a concrete set.
@@ -388,15 +393,25 @@ class HostSession:
     def diff(self, rebase: bool = False) -> Diff:
         body, bins = self._request("pull_diff", {"rebase": rebase})
         writes: dict[str, bytes] = {}
-        if bins and bins[0]:
-            with tarfile.open(fileobj=io.BytesIO(bins[0]), mode="r:*") as tf:
+        modes: dict[str, int] = {}
+        tar = bins[0] if bins else b""
+        if tar:
+            with tarfile.open(fileobj=io.BytesIO(tar), mode="r:*") as tf:
                 for member in tf.getmembers():
                     if member.isfile():
                         f = tf.extractfile(member)
                         if f is not None:
-                            writes[_safe_diff_path(member.name)] = f.read()
+                            path = _safe_diff_path(member.name)
+                            writes[path] = f.read()
+                            # Permission bits only: type and the setuid
+                            # family are not this shape's business, and
+                            # a diff is not a place to smuggle setuid
+                            # across a trust boundary.
+                            perms = member.mode & 0o777
+                            if perms != _DEFAULT_FILE_MODE:
+                                modes[path] = perms
         deletes = [_safe_diff_path(d) for d in body.get("deletes", [])]
-        return Diff(writes=writes, deletes=deletes)
+        return Diff(writes=writes, deletes=deletes, modes=modes, tar=tar)
 
     def reset(self) -> None:
         self._request("reset_stage")
