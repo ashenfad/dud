@@ -49,6 +49,11 @@ _CAP_ENTRY = 1 << 14    # 16 KiB per print
 _CAP_ENTRIES = 2_000    # entries in the structured stream
 _CAP_TOTAL = 1 << 21    # 2 MiB across entries — bounds entry * count
 
+# Smallest render budget worth giving one print argument; below this a
+# value renders to punctuation. Always clamped to the budget that is
+# actually left, so it bounds legibility rather than the total.
+_MIN_ARG_BUDGET = 16
+
 
 class _TeeBuffer(io.StringIO):
     """The transcript buffer, mirrored out of the process as it fills.
@@ -219,12 +224,30 @@ def _renderer():
     """
     global _RENDERER
     if _RENDERER is None:
+        _RENDERER = False
+        saved = list(sys.path)
         try:
+            # Resolve from the IMAGE, never from workspace files. cwd is
+            # the workspace and `python -m` puts cwd on sys.path, so a
+            # stray `reprobate.py` beside the agent's code would shadow
+            # the real package — and dud would be importing agent-authored
+            # code into its own print path.
+            here = os.getcwd()
+            ws = os.environ.get("DUD_WORKSPACE")
+            sys.path = [p for p in saved
+                        if p not in ("", ".", here) and (not ws or p != ws)]
             import reprobate
 
-            _RENDERER = reprobate.render
-        except ImportError:
+            # getattr, not attribute access: if a shadow resolves anyway
+            # (user code already imported one, so it is in sys.modules),
+            # a missing `render` must degrade to plain text. It used to
+            # raise AttributeError out of print() and fail an exec whose
+            # only crime was printing.
+            _RENDERER = getattr(reprobate, "render", False)
+        except Exception:  # noqa: BLE001 — no renderer is never fatal
             _RENDERER = False
+        finally:
+            sys.path = saved
     return _RENDERER or None
 
 
@@ -304,14 +327,33 @@ class PrintCapture:
         must produce what a real machine produces, and the structured
         stream is where a summary belongs (the Jupyter split).
         """
-        render = _renderer() if self.render_budget else None
-        if render is None or not objs:
-            return plain, False
-        # Split the budget across args the way the host would across
-        # entries; a floor keeps each one legible when there are many.
-        per_arg = max(40, self.render_budget // len(objs))
         try:
-            return sep.join(render(o, budget=per_arg) for o in objs), True
+            render = _renderer() if self.render_budget else None
+            if render is None or not objs:
+                return plain, False
+            budget, parts, used = self.render_budget, [], 0
+            for i, obj in enumerate(objs):
+                remaining = budget - used
+                if remaining <= 0:
+                    parts.append(f"...{len(objs) - i} more")
+                    break
+                # A share of what is LEFT, not a fixed floor per
+                # argument: a floor multiplies by the argument count, so
+                # print(*range(100)) ran ~5x past the caller's number and
+                # then met the entry guard as a mid-token cut — the exact
+                # thing rendering exists to avoid.
+                # Floored so each piece stays legible (a fair share of a
+                # small budget across many args renders every int as
+                # "."), then clamped to what's left so the floor can
+                # never be what multiplies. Args past the budget are
+                # counted, not rendered.
+                share = min(remaining,
+                            max(_MIN_ARG_BUDGET,
+                                remaining // (len(objs) - i)))
+                piece = render(obj, budget=share)
+                parts.append(piece)
+                used += len(piece) + len(sep)
+            return sep.join(parts), True
         except Exception:  # noqa: BLE001 — a repr of agent data, never fatal
             return plain, False
 
