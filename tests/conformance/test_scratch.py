@@ -59,7 +59,7 @@ def test_scratch_mounts_persists_and_discards_on_crash(blank, tmp_path):
     os.kill(s2._proc.pid, signal.SIGKILL)
     try:
         s2.close()
-    except Exception:
+    except Exception:  # noqa: BLE001 — closing over a VMM we just SIGKILLed
         pass
 
     # Boot 3: clean-park survivors only — the crashed VM's write was

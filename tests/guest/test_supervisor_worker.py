@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import socket
 import threading
-from pathlib import Path
 
 import pytest
 
