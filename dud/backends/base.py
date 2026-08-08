@@ -322,6 +322,7 @@ class HostSession:
         caps: dict[str, int] | None = None,
         cache_readonly: bool = False,
         fs_readonly: bool = False,
+        render_budget: int | None = None,
     ) -> PythonResult:
         """Execute code in a fresh guest runner.
 
@@ -340,6 +341,22 @@ class HostSession:
         The defaults sit far above any plausible observation, so raising
         them is rarely the answer; lowering them is a way to bound a
         specific untrusted exec.
+
+        ``render_budget`` asks the guest to render each print entry to
+        roughly that many characters using structural elision
+        (``[1, 2, 3, ...86 more]``) instead of a mid-token cut. It is
+        the one piece of observation shaping that *has* to happen
+        guest-side, because it needs the live object — a DataFrame's
+        head/tail cannot be reconstructed from a chopped string. The
+        number stays the caller's: dud never invents one, so leaving
+        this unset means plain ``str()``.
+
+        Requires ``reprobate`` in the image (``packages=["reprobate"]``);
+        without it entries fall back to plain text, and ``ping()``
+        reports which renderer is live so the difference is visible
+        rather than silent. Rendered entries are marked ``elided``.
+        The transcript is never rendered — it keeps exactly what real
+        Python printed.
         """
         enc_inputs = {}
         if inputs:
@@ -348,7 +365,8 @@ class HostSession:
         body, _ = self._request(
             "exec_python",
             {"code": code, "inputs": enc_inputs, "timeout": timeout,
-             "caps": caps or {}, "host_objects": sorted(self.host_objects),
+             "caps": caps or {}, "render_budget": render_budget,
+             "host_objects": sorted(self.host_objects),
              "cache_readonly": cache_readonly, "fs_readonly": fs_readonly},
         )
         if body.get("ok"):

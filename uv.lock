@@ -19,12 +19,14 @@ source = { editable = "." }
 [package.optional-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "reprobate" },
     { name = "ruff" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
+    { name = "reprobate", marker = "extra == 'dev'", specifier = ">=0.1.3" },
     { name = "ruff", marker = "extra == 'dev'" },
 ]
 provides-extras = ["dev"]
@@ -79,6 +81,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/e4/47/b9efed96c114afcfa3c9d3fe98a76a1d14c74a9e266d397cf6eb64be5e01/pytest-9.1.1.tar.gz", hash = "sha256:1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313", size = 1636369, upload-time = "2026-06-19T10:58:32.857Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl", hash = "sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c", size = 386536, upload-time = "2026-06-19T10:58:31.347Z" },
+]
+
+[[package]]
+name = "reprobate"
+version = "0.1.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/a0/0c/f39f4fd6458b5cf17e358dd8f6fb38fa3690bd35804cc3b26d136fec15ac/reprobate-0.1.3.tar.gz", hash = "sha256:80a991b4545aed975768c54c436002732e980cfd33b6490760e8e5844b4b5e8b", size = 35537, upload-time = "2026-07-31T16:18:20.589Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f5/b0/3e1790d0bc6600cea9f202a1934e03dac0304959941fee2294a34acfee54/reprobate-0.1.3-py3-none-any.whl", hash = "sha256:8716ade3ae519480fb9f2e8bbf36577695425533a7c36e47d353d35b4c3a088a", size = 26861, upload-time = "2026-07-31T16:18:19.483Z" },
 ]
 
 [[package]]

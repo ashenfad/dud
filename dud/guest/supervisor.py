@@ -307,7 +307,26 @@ class Supervisor:
     def do_ping(self, body, bins):
         return {"pong": True, "workspace": str(self.work),
                 "staging": self.stage.kind,
+                "renderer": self._renderer_kind(),
                 "view_worker": self._worker_state()}, []
+
+    @staticmethod
+    def _renderer_kind() -> str:
+        """Which print renderer this image can offer.
+
+        Reported for the same reason ``staging`` is: rendering falls
+        back silently when reprobate isn't installed, and a fallback
+        nobody can see is one tests pass over. find_spec rather than an
+        import — answering a ping must not pay for a module the exec
+        may never ask for.
+        """
+        import importlib.util
+
+        try:
+            found = importlib.util.find_spec("reprobate") is not None
+        except (ImportError, ValueError):
+            found = False
+        return "reprobate" if found else "plain"
 
     def do_shutdown(self, body, bins):
         shutdown_served()

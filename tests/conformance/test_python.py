@@ -193,3 +193,69 @@ def test_root_imports_survive_cwd_changes(session):
     r = session.python("import rootmod\nfrom pkg import mod\nv = mod.Y")
     assert r.ok, r.error
     assert r.outputs["v"] == 42
+
+
+# ---- print rendering ---------------------------------------------------
+
+
+def test_ping_reports_the_live_renderer(session):
+    """Rendering falls back silently when the image has no reprobate, so
+    the fallback has to be observable — same reason ping reports which
+    staging strategy is live."""
+    assert session.ping()["renderer"] in ("reprobate", "plain")
+
+
+def test_no_render_budget_means_plain_text(session):
+    """dud never invents an observation size. Unasked, entries carry
+    exactly what print produced."""
+    r = session.python("print(list(range(100)))")
+    assert r.ok, r.error
+    assert r.prints[0]["text"] == str(list(range(100)))
+    assert not r.prints[0].get("elided")
+
+
+def test_render_budget_elides_structurally(session):
+    """The gap this closes: the host used to get a mid-token head-cut
+    where the in-process executor got structural elision. Rendering
+    needs the live object, so it can only happen here."""
+    if session.ping()["renderer"] != "reprobate":
+        import pytest
+
+        pytest.skip("image has no reprobate; see the fallback test")
+    r = session.python("print(list(range(100)))", render_budget=60)
+    assert r.ok, r.error
+    entry = r.prints[0]
+    assert entry["elided"] is True
+    assert "more" in entry["text"]  # "...86 more", not a severed token
+    assert len(entry["text"]) < 200
+
+
+def test_render_budget_falls_back_without_reprobate(session):
+    """Degrades to plain text rather than failing the exec — rendering
+    is an optimization on the observation, never a correctness input."""
+    if session.ping()["renderer"] != "plain":
+        import pytest
+
+        pytest.skip("image has reprobate; see the elision test")
+    r = session.python("print(list(range(100)))", render_budget=60)
+    assert r.ok, r.error
+    assert not r.prints[0].get("elided")
+
+
+def test_transcript_is_never_rendered(session):
+    """Fidelity outranks the observation: print(x) must produce what a
+    real machine produces. Only the structured entry is summarized."""
+    r = session.python("print(list(range(100)))", render_budget=60)
+    assert r.ok, r.error
+    assert r.transcript == str(list(range(100))) + "\n"
+
+
+def test_render_budget_applies_to_the_echo(session):
+    if session.ping()["renderer"] != "reprobate":
+        import pytest
+
+        pytest.skip("image has no reprobate")
+    r = session.python("list(range(100))", render_budget=60)
+    assert r.ok, r.error
+    echo = [p for p in r.prints if p.get("echo")][0]
+    assert echo["elided"] is True

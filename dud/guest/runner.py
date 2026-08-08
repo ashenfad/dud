@@ -202,6 +202,32 @@ class HostProxy:
         return f"<host object {self._name!r}>"
 
 
+_RENDERER: Any = None  # unresolved; False once known absent
+
+
+def _renderer():
+    """reprobate's budget-controlled repr, if the image has it.
+
+    Resolved lazily so an exec that never asks for rendering pays
+    nothing, and cached because the runner is one process per exec (the
+    fork template warms it for view execs).
+
+    Optional by design: dud keeps no dependencies, and the image is the
+    config surface. Callers layer ``packages=["reprobate"]`` when they
+    want it; ``ping()`` reports which renderer is live, so the fallback
+    is observable rather than a silent difference in what an agent sees.
+    """
+    global _RENDERER
+    if _RENDERER is None:
+        try:
+            import reprobate
+
+            _RENDERER = reprobate.render
+        except ImportError:
+            _RENDERER = False
+    return _RENDERER or None
+
+
 def _meta_for(obj: Any) -> dict:
     meta: dict[str, Any] = {"type": type(obj).__name__}
     shape = getattr(obj, "shape", None)
@@ -230,10 +256,15 @@ class PrintCapture:
     """
 
     def __init__(self, stdout: io.StringIO, entry_cap: int,
-                 max_entries: int, total_cap: int):
+                 max_entries: int, total_cap: int,
+                 render_budget: int | None = None):
         self.stdout = stdout
         self.entry_cap = entry_cap
         self.max_entries = max_entries
+        # Per-entry render budget, supplied by the host. Absent means
+        # plain str(): dud does not invent an observation size, it only
+        # applies one — see `render_budget` on HostSession.python.
+        self.render_budget = render_budget
         # Without a total, the real ceiling is entry_cap * max_entries,
         # which multiplies into hundreds of MB at guard-sized values.
         self.total_cap = total_cap
@@ -241,7 +272,8 @@ class PrintCapture:
         self.dropped = 0
         self._total = 0
 
-    def _add(self, text: str, meta: dict, echo: bool = False) -> None:
+    def _add(self, text: str, meta: dict, echo: bool = False,
+             elided: bool = False) -> None:
         # Against the REMAINING budget, not the running total: checking
         # before the append lets each entry overshoot by its own length,
         # so a single oversized print would sail past any total. The
@@ -256,8 +288,32 @@ class PrintCapture:
         entry = {"text": text, "truncated": truncated, **meta}
         if echo:
             entry["echo"] = True
+        if elided:
+            # Structural elision, not a mid-token cut: the host can tell
+            # which kind of shortening it got, and re-trimming an elided
+            # render still beats chopping a raw str().
+            entry["elided"] = True
         self.entries.append(entry)
         self._total += len(text)
+
+    def _render(self, objs: tuple, sep: str, plain: str) -> tuple[str, bool]:
+        """Entry text for these objects: (text, was_elided).
+
+        Only the ENTRY is rendered. The transcript keeps what real
+        Python printed — fidelity is the whole thesis, so `print(df)`
+        must produce what a real machine produces, and the structured
+        stream is where a summary belongs (the Jupyter split).
+        """
+        render = _renderer() if self.render_budget else None
+        if render is None or not objs:
+            return plain, False
+        # Split the budget across args the way the host would across
+        # entries; a floor keeps each one legible when there are many.
+        per_arg = max(40, self.render_budget // len(objs))
+        try:
+            return sep.join(render(o, budget=per_arg) for o in objs), True
+        except Exception:  # noqa: BLE001 — a repr of agent data, never fatal
+            return plain, False
 
     def print_fn(self, *args, sep=" ", end="\n", file=None, flush=False):
         text = sep.join(str(a) for a in args)
@@ -268,14 +324,16 @@ class PrintCapture:
             pass
         if file is None or file is self.stdout:
             meta = _meta_for(args[0]) if len(args) == 1 else {"type": "tuple"}
-            self._add(text, meta)
+            entry_text, elided = self._render(args, sep, text)
+            self._add(entry_text, meta, elided=elided)
 
     def echo(self, value: Any) -> None:
         if value is None:
             return
         text = repr(value)
         self.stdout.write(text + "\n")
-        self._add(text, _meta_for(value), echo=True)
+        entry_text, elided = self._render((value,), " ", text)
+        self._add(entry_text, _meta_for(value), echo=True, elided=elided)
 
 
 def _split_echo(code: str) -> tuple[ast.Module, ast.Expression | None]:
@@ -327,6 +385,8 @@ def run(channel: Channel, req: dict) -> dict:
     entry_cap = int(caps.get("entry", _CAP_ENTRY))
     max_entries = int(caps.get("entries", _CAP_ENTRIES))
     total_cap = int(caps.get("total", _CAP_TOTAL))
+    render_budget = req.get("render_budget")
+    render_budget = int(render_budget) if render_budget else None
 
     # Workspace-root imports, cwd-independent: filesystem modules resolve
     # from the workspace root (`import app.api...` works after `cd app`),
@@ -339,7 +399,8 @@ def run(channel: Channel, req: dict) -> dict:
     # Captured before redirect_stdout swaps it out: this is the fd the
     # supervisor is reading, and the only way anything escapes a kill.
     stdout_buf = _TeeBuffer(sys.stdout)
-    prints = PrintCapture(stdout_buf, entry_cap, max_entries, total_cap)
+    prints = PrintCapture(stdout_buf, entry_cap, max_entries, total_cap,
+                          render_budget)
 
     g: dict[str, Any] = {"__name__": "__dud__", "__builtins__": __builtins__}
     injected = {"__name__", "__builtins__", "print", "cache", "emit"}
