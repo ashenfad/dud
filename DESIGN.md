@@ -313,14 +313,36 @@ boundary, so what dud ships instead is a structured stream:
   the observation budget, the model, and the turn. It receives every
   entry with its metadata and allocates across them.
 
-What is deliberately *not* here: per-type smart rendering (DataFrame
-head/tail, array shape+dtype). That would need the live object, so it
-could only ever live guest-side — and it is the one piece of this that
-genuinely cannot move up. It is unbuilt, and `str(obj)` truncated at
-the guard is what ships today. Recorded because the difference matters
-if it ever gets built: rendering must be guest-side, budgeting must not
-be. A previous version of this document described the budgeting half as
-though dud performed it, which it never has.
+Rendering is the exception, and the reason is physical rather than a
+preference: a DataFrame's head/tail cannot be reconstructed from a
+chopped string, so it has to happen where the object still exists. The
+runner shadows `print` in the exec globals, which puts it holding the
+live arguments — the one place in the system that does.
+
+So `render_budget` rides the exec request and the guest applies it via
+[reprobate](https://github.com/ashenfad/reprobate), turning
+`[0, 1, 2, ...]` into `[0, 1, 2, ...86 more]` rather than a severed
+token. The number stays the host's; dud never invents one, and unasked
+it ships plain `str()`. That keeps the split intact — **rendering
+guest-side because it must be, budgeting host-side because it should
+be** — and it closes a real gap: the in-process executor could
+re-render from snapshotted objects, so until this existed the VM path
+gave an agent strictly worse output than the emulation it replaces.
+
+Two deliberate limits. The **transcript is never rendered**: fidelity
+outranks the observation, and `print(df)` must produce what a real
+machine produces, so only the structured entry is summarized. And the
+renderer is **optional** — dud has no dependencies and the image is the
+config surface, so callers layer `packages=["reprobate"]` and `ping()`
+reports which renderer is live, on the same reasoning that makes it
+report which staging strategy is live: a silent fallback is one tests
+pass over.
+
+Coverage follows from the mechanism. Shadowing reaches the exec'd
+code's own globals, so an imported module's prints and direct
+`sys.stdout` writes reach the transcript but never become entries.
+That bounds what any renderer here can see — the agent's own top-level
+prints and the echo, which is where `print(df)` actually lives.
 
 Rejected: holding the interpreter alive for a `render_more(id, budget)`
 RPC. It makes VM lifetime a correctness concern again — trading the

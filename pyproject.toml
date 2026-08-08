@@ -29,7 +29,10 @@ dependencies = []
 "Source" = "https://github.com/ashenfad/dud"
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff"]
+# reprobate exercises the optional smart-render path; it is NOT a
+# runtime dependency (dud has none) — callers layer it into the
+# image with packages=["reprobate"] when they want it.
+dev = ["pytest>=8", "ruff", "reprobate>=0.1.3"]
 
 [build-system]
 requires = ["hatchling>=1.26"]  # license = "MIT" is PEP 639 string form
