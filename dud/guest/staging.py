@@ -445,7 +445,17 @@ def replay(
             if spath.is_dir():
                 _rmtree_or_unlink(spath)
             shutil.copy2(entry.path, spath)
-        # symlinks/others: not part of the contract (v0)
+        elif stat.S_ISLNK(st.st_mode):
+            # Fold the link into the snapshot rather than skipping it.
+            # Skipping did not merely leave it unreported: this IS
+            # rebase, so the upper is wiped immediately after, and a
+            # link that never reached the snapshot vanished from the
+            # agent's live workspace mid-session. Its target still
+            # doesn't cross the wire — that is a separate question —
+            # but the guest must not lose the file.
+            _rmtree_or_unlink(spath)
+            os.symlink(os.readlink(entry.path), spath)
+        # other node types: not part of the contract (v0)
 
 
 def _rmtree_or_unlink(p: Path) -> None:
