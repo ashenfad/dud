@@ -200,8 +200,19 @@ secrets in `/tmp`, the same rule as any server-side cache.
 ## Wire protocol
 
 One channel between host and guest supervisor (vsock for VMs, unix
-socket for the subprocess backend), msgpack-framed, with services
-multiplexed on it:
+socket for the subprocess backend), with services multiplexed on it.
+A frame is a length-prefixed **JSON** header plus a count of raw binary
+attachments — structure where structure helps, bytes where they don't.
+(This document said msgpack for a long while; it never was.)
+
+Anything unbounded rides the binary side: workspace tars, diff tars,
+and cache values. Base64 in the header would be a 1.33x string encoded
+by the sender, parsed by the supervisor forwarding it, and decoded by
+the receiver — three transient copies of a payload that was never text.
+Measured on an 8 MB cache value, moving it off base64 took the round
+trip from ~108 ms to ~47 ms in each direction. Small typed values stay
+in the header, where being able to read a frame is worth more than the
+bytes it costs.
 
 | verb | direction | purpose |
 |---|---|---|
@@ -219,8 +230,9 @@ multiplexed on it:
 **No pickle ever crosses this boundary.** Cache values are pickled and
 unpickled only guest-side; the host stores opaque bytes. The only
 host-side deserialization surfaces are `hostcall` arguments and `emit`
-payloads, both restricted to a typed codec (msgpack over an allowlisted
-type set). This closes, by construction, the worker→host pickle hole
+payloads, both restricted to a typed codec (JSON over an allowlisted
+type set, with `bytes` base64'd inside it — these are specced small; a
+large payload belongs in the workspace as a file). This closes, by construction, the worker→host pickle hole
 documented in sandtrap's threat model — the boundary is only as strong
 as this rule.
 
@@ -564,7 +576,7 @@ later rung — rent the machine, keep the state model.
 - **Incremental materialize protocol** — when to graduate from tarball
   to commit-diff shipping; whether the provider seam needs a
   `diff(commit_a, commit_b)` capability flag.
-- **hostcall codec hardening** — msgpack + allowlisted types vs.
+- **hostcall codec hardening** — the JSON + allowlisted-types codec vs.
   per-object typed stubs; how streaming and callbacks degrade. Wanted
   before anything serves untrusted traffic.
 - **cache-as-service semantics** — read-your-writes within a call,

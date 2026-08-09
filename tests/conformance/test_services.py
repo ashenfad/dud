@@ -58,6 +58,36 @@ def test_cache_read_is_not_a_write(make_session):
         assert cache.sets > writes_after_seed
 
 
+def test_cache_carries_arbitrary_bytes_intact(session):
+    """Values ride binary frames rather than base64 in the JSON body,
+    matched to their keys by order. Bytes that JSON could never hold
+    are the sharp end of that: a framing bug shows up here as
+    corruption or a mismatched key, not as a slow path."""
+    session.python(
+        "cache['p'] = bytes(range(256))\n"
+        "cache['q'] = {'k': [1, 2]}\n"
+        "cache['r'] = 'text'"
+    )
+    assert sorted(session.cache) == ["p", "q", "r"]
+    r = session.python("a = cache['p']\nb = cache['q']\nc = cache['r']")
+    assert r.ok, r.error
+    assert r.outputs["a"] == bytes(range(256))
+    assert r.outputs["b"] == {"k": [1, 2]} and r.outputs["c"] == "text"
+
+
+def test_cache_survives_a_multi_megabyte_value(session):
+    """The size where base64 hurt: a 1.33x string encoded here, parsed
+    by the supervisor forwarding it, and decoded again. Pinned for
+    correctness at scale, not for speed."""
+    n = 2 << 20
+    r = session.python(f"cache['blob'] = b'z' * {n}")
+    assert r.ok, r.error
+    r2 = session.python("size = len(cache['blob'])\nhead = cache['blob'][:4]")
+    assert r2.ok, r2.error
+    assert r2.outputs["size"] == n
+    assert r2.outputs["head"] == b"zzzz"
+
+
 def test_cache_readonly_blocks_writes(make_session):
     with make_session() as s:
         s.python("cache['seed'] = 1")

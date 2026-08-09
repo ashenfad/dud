@@ -23,7 +23,6 @@ that socket; cache/hostcall/emit flow back as reverse requests.
 from __future__ import annotations
 
 import ast
-import base64
 import io
 import os
 import pickle
@@ -37,6 +36,12 @@ from ..proto import Channel, RemoteError
 from ..values import decode_map, encode_map, encode_value
 
 _RUNNER_FILE = "<session>"
+
+# Out-of-band slot for binary payloads travelling with a result dict.
+# Popped by whoever hands the dict to the wire, so it never reaches a
+# body. Shared with the supervisor, which uses it in the other
+# direction — see dud.guest.supervisor.
+_BINS = "_bins"
 
 # Resource guards, deliberately not an observation budget: what a model
 # should see is the host's call, and it has the budget, the model and
@@ -111,11 +116,11 @@ class CacheView(MutableMapping):
             return self._local[key]
         if key in self._deleted or key in self._known_missing:
             raise KeyError(key)
-        body, _ = self._ch.request("cache.get", {"key": key})
+        body, bins = self._ch.request("cache.get", {"key": key})
         if not body.get("hit"):
             self._known_missing.add(key)
             raise KeyError(key)
-        raw = base64.b64decode(body["b64"])
+        raw = bins[0] if bins else b""
         value = pickle.loads(raw)
         self._local[key] = value
         self._fetched[key] = raw
@@ -151,8 +156,11 @@ class CacheView(MutableMapping):
     def __len__(self) -> int:
         return sum(1 for _ in self)
 
-    def flush(self) -> tuple[dict[str, str], list[str]]:
-        """(writes as b64 pickles, deletes) for the result payload.
+    def flush(self) -> tuple[dict[str, bytes], list[str]]:
+        """(writes as raw pickles, deletes) for the result payload.
+
+        Raw bytes, not base64: these ride binary frames beside the
+        response so an unbounded pickle never becomes a JSON string.
 
         Keys that were only read ship back only if their re-pickled
         bytes differ from what was fetched — that keeps in-place
@@ -163,7 +171,7 @@ class CacheView(MutableMapping):
         for k, v in self._local.items():
             raw = pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
             if self._fetched.get(k) != raw:
-                writes[k] = base64.b64encode(raw).decode()
+                writes[k] = raw
         return writes, sorted(self._deleted)
 
 
@@ -504,8 +512,16 @@ def run(channel: Channel, req: dict) -> dict:
         result["error"] = error
     if ok:
         writes, deletes = cache.flush()
-        result["cache_writes"] = writes
+        # Keys in the body, blobs in binary frames, matched by ORDER.
+        # `_bins` is an out-of-band slot the transport pops before the
+        # body is serialized — carrying them this way instead of
+        # widening every return between here and the host keeps the
+        # supervisor's timeout, crash and fork-retry paths untouched,
+        # which is the code least worth disturbing for a payload
+        # optimization.
+        result["cache_writes"] = list(writes)
         result["cache_deletes"] = deletes
+        result[_BINS] = list(writes.values())
     return result
 
 
@@ -528,7 +544,8 @@ def serve(sock) -> None:
         return
     try:
         result = run(channel, msg.get("body", {}))
-        channel._send_msg({"id": msg["id"], "kind": "resp", "body": result}, [])
+        bins = result.pop(_BINS, [])
+        channel._send_msg({"id": msg["id"], "kind": "resp", "body": result}, bins)
     except Exception as e:  # noqa: BLE001
         channel._send_msg(
             {"id": msg["id"], "kind": "err", "etype": type(e).__name__,
