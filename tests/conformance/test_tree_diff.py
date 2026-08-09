@@ -291,3 +291,33 @@ def test_symlink_still_does_not_round_trip(session):
     d = session.diff()
     assert "alias.txt" not in d.writes
     assert "alias.txt" not in d.deletes
+
+
+def test_file_replacing_a_snapshot_symlink(session):
+    """Preserving links in the snapshot put something there that the
+    other replay branches never had to consider — and is_dir/is_file/
+    copy2 all FOLLOW links. Left in place, the replacement was written
+    THROUGH the link: it landed in the target, destroying an unrelated
+    file, while the path stayed a symlink."""
+    session.shell("echo ORIGINAL > real.txt && ln -s real.txt alias.txt")
+    session.diff(rebase=True)  # the snapshot now holds a symlink
+    session.shell("rm alias.txt && echo REPLACED > alias.txt")
+    session.diff(rebase=True)  # replay a regular file over it
+
+    r = session.shell("readlink alias.txt || echo NOTLINK; cat alias.txt; cat real.txt")
+    assert "NOTLINK" in r.transcript, "the link should be gone"
+    assert "REPLACED" in r.transcript
+    assert "ORIGINAL" in r.transcript, "real.txt must not have been written through"
+
+
+def test_directory_replacing_a_snapshot_symlink(session):
+    """Same guard from the other side: replay must not recurse through
+    a snapshot link into a directory the workspace never named."""
+    session.shell("mkdir -p d && echo inner > d/f.txt && ln -s d dlink")
+    session.diff(rebase=True)
+    session.shell("rm dlink && mkdir dlink && echo NEW > dlink/n.txt")
+    session.diff(rebase=True)
+
+    r = session.shell("ls d; echo --; ls dlink")
+    assert "f.txt" in r.transcript and "n.txt" in r.transcript
+    assert "n.txt" not in r.transcript.split("--")[0], "leaked into d/"
