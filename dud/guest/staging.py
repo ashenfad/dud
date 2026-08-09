@@ -434,6 +434,17 @@ def replay(
     for entry in os.scandir(udir):
         spath = sdir / entry.name
         st = entry.stat(follow_symlinks=False)
+        if spath.is_symlink():
+            # Drop it before replaying anything over it. Every test
+            # below — is_dir, is_file, and copy2 itself — FOLLOWS a
+            # link, so a snapshot symlink left in place takes the
+            # replacement THROUGH it: the file lands in the link's
+            # target (destroying an unrelated path) while this one
+            # stays a link. Only reachable since replay began
+            # preserving links at all; nothing else here could put one
+            # in the snapshot. An upper entry always wins, so there is
+            # no branch that wants to keep it.
+            spath.unlink()
         if stat.S_ISDIR(st.st_mode):
             if is_opaque(Path(entry.path)) or spath.is_file():
                 _rmtree_or_unlink(spath)
