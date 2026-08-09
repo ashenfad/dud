@@ -39,6 +39,7 @@ from ..proto import (
     freeze_served,
     shutdown_served,
 )
+from .runner import _BINS
 from .shell import ShellOutcome, ShellState, run_shell
 from .staging import make_stage
 
@@ -479,7 +480,9 @@ class Supervisor:
                     # Timeouts are excluded — user code ran there.
                     result = self._exec_once(None, cwd, env, run_body,
                                              timeout)
-        return result, []
+        # Out of the dict and onto the wire as frames, before the body
+        # is serialized.
+        return result, result.pop(_BINS, [])
 
     def _exec_once(self, forked, cwd: str, env: dict, run_body: dict,
                    timeout: float) -> dict:
@@ -591,6 +594,16 @@ class Supervisor:
                          "message": e.message}, []
                     )
             elif kind in ("resp", "err") and msg.get("id") == rid:
+                if kind == "resp" and mbins:
+                    # Binary payloads travelling with the result (cache
+                    # writes). Attached to the dict rather than widening
+                    # this function's return, which has five exits —
+                    # timeout, three crash paths, and this one — plus a
+                    # fork-retry above that inspects the result. Popped
+                    # in do_exec_python before the body is serialized.
+                    body = msg.get("body", {})
+                    body[_BINS] = mbins
+                    return body
                 if kind == "err":
                     return {
                         "ok": False, "transcript": "", "prints": [],

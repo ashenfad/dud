@@ -14,7 +14,6 @@ implements :meth:`close`.
 
 from __future__ import annotations
 
-import base64
 import inspect
 import io
 import logging
@@ -240,8 +239,16 @@ class HostSession:
         if verb == "cache.get":
             key = body["key"]
             if key in self.cache:
-                return {"hit": True,
-                        "b64": base64.b64encode(self.cache[key]).decode()}, []
+                # A binary frame, not base64 in the body. Cache values
+                # are opaque pickles of unbounded size, and base64 put
+                # a 1.33x string through a JSON encode here, a parse in
+                # the supervisor forwarding it, and a decode in the
+                # runner — three transient copies of a payload that
+                # never needed to be text. The frame just rides along:
+                # _pump_runner already forwards bins for reverse
+                # requests, so nothing between here and the runner
+                # changes.
+                return {"hit": True}, [self.cache[key]]
             return {"hit": False}, []
         if verb == "cache.keys":
             return {"keys": sorted(self.cache)}, []
@@ -367,7 +374,7 @@ class HostSession:
         if inputs:
             for k, v in inputs.items():
                 enc_inputs[k] = encode_value(v)
-        body, _ = self._request(
+        body, bins = self._request(
             "exec_python",
             {"code": code, "inputs": enc_inputs, "timeout": timeout,
              "caps": caps or {}, "render_budget": render_budget,
@@ -375,8 +382,10 @@ class HostSession:
              "cache_readonly": cache_readonly, "fs_readonly": fs_readonly},
         )
         if body.get("ok"):
-            for k, b64 in body.get("cache_writes", {}).items():
-                self.cache[k] = base64.b64decode(b64)
+            # Keys in the body, blobs in frames, matched by order —
+            # an unbounded pickle never becomes a JSON string.
+            for k, blob in zip(body.get("cache_writes", []), bins):
+                self.cache[k] = blob
             for k in body.get("cache_deletes", []):
                 self.cache.pop(k, None)
         err = body.get("error")
