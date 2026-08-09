@@ -34,6 +34,22 @@ from typing import Callable
 
 PROTO_VERSION = 1
 
+# Why this rarely moves, and why a wire change usually shouldn't move it:
+# host and guest cannot be different builds. `inject_dud` installs the
+# host's own dud package into the rootfs, and `_spec_hash` includes
+# `_dud_code_hash()` — a digest of exactly those injected files. Editing
+# anything the guest runs therefore changes the image spec, so the host
+# looks up (and builds) a different rootfs rather than reusing one
+# holding the older guest. Verified: this file's own edits move the spec
+# hash.
+#
+# So the skew this version guards against — a new host meeting an old
+# guest — has no path through the normal build. It stays because the
+# handshake is cheap and a hand-assembled rootfs, or a future rung that
+# rents a machine it did not build, would reintroduce the possibility.
+# Bump it when the framing itself changes shape (the header format, the
+# attachment protocol), not merely because a verb's payload moved.
+
 _LEN = struct.Struct(">I")
 
 # A handler takes (verb, body, bins) and returns (body, bins).
