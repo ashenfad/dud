@@ -233,3 +233,61 @@ def test_mode_round_trips_back_into_a_session(session, tmp_path):
     session.push_dir(out)
     r = session.shell("./tool.sh")
     assert "ran" in r.transcript, r.transcript
+
+
+# ---- symlinks: not carried, but not destroyed either --------------------
+
+
+def test_rebase_does_not_destroy_a_symlink(session):
+    """The worst of the set. rebase folds the staged tree into the
+    baseline and wipes the staging area, so a producer that skipped
+    symlinks didn't merely leave them unreported — the link vanished
+    from the agent's own workspace, mid-session, on the normal
+    checkpoint path."""
+    session.shell("echo data > real.txt && ln -s real.txt alias.txt")
+    session.diff(rebase=True)
+    r = session.shell("readlink alias.txt || echo GONE")
+    assert "real.txt" in r.transcript, r.transcript
+
+
+def test_symlink_is_not_reported_as_deleted(session):
+    """A skipped symlink is a path on disk and absent from the index,
+    which the delete arithmetic reads as a removal — so the diff told
+    the consumer to delete a file that was sitting right there."""
+    session.shell("echo data > real.txt && ln -s real.txt alias.txt")
+    session.diff(rebase=True)
+    d = session.diff()
+    assert d.deletes == []
+    assert d.empty, f"a settled tree should be quiet: {d.writes} {d.deletes}"
+
+
+def test_dangling_symlink_survives_a_rebase(session):
+    """Following links instead of copying them made a broken one fatal:
+    FileNotFoundError out of the copy, taking the whole rebase with it.
+    Agents produce these routinely — a build that half-finished."""
+    session.shell("ln -s /nonexistent/target dangle && echo ok")
+    d = session.diff(rebase=True)  # must not raise
+    assert d.deletes == []
+    r = session.shell("readlink dangle")
+    assert "/nonexistent/target" in r.transcript
+
+
+def test_symlink_replacing_a_file_still_reports_the_delete(session, tmp_path):
+    """The other direction: indexing symlinks must not silence a real
+    delete. Content that was on the wire and no longer is has to be
+    reported, whether it was removed or covered over by a link."""
+    _seed(tmp_path, {"data.txt": "d", "target.txt": "t"})
+    session.push_dir(tmp_path)
+    session.shell("ln -sf target.txt data.txt")
+    d = session.diff()
+    assert d.deletes == ["data.txt"]
+    assert "data.txt" not in d.writes
+
+
+def test_symlink_still_does_not_round_trip(session):
+    """Tier 0 stops the destruction; it does not add symlinks to the
+    wire. Pinned so the boundary stays explicit rather than assumed."""
+    session.shell("echo data > real.txt && ln -s real.txt alias.txt")
+    d = session.diff()
+    assert "alias.txt" not in d.writes
+    assert "alias.txt" not in d.deletes
