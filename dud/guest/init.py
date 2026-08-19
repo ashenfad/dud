@@ -149,6 +149,10 @@ def main(default_root: str = "/workspace") -> None:
 
     # Children (the python runner) inherit this so `-m dud.guest.runner`
     # resolves even if the package lives outside the default sys.path.
+    #
+    # Ordering is load-bearing: /init has already applied the image's
+    # ENV by now, so PREPENDING here keeps dud's site dir ahead of an
+    # image that ships its own PYTHONPATH, without discarding theirs.
     site = next((p for p in sys.path if p.endswith("site-packages")), None)
     if site:
         os.environ["PYTHONPATH"] = site + os.pathsep + os.environ.get("PYTHONPATH", "")

@@ -200,10 +200,35 @@ def inject_dud(fs: FileSet, extra_pythonpath: str | None = None) -> str:
     return site
 
 
-def _init_script(site: str, workspace: str) -> bytes:
+def _image_env(env: list[str]) -> dict[str, str]:
+    """The image's ENV as a mapping, dropping anything malformed.
+
+    Baked into /init so the guest boots with the environment its image
+    declares. Without it the kernel hands init almost nothing and there
+    is no PATH at all — which bash hides behind its own fallback while
+    every other PATH consumer (subprocess, timeout, xargs, and CPython
+    resolving its own argv[0]) fails to find /usr/local/bin, where the
+    image keeps python, pip and every console script.
+    """
+    out: dict[str, str] = {}
+    for entry in env or ():
+        key, sep, value = entry.partition("=")
+        if sep and key:
+            out[key] = value
+    return out
+
+
+def _init_script(site: str, workspace: str,
+                 env: dict[str, str] | None = None) -> bytes:
     lines = [
         "#!/usr/local/bin/python3",
-        "import sys",
+        "import os, sys",
+        # setdefault, not assignment: anything the boot actually handed
+        # us was chosen for this machine and outranks a build-time
+        # record. And note what is NOT applied — the image's WORKDIR.
+        # Execs start at the workspace root by contract, which is a dud
+        # decision the image doesn't get a vote in.
+        f"for _k, _v in {dict(env or {})!r}.items(): os.environ.setdefault(_k, _v)",
         f"sys.path.insert(0, {('/' + site)!r})",
         "from dud.guest.init import main",
         f"main(default_root={workspace!r})",
@@ -229,5 +254,7 @@ def build_fileset(
         )
     site = inject_dud(fs)
     fs.add_dir(workspace, 0o755)
-    fs.add_file("init", _init_script(site, workspace), 0o755)
+    fs.add_file(
+        "init", _init_script(site, workspace, _image_env(image.env)), 0o755
+    )
     return fs

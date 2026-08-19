@@ -142,3 +142,47 @@ def test_build_fileset_adds_init_and_workspace(make_layer):
     assert body.startswith("#!/usr/local/bin/python3")
     assert "from dud.guest.init import main" in body
     assert "default_root='/workspace'" in body
+
+
+# ---- image ENV into /init ----------------------------------------------
+
+
+def test_image_env_parses_docker_style_entries():
+    from dud.images.rootfs import _image_env
+
+    got = _image_env([
+        "PATH=/usr/local/bin:/usr/bin",
+        "LANG=C.UTF-8",
+        "EMPTY=",
+        "malformed-no-equals",
+        "=novalue",
+    ])
+    assert got == {
+        "PATH": "/usr/local/bin:/usr/bin",
+        "LANG": "C.UTF-8",
+        "EMPTY": "",
+    }
+
+
+def test_init_script_applies_env_before_handing_off():
+    """Order matters twice over: the ENV has to land before main() runs,
+    because main() prepends dud's site dir to PYTHONPATH and the
+    supervisor snapshots the environment as _boot_env right after."""
+    from dud.images.rootfs import _init_script
+
+    src = _init_script("usr/local/lib/python3.12/site-packages", "/workspace",
+                       {"PATH": "/usr/local/bin", "LANG": "C.UTF-8"})
+    text = src.decode()
+    assert "os.environ.setdefault" in text
+    assert "/usr/local/bin" in text and "C.UTF-8" in text
+    assert text.index("setdefault") < text.index("main(default_root=")
+    # setdefault, not assignment: whatever the boot handed us was chosen
+    # for this machine and outranks a build-time record.
+    assert "os.environ[" not in text
+
+
+def test_init_script_without_env_still_boots():
+    from dud.images.rootfs import _init_script
+
+    text = _init_script("site", "/workspace").decode()
+    assert "main(default_root='/workspace')" in text
