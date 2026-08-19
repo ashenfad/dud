@@ -32,9 +32,14 @@ from . import registry, rootfs
 # v2: layered packages ship baked hash-based .pyc (imports were
 #     recompiling pandas per exec: ~1s per view GET); debs marker
 #     folded unconditionally into the spec hash.
+# v3: /init applies the image's ENV. Needed here rather than riding
+#     _dud_code_hash because dud/images is _HOST_ONLY — the generator
+#     of /init is not itself injected, so changing what it emits leaves
+#     the code hash untouched and every cached artifact would keep its
+#     old, env-less init.
 _log = logging.getLogger(__name__)
 
-PIPELINE_VERSION = 2
+PIPELINE_VERSION = 3
 
 # Rootfs media the backend can boot. The medium is folded into the spec
 # hash so a threshold change can never serve a wrong-medium artifact, and
