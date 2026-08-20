@@ -3,7 +3,7 @@
 Starts at 0.3.0. Earlier releases predate this file; `git log` is the
 record for those.
 
-## 0.3.0 (unreleased)
+## 0.3.0 - 2026-08-20
 
 ### Breaking
 
