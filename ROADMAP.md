@@ -1,27 +1,15 @@
 # Roadmap
 
-What's left. Companion to [DESIGN.md](DESIGN.md) (why it's shaped this
-way) and [README.md](README.md) (what it is and what it costs).
-Updated 2026-07-20.
+What isn't built yet.
 
-## Where we are
+- [README.md](README.md) — what it is, how to use it, what it costs.
+- [CHANGELOG.md](CHANGELOG.md) — what shipped, and when.
+- [DESIGN.md](DESIGN.md) — why it's shaped this way, including
+  ["Roads not taken"](DESIGN.md#roads-not-taken): the things considered
+  and declined, so they don't get re-litigated here.
 
-All three backends are live and pass the same conformance corpus.
-(These docs call them *rungs* — they're ordered by isolation strength,
-not interchangeable; see the ladder in the [README](README.md).)
-
-| rung | status |
-|---|---|
-| `subprocess` | shipped — dev/CI floor, zero isolation |
-| `vfkit` (macOS/HVF) | shipped |
-| `firecracker` (Linux/KVM) | shipped — including snapshot freeze/thaw parking |
-
-Built and working end to end: OCI image pulls with pip-layered wheels
-and pinned debs (pure Python, no daemon), erofs and initramfs rootfs
-media, overlay workspace staging at the configured root, the scratch
-plane, warm VM pooling with state affinity and demand-driven reclaim,
-death recovery, the warm fork template for view execs, and snapshot
-parking on firecracker.
+All three rungs are live and pass the same conformance corpus; what
+that covers is the CHANGELOG's business rather than this file's.
 
 ## Open
 
@@ -51,8 +39,8 @@ calls. Serving splits that:
   neither the binary nor a server to hit. Either an in-guest forwarder
   (see DESIGN, "The apps loop") or a wire-level shell→host bridge.
   Agents use `test_app`/preview meanwhile.
-- **hostcall codec hardening**: the boundary's attack surface, before
-  anything serves untrusted traffic.
+- **hostcall codec hardening** — a prerequisite, not a nice-to-have;
+  see Design questions below for the shape of it.
 
 ### CI matrix
 
@@ -64,7 +52,37 @@ a KVM-capable Linux runner. **Golden transcripts** — pinning
 agent-visible runner semantics (echo, harvest, print caps, error
 rendering) across rungs in one corpus — become valuable exactly here.
 
+### Workspace fidelity
+
+- **Symlinks don't round-trip.** They survive inside a session and no
+  longer vanish at checkpoint, but a link an agent creates never
+  reaches the consumer. Carrying relative, inside-workspace targets is
+  the easy and useful half. Absolute ones (`venv/bin/python3.13 ->
+  /usr/local/bin/python3.13`) are the decision: the stdlib's `data`
+  extraction filter refuses them outright, and an image-absolute link
+  arguably isn't workspace *state* at all — it only means anything in
+  that exact image. Whatever the disposition, record what was dropped
+  rather than dropping it silently, the way `outputs_skipped` does.
+- **Empty directories don't round-trip.** Files imply their parents.
+  Probably leave it: git doesn't track them either, so a git-shaped
+  provider has nowhere to put one.
+
+### Reach
+
+- **The `python:*-slim` requirement.** `rootfs.py` demands an
+  interpreter at `/usr/local/bin/python3` and a matching
+  `site-packages` layout, which is narrower than "has Python". Relaxing
+  it to *find* an interpreter is the first rung of the language-neutral
+  ladder in DESIGN's thesis, and the only one that pays off without
+  protocol work.
+
 ### Loose ends
+
+- **No host-side deadline.** Death recovers — the channel closes and
+  the owner re-acquires — but a *hang* doesn't: `Channel` sets no
+  socket timeout, so a wedged guest blocks the host forever. Needs a
+  decision about legitimately slow calls (`push_tree` on a large tree)
+  before it can be a single number.
 
 - **Boot latency**: ~2.5 s of the 3 s initramfs boot is the guest
   retrying its vsock dial until the VMM's bridge is ready (erofs boots
@@ -81,32 +99,37 @@ rendering) across rungs in one corpus — become valuable exactly here.
   nothing. (An older note here pointed at a `dogfood/analyst_agent.py`
   in this repo that never existed — the harnesses live in the studio.)
 
-## Deliberately not now
+### Design questions
 
-Recorded so they don't get re-litigated.
+Carried over from DESIGN, which should say why things are shaped as
+they are rather than track what hasn't been decided.
 
-- **Restart survival (detached VMs)** — decided against 2026-07-19. VM
-  lifetime is process-linked *as an invariant*: channel EOF powers the
-  guest off, the VMM exits with its guest, so even a `kill -9` of the
-  host cascades to full cleanup with no orphan reaper. Detaching removes
-  exactly that safety and rebuilds its guarantees by hand (socket
-  rediscovery, adopt protocols, stale-guest-runtime handshakes) to save
-  a ~1 s boot whose tree would be re-pushed from kvgit anyway. Where
-  durable warmth actually matters — the firecracker rung — it arrives
-  structurally instead: snapshots are files, and files survive restarts
-  without any process outliving anything.
-- **virtiofs lowerdir** (host-mounted workspaces instead of tarring over
-  vsock) — deferred indefinitely 2026-07-19. The scratch plane routes
-  bulk to disk cache, so state stays small — kvgit's own assumption —
-  and eager hydration (~0.4 s / 200 MB) stops mattering. Revisit only if
-  large *source* data (uploads that are genuinely state) becomes common.
-- **OS-level sandboxing around the subprocess backend**
-  (Seatbelt/Landlock — a half-step between "no isolation" and a real
-  VM) — the vfkit backend landing on macOS removed most of its
-  audience. Revisit only if a Linux-dev-without-KVM constituency
-  appears.
-- **Per-blob content addressing** — kvgit's concern (storage v4
-  candidate), not dud's.
-- **Windows** — no rung, no plan.
-- **Incremental tree push** — `push_tree` wipes and re-extracts on
-  restore; fine at current workspace sizes.
+- **Incremental materialize protocol** — when to graduate from tarball
+  to commit-diff shipping; whether the provider seam needs a
+  `diff(commit_a, commit_b)` capability flag.
+- **hostcall codec hardening** — the JSON + allowlisted-types codec vs.
+  per-object typed stubs; how streaming and callbacks degrade. Wanted
+  before anything serves untrusted traffic.
+- **cache-as-service semantics** — read-your-writes within a call,
+  staging interaction, size limits on the wire.
+- **Egress design**, if network is ever wanted — gvisor-tap-vsock,
+  allowlist format, DNS.
+- **GitProvider** — a plain git repo as a `WorkspaceProvider`; nearly
+  free given tree-in/diff-out, and a very legible demo.
+- **Sub-task delegation as a host service** — guests can't nest VMs
+  (Firecracker masks VMX; the DinD lesson applies anyway), and don't
+  need to: a host-registered `subtask` service lets an agent request
+  "run X on a fork of my workspace; return the branch." The sibling VM
+  is an implementation detail the guest never sees — the service is just
+  another hostcall registration, implemented host-side by composing
+  `ws.fork()` + an executor + a sub-loop. **dud needs zero new verbs for
+  this.** Recursion lives in the branch tree; machines stay flat under
+  one manager. Policy at the registration, as always: max concurrent
+  sub-tasks, image allowlist, budget subdivision. Also the worked
+  example that hostcall subsumes what in-process nontainer needed three
+  mechanisms for (host_objects, cache, and now delegation): named
+  services, typed codec, host-side allowlist.
+- **Per-blob content addressing in kvgit** (currently `{commit}:{key}`,
+  write-once but not content-addressed) — not a blocker, but at a VM
+  trust boundary it buys put-verification (`sha(bytes) == key`), upload
+  skipping, and cross-session dedup. Candidate storage v4.

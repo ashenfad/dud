@@ -5,10 +5,12 @@ substrate for [nontainer](https://github.com/ashenfad/nontainer)-style
 versioned workspaces — `pip install dud`, no Kubernetes, no daemon, no
 cloud.
 
-> **Scope.** This is the *why*: the thesis, the design decisions that
-> shaped what got built, and the costs knowingly accepted. What it is
-> and what it costs to run: [README.md](README.md). What's still open:
-> [ROADMAP.md](ROADMAP.md).
+> **Scope.** This is the *why*: the thesis, the decisions that shaped
+> what got built, the costs knowingly accepted, and the roads not
+> taken. It deliberately does not track status — what shipped and when
+> is [CHANGELOG.md](CHANGELOG.md), what isn't built is
+> [ROADMAP.md](ROADMAP.md), and what it is and costs to run is
+> [README.md](README.md).
 
 ## Thesis
 
@@ -571,34 +573,35 @@ later rung — rent the machine, keep the state model.
   absolute-path skew.
 - **`outputs` narrows to codec-representable values.**
 
-## Open questions
+## Roads not taken
 
-- **Incremental materialize protocol** — when to graduate from tarball
-  to commit-diff shipping; whether the provider seam needs a
-  `diff(commit_a, commit_b)` capability flag.
-- **hostcall codec hardening** — the JSON + allowlisted-types codec vs.
-  per-object typed stubs; how streaming and callbacks degrade. Wanted
-  before anything serves untrusted traffic.
-- **cache-as-service semantics** — read-your-writes within a call,
-  staging interaction, size limits on the wire.
-- **Egress design**, if network is ever wanted — gvisor-tap-vsock,
-  allowlist format, DNS.
-- **GitProvider** — a plain git repo as a `WorkspaceProvider`; nearly
-  free given tree-in/diff-out, and a very legible demo.
-- **Sub-task delegation as a host service** — guests can't nest VMs
-  (Firecracker masks VMX; the DinD lesson applies anyway), and don't
-  need to: a host-registered `subtask` service lets an agent request
-  "run X on a fork of my workspace; return the branch." The sibling VM
-  is an implementation detail the guest never sees — the service is just
-  another hostcall registration, implemented host-side by composing
-  `ws.fork()` + an executor + a sub-loop. **dud needs zero new verbs for
-  this.** Recursion lives in the branch tree; machines stay flat under
-  one manager. Policy at the registration, as always: max concurrent
-  sub-tasks, image allowlist, budget subdivision. Also the worked
-  example that hostcall subsumes what in-process nontainer needed three
-  mechanisms for (host_objects, cache, and now delegation): named
-  services, typed codec, host-side allowlist.
-- **Per-blob content addressing in kvgit** (currently `{commit}:{key}`,
-  write-once but not content-addressed) — not a blocker, but at a VM
-  trust boundary it buys put-verification (`sha(bytes) == key`), upload
-  skipping, and cross-session dedup. Candidate storage v4.
+Decisions made against, with the reasoning, so they don't get
+re-litigated. What is merely *unbuilt* lives in
+[ROADMAP.md](ROADMAP.md); these are the things that were considered and
+declined.
+
+- **Restart survival (detached VMs)** — decided against 2026-07-19. VM
+  lifetime is process-linked *as an invariant*: channel EOF powers the
+  guest off, the VMM exits with its guest, so even a `kill -9` of the
+  host cascades to full cleanup with no orphan reaper. Detaching removes
+  exactly that safety and rebuilds its guarantees by hand (socket
+  rediscovery, adopt protocols, stale-guest-runtime handshakes) to save
+  a ~1 s boot whose tree would be re-pushed from kvgit anyway. Where
+  durable warmth actually matters — the firecracker rung — it arrives
+  structurally instead: snapshots are files, and files survive restarts
+  without any process outliving anything.
+- **virtiofs lowerdir** (host-mounted workspaces instead of tarring over
+  vsock) — deferred indefinitely 2026-07-19. The scratch plane routes
+  bulk to disk cache, so state stays small — kvgit's own assumption —
+  and eager hydration (~0.4 s / 200 MB) stops mattering. Revisit only if
+  large *source* data (uploads that are genuinely state) becomes common.
+- **OS-level sandboxing around the subprocess backend**
+  (Seatbelt/Landlock — a half-step between "no isolation" and a real
+  VM) — the vfkit backend landing on macOS removed most of its
+  audience. Revisit only if a Linux-dev-without-KVM constituency
+  appears.
+- **Per-blob content addressing** — kvgit's concern (storage v4
+  candidate), not dud's.
+- **Windows** — no rung, no plan.
+- **Incremental tree push** — `push_tree` wipes and re-extracts on
+  restore; fine at current workspace sizes.

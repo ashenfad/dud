@@ -100,6 +100,34 @@ relative paths behave identically, absolute ones don't. Known gap,
 and it only bites if you develop against that backend and deploy on
 a VM one.)
 
+### What a print costs to look at
+
+`r.prints` is a structured stream beside the transcript: one entry per
+`print`, carrying the text plus the metadata text alone would lose
+(`type`, and `shape`/`len` where the object had one). Composing an
+observation from those entries is the caller's job — dud knows nothing
+about your model or your budget.
+
+The exception is *rendering*, which can only happen guest-side because
+it needs the live object — a DataFrame's head/tail can't be
+reconstructed from a chopped string:
+
+```python
+r = s.python(code, render_budget=200)
+# entry text becomes [0, 1, 2, ...86 more] instead of a severed token
+```
+
+The number stays yours; unset means plain `str()`. It needs
+[reprobate](https://github.com/ashenfad/reprobate) in the image
+(`packages=["reprobate"]`), falls back to plain text without it, and
+`ping()["renderer"]` says which is live. Rendered entries are marked
+`elided`. The transcript is never rendered — it keeps exactly what real
+Python printed.
+
+`caps` are the other knob and are **not** an observation budget: they
+bound what one exec can send back so a runaway print loop can't flood
+the channel, and they sit far above anything you'd show a model.
+
 ### Pooling and parking
 
 `pooled=True` reuses VMs across sessions from a process-wide warm
