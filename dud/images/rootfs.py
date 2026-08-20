@@ -223,12 +223,20 @@ def _init_script(site: str, workspace: str,
     lines = [
         "#!/usr/local/bin/python3",
         "import os, sys",
-        # setdefault, not assignment: anything the boot actually handed
-        # us was chosen for this machine and outranks a build-time
-        # record. And note what is NOT applied — the image's WORKDIR.
-        # Execs start at the workspace root by contract, which is a dud
-        # decision the image doesn't get a vote in.
-        f"for _k, _v in {dict(env or {})!r}.items(): os.environ.setdefault(_k, _v)",
+        # Overrides, not defaults. What the kernel hands PID 1 is two
+        # hardcoded constants — HOME=/ and TERM=linux — not choices made
+        # for this machine, so deferring to them would silently discard
+        # an image that declares either (ENV HOME=/app is ordinary for
+        # app images). The image's ENV is the deliberate statement, and
+        # treating it as authoritative is also what a container runtime
+        # does, which is the behavior being matched.
+        #
+        # dud's own variables are applied AFTER this, in guest.init and
+        # the supervisor, so they still win. And note what is NOT
+        # applied — the image's WORKDIR. Execs start at the workspace
+        # root by contract, which is a dud decision the image gets no
+        # vote in.
+        f"os.environ.update({dict(env or {})!r})",
         f"sys.path.insert(0, {('/' + site)!r})",
         "from dud.guest.init import main",
         f"main(default_root={workspace!r})",

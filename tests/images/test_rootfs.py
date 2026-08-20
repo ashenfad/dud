@@ -173,12 +173,30 @@ def test_init_script_applies_env_before_handing_off():
     src = _init_script("usr/local/lib/python3.12/site-packages", "/workspace",
                        {"PATH": "/usr/local/bin", "LANG": "C.UTF-8"})
     text = src.decode()
-    assert "os.environ.setdefault" in text
+    assert "os.environ.update" in text
     assert "/usr/local/bin" in text and "C.UTF-8" in text
-    assert text.index("setdefault") < text.index("main(default_root=")
-    # setdefault, not assignment: whatever the boot handed us was chosen
-    # for this machine and outranks a build-time record.
-    assert "os.environ[" not in text
+    assert text.index("os.environ.update") < text.index("main(default_root=")
+
+
+def test_image_env_overrides_the_kernel_presets():
+    """The kernel hands PID 1 two hardcoded constants, HOME=/ and
+    TERM=linux. Deferring to them would silently discard an image that
+    declares either — and ENV HOME=/app is ordinary for app images."""
+    import subprocess
+    import sys as _sys
+
+    from dud.images.rootfs import _init_script
+
+    src = _init_script("site", "/workspace", {"HOME": "/app"}).decode()
+    # Everything above the hand-off to main(), run with the kernel's
+    # value already in place.
+    prelude = src.split("from dud.guest.init import main")[0]
+    prelude = prelude.split("\n", 1)[1]  # drop the shebang
+    out = subprocess.run(
+        [_sys.executable, "-c", prelude + "\nprint(os.environ['HOME'])"],
+        capture_output=True, text=True, env={"HOME": "/", "TERM": "linux"},
+    )
+    assert out.stdout.strip() == "/app", out
 
 
 def test_init_script_without_env_still_boots():
