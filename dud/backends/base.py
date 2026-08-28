@@ -231,7 +231,20 @@ class HostSession:
         ``SessionLost``, so they have to arrive as one. Decode failures
         are named precisely rather than caught as ``ValueError``: a
         caller handing us an unserializable ``body`` also raises
-        ValueError, and that is a bug in the call, not a dead guest."""
+        ValueError, and that is a bug in the call, not a dead guest.
+
+        That race has a fourth outcome which is **not** an exception and
+        is therefore not covered here: if the split leaves a reader
+        taking the first four bytes of a JSON header as a length prefix,
+        ``_recv_exact`` blocks on a bogus multi-gigabyte read. Reclaim
+        rescues itself in practice — ``VmPool._teardown`` goes on to
+        send ``shutdown``, the guest powers off, and the resulting EOF
+        reaches both readers as ``ChannelClosed`` — but an unresponsive
+        guest never produces that EOF, and no amount of translation
+        catches a hang. That one wants a socket deadline, plus an
+        explicit ``shutdown(SHUT_RDWR)`` on the reclaim path (closing a
+        socket does not wake a ``recv`` already blocked in another
+        thread; only shutdown delivers the EOF)."""
         if getattr(self, "frozen", False):
             raise SessionLost(
                 f"session is frozen (parked as a snapshot); "
