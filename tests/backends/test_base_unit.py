@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket as socketlib
 import struct
+import time
 from contextlib import contextmanager
 
 import pytest
@@ -39,7 +40,7 @@ class _RaisingChannel:
     def __init__(self, exc: Exception):
         self._exc = exc
 
-    def request(self, verb, body=None, bins=None):
+    def request(self, verb, body=None, bins=None, timeout=None):
         raise self._exc
 
 
@@ -150,6 +151,117 @@ def test_handshake_protocol_errors_still_raise():
         _send_frame(peer, json.dumps({"kind": "hello", "proto": 999}).encode())
         with pytest.raises(ProtocolError, match="version mismatch"):
             ch.hello_recv()
+
+
+# ---- per-verb deadlines ------------------------------------------------
+
+
+def test_budget_scales_with_the_exec_timeout():
+    """Execs carry their own timeout; the host waits for that plus the
+    guest's reporting tail (kill, drain, reap)."""
+    from dud.backends.base import _EXEC_SLACK, _budget_for
+
+    assert _budget_for("exec_python", {"timeout": 5.0}, None) == 5.0 + _EXEC_SLACK
+    assert _budget_for("exec_shell", {"timeout": 600.0}, None) == 600.0 + _EXEC_SLACK
+    # No explicit timeout: the same 30s default the verbs document.
+    assert _budget_for("exec_shell", {}, None) == 30.0 + _EXEC_SLACK
+
+
+def test_budget_scales_with_the_pushed_tree():
+    """A 200 MB push must not share a ping's ceiling — the whole reason
+    this is per-verb rather than one number."""
+    from dud.backends.base import _PUSH_FLOOR, _budget_for
+
+    assert _budget_for("push_tree", {}, [b""]) == _PUSH_FLOOR
+    big = _budget_for("push_tree", {}, [b"x" * (200 * 1024 * 1024)])
+    assert big > _PUSH_FLOOR + 15
+
+
+def test_unknown_verbs_get_a_finite_budget():
+    """A verb added later must not silently inherit "wait forever"."""
+    from dud.backends.base import _budget_for
+
+    assert _budget_for("some_future_verb", {}, None) > 0
+
+
+def test_wedged_guest_becomes_session_lost(monkeypatch):
+    """A guest that accepts and never answers is the case death recovery
+    could not reach: no EOF, so nothing raises until a deadline does."""
+    import dud.backends.base as basemod
+
+    monkeypatch.setitem(basemod._VERB_BUDGETS, "ping", 0.25)
+    with _channel_pair() as (ch, peer):  # noqa: F841 — peer never answers
+        s = _session_on(ch)
+        started = time.monotonic()
+        with pytest.raises(SessionLost, match="did not answer"):
+            s.ping()
+        assert time.monotonic() - started < 5.0
+        assert s._in_flight == 0
+
+
+def test_bogus_length_prefix_does_not_hang_forever(monkeypatch):
+    """The race outcome that is a hang rather than an exception: a
+    length prefix read out of the middle of a payload commits the reader
+    to a multi-gigabyte read that never completes."""
+    import dud.backends.base as basemod
+
+    monkeypatch.setitem(basemod._VERB_BUDGETS, "ping", 0.25)
+    with _channel_pair() as (ch, peer):
+        s = _session_on(ch)
+        _send_frame(peer, struct.pack(">I", 0xFFFFFF) + b"partial")
+        with pytest.raises(SessionLost):
+            s.ping()
+        assert s._in_flight == 0
+
+
+def test_handler_time_is_not_charged_to_the_guest():
+    """The channel is bidirectional: this loop SERVES the guest's
+    reverse requests while awaiting its own response. A slow hostcall is
+    our own slowness, and charging it to the guest would time out a
+    session whose only fault was calling a slow host object."""
+    budget, handler_cost = 0.4, 0.25
+
+    def slow_handler(verb, body, bins):
+        time.sleep(handler_cost)
+        return {}, []
+
+    with _channel_pair() as (ch, peer):
+        ch.handler = slow_handler
+        # Two reverse requests, then the real response. Their handler
+        # time alone (0.5s) exceeds the budget; only the guest's own
+        # idle time should count against it.
+        for i in range(2):
+            _send_frame(peer, json.dumps(
+                {"id": i + 1, "kind": "req", "verb": "emit", "body": {}, "nbin": 0}
+            ).encode())
+        _send_frame(peer, json.dumps(
+            {"id": 1, "kind": "resp", "body": {"pong": True}, "nbin": 0}
+        ).encode())
+        body, _ = ch.request("ping", {}, None, timeout=budget)
+        assert body == {"pong": True}
+
+
+def test_a_deadline_does_not_outlive_its_request():
+    """Timeouts are per request. A socket left armed would apply one
+    call's budget to whatever runs next on the channel — including
+    serve(), which must never time out."""
+    with _channel_pair() as (ch, peer):
+        _send_frame(peer, json.dumps(
+            {"id": 1, "kind": "resp", "body": {}, "nbin": 0}
+        ).encode())
+        ch.request("ping", {}, None, timeout=5.0)
+        assert ch._sock.gettimeout() is None
+
+
+def test_guest_side_channels_stay_blocking():
+    """No timeout argument means no deadline: the guest imposes none on
+    the host, and serve() waits indefinitely by design."""
+    with _channel_pair() as (ch, peer):
+        _send_frame(peer, json.dumps(
+            {"id": 1, "kind": "resp", "body": {}, "nbin": 0}
+        ).encode())
+        ch.request("ping")
+        assert ch._sock.gettimeout() is None
 
 
 def test_body_that_cannot_be_serialized_is_not_a_death():

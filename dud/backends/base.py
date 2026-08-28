@@ -39,6 +39,60 @@ _log = logging.getLogger(__name__)
 # overwhelmingly common case and consumers that ignore it are unchanged.
 _DEFAULT_FILE_MODE = 0o644
 
+# ---- host-side deadlines ------------------------------------------------
+#
+# Death recovers on its own (the channel closes and the owner
+# re-acquires); a HANG does not, and without a deadline a wedged guest
+# blocks its host forever. This was open for a while on the theory that
+# it needed "a single number" that could cover both a ping and a
+# push_tree of a 200 MB tree. It doesn't: those differ by orders of
+# magnitude, and the host already knows which verb it is sending and how
+# big the payload is. So the budget is per verb, derived where the size
+# is knowable and fixed where it isn't.
+#
+# Every value here is a CEILING on a wedged guest, not a service-level
+# expectation — the operations themselves are milliseconds. They are set
+# where a human would rather wait than see a false failure, because the
+# cost of being wrong in one direction is a spurious SessionLost on a
+# healthy session and in the other is a hang that already lasted forever.
+
+# Execs carry their own timeout, which the guest enforces. The host waits
+# for that plus the guest's reporting tail: it kills at the timeout,
+# drains the dying runner's pipe (0.5 s), and reaps (up to 5 s).
+_EXEC_SLACK = 15.0
+
+# push_tree extract cost scales with the tree. Deliberately pessimistic
+# — an order of magnitude under what a local socket onto tmpfs actually
+# does — because overshooting only delays a failure nobody is waiting on.
+_PUSH_FLOOR = 60.0
+_PUSH_BYTES_PER_SEC = 10 * 1024 * 1024
+
+_VERB_BUDGETS = {
+    "ping": 30.0,
+    "shutdown": 15.0,
+    "resync": 30.0,
+    "reset_stage": 60.0,
+    # Bounded guest-side by a 2 s kill sweep, then a full-tree wipe.
+    "reset_guest": 120.0,
+    # os.sync() on a guest that may have just written a large scratch
+    # volume. The snapshot itself is the VMM's problem, not this verb's.
+    "freeze": 120.0,
+    # O(changes), so normally ~1 ms — but the size isn't knowable in
+    # advance the way push_tree's is, so the ceiling is generous.
+    "pull_diff": 300.0,
+}
+_DEFAULT_BUDGET = 60.0
+
+
+def _budget_for(verb: str, body: dict | None, bins: list[bytes] | None) -> float:
+    """Wall-clock budget for one host->guest request."""
+    if verb in ("exec_python", "exec_shell"):
+        return float((body or {}).get("timeout", 30.0)) + _EXEC_SLACK
+    if verb == "push_tree":
+        nbytes = sum(len(b) for b in bins or ())
+        return _PUSH_FLOOR + nbytes / _PUSH_BYTES_PER_SEC
+    return _VERB_BUDGETS.get(verb, _DEFAULT_BUDGET)
+
 
 def public_methods(obj: Any) -> frozenset[str]:
     """Every public callable on ``obj``, as a concrete set.
@@ -233,18 +287,13 @@ class HostSession:
         caller handing us an unserializable ``body`` also raises
         ValueError, and that is a bug in the call, not a dead guest.
 
-        That race has a fourth outcome which is **not** an exception and
-        is therefore not covered here: if the split leaves a reader
-        taking the first four bytes of a JSON header as a length prefix,
-        ``_recv_exact`` blocks on a bogus multi-gigabyte read. Reclaim
-        rescues itself in practice — ``VmPool._teardown`` goes on to
-        send ``shutdown``, the guest powers off, and the resulting EOF
-        reaches both readers as ``ChannelClosed`` — but an unresponsive
-        guest never produces that EOF, and no amount of translation
-        catches a hang. That one wants a socket deadline, plus an
-        explicit ``shutdown(SHUT_RDWR)`` on the reclaim path (closing a
-        socket does not wake a ``recv`` already blocked in another
-        thread; only shutdown delivers the EOF)."""
+        That race has a fourth outcome which is **not** an exception: if
+        the split leaves a reader taking the first four bytes of a JSON
+        header as a length prefix, ``_recv_exact`` blocks on a bogus
+        multi-gigabyte read, and no translation catches a hang. Both
+        halves of the answer to that are now in place — the per-verb
+        deadline below bounds it in general, and ``VmPool._teardown``
+        aborts the socket of a reclaimed session specifically."""
         if getattr(self, "frozen", False):
             raise SessionLost(
                 f"session is frozen (parked as a snapshot); "
@@ -252,8 +301,17 @@ class HostSession:
             )
         self.last_used = time.monotonic()
         self._in_flight += 1
+        budget = _budget_for(verb, body, bins)
         try:
-            return self._ch.request(verb, body, bins)
+            return self._ch.request(verb, body, bins, timeout=budget)
+        except TimeoutError as e:
+            # Checked before the OSError arm below, which it subclasses.
+            # Worth its own message: every other cause here is a guest
+            # that went away, and "did not answer in time" is a guest
+            # that is still there and wedged — a different bug to chase.
+            raise SessionLost(
+                f"guest did not answer {verb!r} within {budget:.0f}s"
+            ) from e
         except (ChannelClosed, OSError, ProtocolError,
                 json.JSONDecodeError, UnicodeDecodeError) as e:
             raise SessionLost(

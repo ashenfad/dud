@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import socket
 import struct
+import time
 
 from .errors import DudError
 from typing import Callable
@@ -74,9 +75,31 @@ class ChannelClosed(Exception):
     """EOF on the socket."""
 
 
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
+def _arm(sock: socket.socket, deadline: float | None) -> None:
+    """Point the socket at the remaining budget before a blocking call.
+
+    Armed per operation rather than once per request because a request
+    is many blocking calls (a send, then a recv per frame, then a recv
+    per attachment), and each has to see what is *left* of the budget
+    rather than the whole of it. ``None`` leaves the socket blocking,
+    which is what every guest-side channel wants: the guest imposes no
+    deadline on the host, and ``serve()`` waits indefinitely for the
+    next request by design.
+    """
+    if deadline is None:
+        return
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("deadline exceeded")
+    sock.settimeout(remaining)
+
+
+def _recv_exact(
+    sock: socket.socket, n: int, deadline: float | None = None
+) -> bytes:
     buf = bytearray()
     while len(buf) < n:
+        _arm(sock, deadline)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise ChannelClosed()
@@ -99,21 +122,26 @@ class Channel:
 
     # ---- framing ----------------------------------------------------
 
-    def _send_msg(self, msg: dict, bins: list[bytes]) -> None:
+    def _send_msg(
+        self, msg: dict, bins: list[bytes], deadline: float | None = None
+    ) -> None:
         msg = dict(msg, nbin=len(bins))
         data = json.dumps(msg, separators=(",", ":")).encode()
         out = bytearray(_LEN.pack(len(data)) + data)
         for b in bins:
             out += _LEN.pack(len(b)) + b
+        _arm(self._sock, deadline)
         self._sock.sendall(out)
 
-    def _recv_msg(self) -> tuple[dict, list[bytes]]:
-        (n,) = _LEN.unpack(_recv_exact(self._sock, 4))
-        msg = json.loads(_recv_exact(self._sock, n).decode())
+    def _recv_msg(
+        self, deadline: float | None = None
+    ) -> tuple[dict, list[bytes]]:
+        (n,) = _LEN.unpack(_recv_exact(self._sock, 4, deadline))
+        msg = json.loads(_recv_exact(self._sock, n, deadline).decode())
         bins = []
         for _ in range(int(msg.get("nbin", 0))):
-            (bn,) = _LEN.unpack(_recv_exact(self._sock, 4))
-            bins.append(_recv_exact(self._sock, bn))
+            (bn,) = _LEN.unpack(_recv_exact(self._sock, 4, deadline))
+            bins.append(_recv_exact(self._sock, bn, deadline))
         return msg, bins
 
     # ---- handshake ---------------------------------------------------
@@ -134,28 +162,64 @@ class Channel:
     # ---- request/response -------------------------------------------
 
     def request(
-        self, verb: str, body: dict | None = None, bins: list[bytes] | None = None
+        self, verb: str, body: dict | None = None, bins: list[bytes] | None = None,
+        timeout: float | None = None,
     ) -> tuple[dict, list[bytes]]:
-        """Send a request; pump incoming requests until our response."""
-        self._next_id += 1
-        rid = self._next_id
-        self._send_msg(
-            {"id": rid, "kind": "req", "verb": verb, "body": body or {}},
-            bins or [],
-        )
-        while True:
-            msg, mbins = self._recv_msg()
-            kind = msg.get("kind")
-            if kind == "req":
-                self._serve_one(msg, mbins)
-            elif kind == "resp" and msg.get("id") == rid:
-                return msg.get("body", {}), mbins
-            elif kind == "err" and msg.get("id") == rid:
-                raise RemoteError(
-                    verb, msg.get("message", ""), msg.get("etype", "RemoteError")
-                )
-            else:
-                raise ProtocolError(f"unexpected frame: {kind!r} id={msg.get('id')}")
+        """Send a request; pump incoming requests until our response.
+
+        ``timeout`` bounds how long the *peer* may take, and raises
+        :class:`TimeoutError` when it runs out. It is a budget on the
+        whole exchange rather than on any one blocking call: a peer that
+        sent a byte a moment ago is not thereby making progress, so a
+        per-recv timeout would never fire on a wedged guest that keeps
+        the channel warm. Omitted (the default, and every guest-side
+        caller) leaves the socket blocking exactly as before.
+
+        Time spent inside ``handler`` does not count against it. The
+        channel is bidirectional, so this loop *serves* the peer's
+        reverse requests (cache, hostcall, emit) while awaiting its own
+        response — and a hostcall that legitimately runs longer than the
+        budget is our own slowness, not the guest's. Charging it to the
+        guest would time out a session whose only fault was calling a
+        slow host object.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        try:
+            self._next_id += 1
+            rid = self._next_id
+            self._send_msg(
+                {"id": rid, "kind": "req", "verb": verb, "body": body or {}},
+                bins or [], deadline,
+            )
+            while True:
+                msg, mbins = self._recv_msg(deadline)
+                kind = msg.get("kind")
+                if kind == "req":
+                    served_at = time.monotonic()
+                    self._serve_one(msg, mbins)
+                    if deadline is not None:
+                        deadline += time.monotonic() - served_at
+                elif kind == "resp" and msg.get("id") == rid:
+                    return msg.get("body", {}), mbins
+                elif kind == "err" and msg.get("id") == rid:
+                    raise RemoteError(
+                        verb, msg.get("message", ""),
+                        msg.get("etype", "RemoteError"),
+                    )
+                else:
+                    raise ProtocolError(
+                        f"unexpected frame: {kind!r} id={msg.get('id')}"
+                    )
+        finally:
+            if deadline is not None:
+                # Hand the socket back blocking. A timeout is per
+                # request, and leaving the last one armed would apply an
+                # unrelated budget to whatever runs next on this channel
+                # — including serve(), which must never time out.
+                try:
+                    self._sock.settimeout(None)
+                except OSError:
+                    pass
 
     def _serve_one(self, msg: dict, bins: list[bytes]) -> None:
         rid, verb = msg.get("id"), msg.get("verb", "")
