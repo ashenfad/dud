@@ -7,6 +7,7 @@ import socket as socketlib
 import struct
 import time
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 
@@ -262,6 +263,34 @@ def test_guest_side_channels_stay_blocking():
         ).encode())
         ch.request("ping")
         assert ch._sock.gettimeout() is None
+
+
+def test_no_host_side_call_site_bypasses_the_wire_seam():
+    """`_request` calls itself "the one wire seam: every host->guest
+    request goes through here" — and it wasn't. close(), pool release,
+    and firecracker freeze/thaw all called `_ch.request` directly, so
+    the budgets defined for shutdown/reset_guest/freeze/resync were
+    dead config and a guest that wedged during any of them still hung
+    forever.
+
+    Pinned by a source scan rather than left to review, because the
+    failure is invisible at every call site: the direct call works
+    perfectly until the day a guest stops answering.
+    """
+    import dud.backends as backends_pkg
+
+    pkg = Path(backends_pkg.__file__).parent
+    offenders = []
+    for py in sorted(pkg.glob("*.py")):
+        if py.name == "base.py":  # the seam itself
+            continue
+        for i, line in enumerate(py.read_text().splitlines(), 1):
+            if "_ch.request(" in line:
+                offenders.append(f"{py.name}:{i}: {line.strip()}")
+    assert not offenders, (
+        "host->guest requests must go through HostSession._request so "
+        "they get a deadline:\n  " + "\n  ".join(offenders)
+    )
 
 
 def test_body_that_cannot_be_serialized_is_not_a_death():

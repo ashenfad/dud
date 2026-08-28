@@ -337,7 +337,7 @@ class FirecrackerSession(HostSession):
             self._srv.close()
         except OSError:
             pass
-        self._ch.request("freeze")
+        self._request("freeze")
         self._ch.close()
         # A paused guest can never see channel EOF, so if we die
         # between Pause and the VMM kill the process-linkage cascade is
@@ -431,7 +431,7 @@ class FirecrackerSession(HostSession):
             os.unlink(os.path.join(self._rundir, "frozen"))
         except OSError:
             pass
-        self._ch.request("resync", {"epoch": time.time()})
+        self._request("resync", {"epoch": time.time()})
 
     # ---- scratch ---------------------------------------------------------
 
@@ -464,7 +464,7 @@ class FirecrackerSession(HostSession):
             return
         clean = False
         try:
-            self._ch.request("shutdown")
+            self._request("shutdown")
             clean = True
         except Exception:  # noqa: BLE001 — a guest mid-death answers anything
             pass
