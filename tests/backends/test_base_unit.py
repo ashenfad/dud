@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import socket as socketlib
+import struct
+from contextlib import contextmanager
+
 import pytest
 
 from dud.backends.base import (
@@ -12,7 +17,7 @@ from dud.backends.base import (
     require_allowlist,
 )
 from dud.errors import PolicyError
-from dud.proto import ChannelClosed, ProtocolError, RemoteError
+from dud.proto import Channel, ChannelClosed, ProtocolError, RemoteError
 
 
 def test_safe_diff_path_passes_normal_paths():
@@ -61,6 +66,104 @@ def test_guest_answered_errors_pass_through():
     s = _session_with(RemoteError("exec_python", "boom", "ValueError"))
     with pytest.raises(RemoteError):
         s.ping()
+
+
+# ---- a channel torn by a concurrent speaker ----------------------------
+#
+# VmPool._make_room deliberately reclaims a bound session whose
+# _in_flight is 0 and accepts racing the owner's next call, so two
+# threads can be inside Channel.request on one socket. Each _recv_msg
+# loop may then consume frames the other issued. The three tests below
+# inject exactly the frames that race produces, deterministically —
+# driving live threads would only make the same three outcomes
+# probabilistic. All three must reach the owner as SessionLost, because
+# that is the one exception the pool's recovery path tells consumers to
+# catch.
+
+
+@contextmanager
+def _channel_pair():
+    """A real Channel plus the raw peer socket, for injecting frames."""
+    a, b = socketlib.socketpair()
+    try:
+        yield Channel(a), b
+    finally:
+        a.close()
+        b.close()
+
+
+def _send_frame(sock: socketlib.socket, payload: bytes) -> None:
+    sock.sendall(struct.pack(">I", len(payload)) + payload)
+
+
+def _session_on(ch: Channel) -> HostSession:
+    s = HostSession()
+    s._ch = ch  # type: ignore[assignment]
+    return s
+
+
+def test_foreign_response_id_becomes_session_lost():
+    """The other speaker's response, read by our loop: ProtocolError."""
+    with _channel_pair() as (ch, peer):
+        s = _session_on(ch)
+        _send_frame(peer, json.dumps(
+            {"id": 999, "kind": "resp", "body": {}, "nbin": 0}
+        ).encode())
+        with pytest.raises(SessionLost) as ei:
+            s.ping()
+        assert isinstance(ei.value.__cause__, ProtocolError)
+        assert s._in_flight == 0
+
+
+def test_unparseable_frame_becomes_session_lost():
+    """A binary attachment read as a header: JSON decode failure.
+
+    Text-shaped bytes on purpose — a workspace tar carrying a CSV gets
+    past the UTF-8 decode and dies at json.loads, which is the other
+    half of the pair the next test covers.
+    """
+    with _channel_pair() as (ch, peer):
+        s = _session_on(ch)
+        _send_frame(peer, b"data/in.csv\x00a,b\n1,2\n")
+        with pytest.raises(SessionLost) as ei:
+            s.ping()
+        assert isinstance(ei.value.__cause__, json.JSONDecodeError)
+        assert s._in_flight == 0
+
+
+def test_undecodable_frame_becomes_session_lost():
+    """Same, when the stray bytes aren't even UTF-8."""
+    with _channel_pair() as (ch, peer):
+        s = _session_on(ch)
+        _send_frame(peer, b"\xff\xfe\x00\x01")
+        with pytest.raises(SessionLost) as ei:
+            s.ping()
+        assert isinstance(ei.value.__cause__, UnicodeDecodeError)
+        assert s._in_flight == 0
+
+
+def test_handshake_protocol_errors_still_raise():
+    """The widening is scoped to _request, not to Channel: a version
+    mismatch at connect is a real protocol bug and must stay one — it
+    is not a guest that died, and no recovery path should retry it."""
+    with _channel_pair() as (ch, peer):
+        _send_frame(peer, json.dumps({"kind": "hello", "proto": 999}).encode())
+        with pytest.raises(ProtocolError, match="version mismatch"):
+            ch.hello_recv()
+
+
+def test_body_that_cannot_be_serialized_is_not_a_death():
+    """Decode failures are named precisely rather than caught as
+    ValueError, so a bug in the CALL doesn't masquerade as a dead
+    guest: json.dumps raises ValueError on a circular structure."""
+    with _channel_pair() as (ch, peer):  # noqa: F841 — peer never answers
+        s = _session_on(ch)
+        circular: dict = {}
+        circular["self"] = circular
+        with pytest.raises(ValueError) as ei:
+            s._request("ping", circular)
+        assert not isinstance(ei.value, SessionLost)
+        assert s._in_flight == 0
 
 
 # ---- allowlist shape ---------------------------------------------------
