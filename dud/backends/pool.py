@@ -274,7 +274,7 @@ class VmPool:
             else:
                 _log.info("at max_total=%s: reclaiming an idle VM",
                           self.max_total)
-            self._teardown(victim)
+            self._teardown(victim, had_owner=bound)
 
     def prewarm(self, n: int, background: bool = True, **kwargs: Any) -> None:
         """Keep ``n`` idle VMs warm for this config: boot-and-park the
@@ -379,7 +379,7 @@ class VmPool:
         with self._lock:
             self._bound.pop(id(session), None)
         try:
-            session._ch.request("reset_guest", {"keep_tree": bool(state)})
+            session._request("reset_guest", {"keep_tree": bool(state)})
         except Exception:  # noqa: BLE001 — an unresettable guest is not reusable
             _log.info("guest reset failed on release; discarding instead of "
                       "parking", exc_info=True)
@@ -476,12 +476,20 @@ class VmPool:
         except OSError:
             pass  # already dead, or never connected: nothing to release
 
-    def _teardown(self, session: VfkitSession) -> None:
+    def _teardown(self, session: VfkitSession, had_owner: bool = False) -> None:
         # A parked session already ran close() once (that's what parked
         # it), so clear both the pool hook AND the closed latch — else
         # close() no-ops and the VM process would leak.
         with self._lock:
-            had_owner = self._bound.pop(id(session), None) is not None
+            # `had_owner` is passed in rather than only inferred here,
+            # because the one caller that matters cannot leave it to be
+            # rediscovered: _make_room has to drop its victim from
+            # _bound before it gets here, or the capacity arithmetic it
+            # loops on never falls below the cap and it picks the same
+            # victim forever. Inferring alone made the abort below dead
+            # code on the exact path it was written for.
+            had_owner = (self._bound.pop(id(session), None) is not None
+                         or had_owner)
         if had_owner:
             # Idle victims (TTL, overflow, a park that failed to come
             # back) have no second thread and keep their graceful

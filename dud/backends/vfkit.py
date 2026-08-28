@@ -435,7 +435,7 @@ class VfkitSession(HostSession):
         # shutdown verb -> supervisor stops serving -> init powers the VM off.
         clean = False
         try:
-            self._ch.request("shutdown")
+            self._request("shutdown")
             clean = True
         except Exception:  # noqa: BLE001 — a guest mid-death answers anything
             pass

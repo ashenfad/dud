@@ -51,6 +51,11 @@ class FakeVM:
 
         self._ch = Ch()
 
+    def _request(self, verb, body=None, bins=None):
+        """The real HostSession's wire seam, which the pool goes through
+        so lifecycle verbs get a deadline like every other request."""
+        return self._ch.request(verb, body, bins)
+
     def ping(self):
         if self.dead:
             raise ConnectionError("vm died")
@@ -778,3 +783,22 @@ def test_teardown_releases_a_reader_blocked_on_a_bogus_length():
     finally:
         a.close()
         b.close()
+
+
+def test_reclaiming_a_bound_vm_aborts_its_channel(monkeypatch):
+    """The production reclaim path, which the unit test above skips.
+
+    _make_room has to drop its victim from _bound before calling
+    _teardown — its capacity loop counts _bound, so leaving the victim
+    there would never fall below the cap and it would pick the same one
+    forever. Teardown therefore cannot rediscover that the session had
+    an owner; it has to be told, and when it wasn't, the abort was dead
+    code on exactly the path it exists for.
+    """
+    p = _no_auto(_pool(monkeypatch, max_total=1))
+    a = p.acquire(image="x")
+    sock = _RecordingSock()
+    a._ch._sock = sock
+    p.acquire(image="y")  # no idle to take: reclaims `a` from its owner
+    assert a.torn_down is True
+    assert sock.shutdowns == 1
