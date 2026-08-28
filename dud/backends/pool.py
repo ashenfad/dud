@@ -52,6 +52,7 @@ import inspect
 import json
 import logging
 import os
+import socket as socketlib
 import threading
 import time
 from typing import Any
@@ -439,12 +440,54 @@ class VmPool:
         session.emits = []
         session._closed = False
 
+    @staticmethod
+    def _abort_channel(session: VfkitSession) -> None:
+        """Release anyone blocked reading this session's channel.
+
+        Only reached for a session that still had an owner, which is the
+        only case where another thread can be inside ``Channel.request``
+        on this socket. That owner may be blocked on a read that will
+        never complete: if reclaim tore a frame in half, its ``recv``
+        loop can be waiting out a bogus multi-gigabyte length prefix,
+        which is a hang rather than an error and so is invisible to
+        every ``except`` on the path.
+
+        ``shutdown``, not ``close``. Closing a socket does not reliably
+        wake a ``recv`` already blocked on it in another thread — the fd
+        just stops being valid, and on some platforms the reader sits
+        there anyway. SHUT_RDWR delivers the EOF, which the reader turns
+        into ``ChannelClosed`` and the owner sees as ``SessionLost``:
+        the recovery it was promised, rather than a wedge.
+
+        Doing it before ``close()`` also matches what this path is. A
+        reclaim is a deliberate death, not a clean park, and EOF is
+        already the designed kill signal — the guest powers off on it
+        (syncing on the way), and the VMM exits with the guest. The
+        graceful ``shutdown`` verb close() would otherwise send buys
+        nothing here and can itself block on the same torn channel.
+        """
+        if getattr(session, "frozen", False):
+            return  # a frozen park is files; there is no live channel
+        sock = getattr(getattr(session, "_ch", None), "_sock", None)
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socketlib.SHUT_RDWR)
+        except OSError:
+            pass  # already dead, or never connected: nothing to release
+
     def _teardown(self, session: VfkitSession) -> None:
         # A parked session already ran close() once (that's what parked
         # it), so clear both the pool hook AND the closed latch — else
         # close() no-ops and the VM process would leak.
         with self._lock:
-            self._bound.pop(id(session), None)
+            had_owner = self._bound.pop(id(session), None) is not None
+        if had_owner:
+            # Idle victims (TTL, overflow, a park that failed to come
+            # back) have no second thread and keep their graceful
+            # poweroff. Only a reclaimed-from-an-owner session can have
+            # a reader to release, so only it pays the abrupt exit.
+            self._abort_channel(session)
         # Disposal is NOT a clean park: TTL expiry, overflow, reclaim,
         # and failed-reset all land here, and none of them may publish
         # scratch (a reclaimed VM was never quiesced; a TTL victim's

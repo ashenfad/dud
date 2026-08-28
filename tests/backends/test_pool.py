@@ -659,3 +659,122 @@ def test_refill_cap_ignores_frozen_parks(monkeypatch):
     p.prewarm(3, background=False, image="warm")
     bucket = p._idle[poolmod._fingerprint({"image": "warm"}, FrozenFakeVM)]
     assert len(bucket) == 3 and all(s.frozen for _, _, s in bucket)
+
+
+# ---- releasing a reader blocked on a reclaimed channel ------------------
+#
+# _make_room reclaims a bound session whose _in_flight is 0 and accepts
+# racing the owner's next call. If that race tears a frame, the owner's
+# recv loop can be waiting out a bogus length prefix — a hang, so
+# invisible to every `except` on the path. The deadline bounds it in
+# general; aborting the socket ends it at once.
+
+
+class _RecordingSock:
+    def __init__(self):
+        self.shutdowns = 0
+
+    def shutdown(self, how):
+        self.shutdowns += 1
+
+
+def test_abort_is_scoped_to_sessions_that_had_an_owner(monkeypatch):
+    """Idle victims (TTL, overflow, a park that failed to come back)
+    have no second thread, so they keep their graceful poweroff. Only a
+    reclaim-from-an-owner can have a reader to release."""
+    p = _pool(monkeypatch, max_idle=4)
+    owned = p.acquire(image="x")
+    owned_sock = _RecordingSock()
+    owned._ch._sock = owned_sock
+
+    idle = p.acquire(image="y")
+    idle_sock = _RecordingSock()
+    idle._ch._sock = idle_sock
+    idle.close()  # parks it: no longer bound
+
+    p._teardown(owned)
+    p._teardown(idle)
+
+    assert owned_sock.shutdowns == 1
+    assert idle_sock.shutdowns == 0
+
+
+def test_abort_skips_a_frozen_park(monkeypatch):
+    """A frozen park is files, not a process: there is no live channel
+    and no reader to release."""
+    p = _pool(monkeypatch)
+    s = p.acquire(image="x")
+    sock = _RecordingSock()
+    s._ch._sock = sock
+    s.frozen = True
+    p._teardown(s)
+    assert sock.shutdowns == 0
+
+
+def test_abort_tolerates_a_channel_with_no_socket(monkeypatch):
+    """Teardown must never fail on cleanup — a half-built session (boot
+    raised before the channel existed) still has to be disposable."""
+    p = _pool(monkeypatch)
+    s = p.acquire(image="x")
+    p._teardown(s)  # FakeVM's channel has no _sock at all
+    assert s.torn_down
+
+
+def test_teardown_releases_a_reader_blocked_on_a_bogus_length():
+    """The end of the race PR #20 could only translate the errors of.
+
+    A live thread here rather than injected frames: the point is that
+    the reader is *blocked with no exception pending*, which is a state
+    only a real blocking read can be in.
+    """
+    import socket as socketlib
+    import struct
+    import threading
+    import time
+
+    from dud.backends.base import HostSession, SessionLost
+    from dud.proto import Channel
+
+    class _SockSession(HostSession):
+        def __init__(self, sock):
+            super().__init__()
+            self._ch = Channel(sock)
+            self._pool = None
+            self._pool_kwargs = {}
+            self._scratch_master = None
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    a, b = socketlib.socketpair()
+    try:
+        s = _SockSession(a)
+        p = poolmod.VmPool(session_cls=FakeVM)
+        p._bound[id(s)] = s
+
+        caught: list[BaseException] = []
+
+        def owner():
+            try:
+                s.ping()
+            except BaseException as e:  # noqa: BLE001 — the test IS the assert
+                caught.append(e)
+
+        t = threading.Thread(target=owner, daemon=True)
+        t.start()
+        # Commit the reader to a read that will never complete.
+        b.sendall(struct.pack(">I", 0x0FFFFFFF) + b"partial")
+        time.sleep(0.2)
+        assert t.is_alive(), "reader should be blocked, not finished"
+
+        started = time.monotonic()
+        p._teardown(s)
+        t.join(timeout=5.0)
+        assert not t.is_alive(), "teardown did not release the reader"
+        # Fast: proving the abort did it, not the verb's 30s deadline.
+        assert time.monotonic() - started < 5.0
+        assert caught and isinstance(caught[0], SessionLost)
+    finally:
+        a.close()
+        b.close()
