@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import io
+import json
 import logging
 import posixpath
 import tarfile
@@ -215,7 +216,22 @@ class HostSession:
         here so activity tracking and death detection can't drift per
         call site. Transport failures become :class:`SessionLost`;
         guest-answered errors (``RemoteError``) pass through untouched —
-        an answering guest is alive."""
+        an answering guest is alive.
+
+        "Transport failure" includes a channel torn by a *concurrent*
+        speaker, not just one that died. ``VmPool._make_room``
+        deliberately reclaims a bound session whose ``_in_flight`` is 0
+        and accepts racing the owner's next call, so two threads can
+        end up inside ``Channel.request`` on one socket: each
+        ``_recv_msg`` loop may consume frames the other issued, which
+        surfaces as a foreign response id (``ProtocolError``) or as a
+        binary payload parsed as a header (a JSON/UTF-8 decode error).
+        None of those are wire *bugs* — they are the documented reclaim
+        landing mid-call — and the owner is told to recover by catching
+        ``SessionLost``, so they have to arrive as one. Decode failures
+        are named precisely rather than caught as ``ValueError``: a
+        caller handing us an unserializable ``body`` also raises
+        ValueError, and that is a bug in the call, not a dead guest."""
         if getattr(self, "frozen", False):
             raise SessionLost(
                 f"session is frozen (parked as a snapshot); "
@@ -225,7 +241,8 @@ class HostSession:
         self._in_flight += 1
         try:
             return self._ch.request(verb, body, bins)
-        except (ChannelClosed, OSError) as e:
+        except (ChannelClosed, OSError, ProtocolError,
+                json.JSONDecodeError, UnicodeDecodeError) as e:
             raise SessionLost(
                 f"guest lost during {verb!r}: {e or type(e).__name__}"
             ) from e
