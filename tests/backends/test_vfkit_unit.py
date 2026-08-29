@@ -9,8 +9,6 @@ cmdline, scratch device naming, the rundir sweep — lives in
 
 from __future__ import annotations
 
-import platform
-
 import pytest
 
 from dud.backends import vfkit
@@ -18,9 +16,23 @@ from dud.backends.vfkit import VfkitSession
 from dud.backends.vm import BootSpec
 from dud.errors import IsolationUnavailable
 
-_DARWIN_ONLY = pytest.mark.skipif(
-    platform.system() != "Darwin", reason="vfkit ctor is Darwin-only"
-)
+
+@pytest.fixture
+def runnable_rung(monkeypatch, tmp_path):
+    """Get past the preflight so a test can reach what it is about.
+
+    The argument-validation tests below care about `disks=` and
+    `scratch=`, not about this host. Faking the two preflight facts —
+    macOS, and a vfkit binary — lets them assert their actual subject
+    on any platform, and stops a CI runner without vfkit installed
+    from reporting "vfkit not found" as though it were the finding.
+
+    Safe on Linux: validation raises before anything is pulled, built
+    or booted, so no VM is ever created.
+    """
+    monkeypatch.setattr(vfkit.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(vfkit, "_vfkit_bin", lambda: "/usr/bin/true")
+    monkeypatch.setenv("DUD_HOME", str(tmp_path))
 
 
 def _spec(rootfs, medium, rundir, **kw) -> BootSpec:
@@ -67,16 +79,36 @@ def test_non_darwin_fails_closed(monkeypatch):
         VfkitSession()
 
 
-@_DARWIN_ONLY
-def test_missing_disk_image_fails_closed(tmp_path, monkeypatch):
+def test_missing_disk_image_fails_closed(tmp_path, runnable_rung):
     """disks= paths are validated before any VM resources are spent."""
-    monkeypatch.setenv("DUD_HOME", str(tmp_path))
     with pytest.raises(IsolationUnavailable, match="disk image not found"):
         VfkitSession(disks=[tmp_path / "nope.erofs"])
 
 
-@_DARWIN_ONLY
-def test_missing_scratch_volume_fails_closed(tmp_path, monkeypatch):
-    monkeypatch.setenv("DUD_HOME", str(tmp_path))
+def test_missing_scratch_volume_fails_closed(tmp_path, runnable_rung):
     with pytest.raises(IsolationUnavailable, match="scratch volume not found"):
         VfkitSession(scratch=tmp_path / "nope.ext4")
+
+
+def test_missing_vfkit_fails_closed_before_any_build(monkeypatch, tmp_path):
+    """The preflight ordering itself, which CI caught and a developer
+    machine cannot: with vfkit installed everywhere locally, nothing
+    here exercises its absence.
+
+    It has to raise before `build_rootfs`, or a host with no VMM pays
+    for a registry pull and a rootfs build to be told it was never
+    going to boot.
+    """
+    monkeypatch.setattr(vfkit.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(vfkit.shutil, "which", lambda _n: None)
+    monkeypatch.setattr(vfkit.Path, "exists", lambda _self: False)
+    monkeypatch.setenv("DUD_HOME", str(tmp_path))
+
+    import dud.backends.vm as vmmod
+
+    def _no_build(*a, **k):
+        raise AssertionError("preflight must raise before any build")
+
+    monkeypatch.setattr(vmmod, "build_rootfs", _no_build)
+    with pytest.raises(IsolationUnavailable, match="vfkit not found"):
+        VfkitSession()
