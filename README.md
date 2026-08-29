@@ -130,30 +130,61 @@ the channel, and they sit far above anything you'd show a model.
 
 ### Rich values out
 
-`outputs` carries what the codec can represent. A live plotly figure or
-a DataFrame can't cross it, so those come back named in
-`outputs_skipped` with their type — dud tells you what it dropped
-rather than guessing at a shape for it.
-
-To get them out, put them in a `ui` dict and give the image a
-`dud_outputs` package:
+`outputs` carries what the codec can represent: JSON, bytes, file refs.
+A live DataFrame or plotly figure can't cross, so out of the box it
+just comes back named, with its type, in `outputs_skipped`:
 
 ```python
-# in the image, via packages=["your-guest-pkg"]
-def flatten(ui: dict, workspace: str) -> set[str]:
-    """Write what you want to files under `workspace`; return the
-    names you handled."""
+r = s.python("import pandas as pd\ndf = pd.DataFrame({'a': [1, 2]})")
+r.outputs          # {}
+r.outputs_skipped  # {'pd': 'module', 'df': 'DataFrame'}
 ```
 
-The guest offers `ui` to that hook, drops whatever it claims, and lets
-the rest harvest through. Anything it wrote is an ordinary workspace
-write, so it rides the diff like any other file.
+(`pd` is in there because the harvest is *every* top-level binding,
+imports included. dud reports what it couldn't represent rather than
+quietly filtering — you decide what's noise.)
 
-Which objects, in what format, under what path is **your** convention —
-dud has no opinion, the same way it has none about your store. Without
-a hook nothing is flattened, and `ping()["outputs_hook"]` says whether
-one is live. Serializing has to happen guest-side for the same physical
-reason rendering does: it needs the live object.
+Nothing is lost — but nothing is delivered either. To get such values
+out, serialize them **guest-side** into workspace files, where they
+ride home in the diff like any other write. That's what the hook is
+for: put a module named `dud_outputs` in the image, exposing `flatten`.
+
+```python
+# your-guest-pkg/dud_outputs.py — layered in via packages=[...]
+import os
+
+
+def flatten(bindings: dict, workspace: str) -> set[str]:
+    handled = set()
+    for name, value in bindings.items():
+        if type(value).__module__.startswith("pandas"):
+            value.to_csv(os.path.join(workspace, f"{name}.csv"), index=False)
+            handled.add(name)   # consumed: don't also send it home
+    return handled
+```
+
+The same exec, with that package in the image:
+
+```python
+s = dud.session("vm", image="python:3.12-slim",
+                packages=["pandas", "your-guest-pkg"])
+
+r = s.python("import pandas as pd\ndf = pd.DataFrame({'a': [1, 2]})")
+r.outputs_skipped   # {'pd': 'module'} — df is gone; the hook took it
+s.diff().writes     # {'df.csv': b'a\n1\n2\n'}
+```
+
+The hook is handed **every** top-level binding and returns the names it
+consumed; dud drops those and lets the rest harvest through as usual.
+It can also *rewrite* a binding instead of consuming it, which is how a
+"collect outputs in a `ui` dict" convention works — read
+`bindings["ui"]`, write out the rich entries, put the remainder back,
+return nothing.
+
+Note what dud doesn't do here: it names no binding and knows no format.
+Which objects to write, in what shape, under what path is yours, the
+same way your store is. Without a hook nothing is flattened, and
+`ping()["outputs_hook"]` tells you whether one is live.
 
 ### Pooling and parking
 

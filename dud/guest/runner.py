@@ -276,14 +276,14 @@ _OUTPUTS_HOOK: Any = None  # unresolved; False once known absent
 def _outputs_hook():
     """The image's ``dud_outputs.flatten``, if it ships one.
 
-    The consumer-supplied half of the ``ui = {...}`` convention. dud
-    used to carry this itself, in a guest module that knew plotly
+    Whatever convention the consumer has for getting live objects out.
+    dud used to carry one itself, in a guest module that knew plotly
     figures serialize to ``ui/<name>.plotly.json``, that DataFrames get
-    ``head(200)`` with ``orient="split"``, and that the artifact cap was
-    8 MB "for parity with the host renderer" — a file in another repo.
-    That is the layer above's convention compiled into dud, and it was
-    the one place the storage-blind, knows-nothing-above design was not
-    true.
+    ``head(200)`` with ``orient="split"``, that the artifact cap was
+    8 MB "for parity with the host renderer" — a file in another repo —
+    and that the dict holding all this was called ``ui``. That is the
+    layer above's convention compiled into dud, and it was the one
+    place the storage-blind, knows-nothing-above design was not true.
 
     Same footing as the renderer, for the same reason: optional,
     layered via ``packages=[...]``, resolved from the image, silently
@@ -445,41 +445,42 @@ def _clean_traceback(exc: BaseException) -> str:
     return "".join(out) if keep else "".join(parts[:1] + parts[-1:])
 
 
-def _flatten_ui(g: dict) -> None:
-    """Offer rich ``ui`` values to the image's outputs hook.
+def _offer_outputs(harvest: dict) -> dict:
+    """Offer the harvested bindings to the image's outputs hook.
 
-    The ``ui = {...}`` convention: live objects that can't cross the
-    codec get serialized guest-side into workspace files, which ride
-    back as ordinary diff writes; the representable remainder still
-    harvests through to the host. Serializing has to happen here
-    because it needs the live object — the same physical reason
-    rendering does.
+    Live objects that can't cross the codec get serialized guest-side
+    into workspace files, which ride back as ordinary diff writes; what
+    the hook doesn't claim still harvests through to the host.
+    Serializing has to happen here because it needs the live object —
+    the same physical reason rendering does.
 
-    *Which* objects, into what shape, under what path, is not dud's
-    business. It is a convention owned by whoever consumes the diff, so
-    it lives in a package the image supplies. Without one, nothing is
-    flattened and unrepresentable values land in ``outputs_skipped``
-    with their type names — the honest answer for a consumer that has
-    no convention.
+    The hook receives **every** top-level binding and returns the names
+    it fully consumed, which dud drops. It may also rewrite a binding
+    in place, which is how a convention like ``ui = {...}`` — write
+    some of the dict to files, let the rest cross — is expressed
+    without dud knowing the word ``ui``.
+
+    That generality is the point. An earlier cut of this passed only a
+    binding literally named ``ui``, which moved the *formats* out of
+    dud while leaving the *vocabulary* in: dud would still have known
+    what the layer above calls its output dict, and a second consumer
+    wanting a different name, or a bare top-level figure, would have
+    had to adopt someone else's word for it. Now dud names nothing.
 
     A hook that raises is treated as having handled nothing. It runs
     third-party serializers over agent data, so it will raise
     eventually, and an exec must not fail because a chart could not be
     written.
     """
-    ui = g.get("ui")
-    if not isinstance(ui, dict) or not ui:
-        return
     flatten = _outputs_hook()
-    if flatten is None:
-        return
+    if flatten is None or not harvest:
+        return harvest
     workspace = os.environ.get("DUD_WORKSPACE") or os.getcwd()
     try:
-        handled = set(flatten(ui, workspace) or ())
+        handled = set(flatten(harvest, workspace) or ())
     except Exception:  # noqa: BLE001 — a hook over agent data, never fatal
-        return
-    if handled:
-        g["ui"] = {k: v for k, v in ui.items() if k not in handled}
+        return harvest
+    return {k: v for k, v in harvest.items() if k not in handled}
 
 
 def run(channel: Channel, req: dict) -> dict:
@@ -546,12 +547,11 @@ def run(channel: Channel, req: dict) -> dict:
 
     outputs, skipped = ({}, {})
     if ok:
-        _flatten_ui(g)
         harvest = {
             k: v for k, v in g.items()
             if not k.startswith("_") and k not in injected
         }
-        outputs, skipped = encode_map(harvest)
+        outputs, skipped = encode_map(_offer_outputs(harvest))
 
     transcript = stdout_buf.getvalue()
     if len(transcript) > stdout_cap:
