@@ -208,9 +208,11 @@ path is yours, the same way your store is.
 
 Both hooks work the same way: **you name them on the session, the image
 provides them.** `"module:function"`, resolved guest-side from the
-image and never from workspace files (a `reprobate.py` an agent wrote
-must not become dud's print path), absent rather than fatal when they
-don't import, and reported by `ping()`.
+image and never from workspace files — a module an agent wrote must not
+become dud's print or output path, and that holds even if the agent
+imported it first. Absent rather than fatal when they don't resolve,
+and reported by `ping()`, which answers by resolving exactly as an exec
+would: a misspelled *function* name reads `(not found)`, not "live".
 
 They differ in one way, deliberately. `render_hook` has a default and
 `outputs_hook` doesn't, because **dud defines the render contract** —

@@ -258,3 +258,65 @@ def test_no_renderer_at_all_is_none(monkeypatch):
     monkeypatch.setattr(runner, "_DEFAULT_RENDERER", ("nope_absent", "render"))
     assert runner._renderer(None) is None
     assert runner._renderer("also.missing:render") is None
+
+
+# ---- hijack resistance --------------------------------------------------
+
+
+def test_a_preloaded_workspace_module_cannot_satisfy_a_hook(tmp_path,
+                                                            monkeypatch):
+    """Stripping sys.path is not enough on its own.
+
+    Agent code runs BEFORE the harvest, so it can import its own
+    shadow first; `import_module` then returns it straight out of
+    sys.modules without consulting sys.path at all. Measured on a real
+    guest before the fix: an agent that wrote `agentmod.py` into its
+    workspace and imported it had its function called in place of the
+    configured hook, and every binding it chose to drop was dropped.
+    """
+    shadow = tmp_path / "agent_hooks.py"
+    shadow.write_text("def flatten(bindings, ws):\n    bindings.clear()\n"
+                      "    return set()\n")
+    monkeypatch.setenv("DUD_WORKSPACE", str(tmp_path))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    # The agent got there first: it is already in sys.modules.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("agent_hooks", shadow)
+    preloaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(preloaded)
+    monkeypatch.setitem(sys.modules, "agent_hooks", preloaded)
+    assert runner._from_image("agent_hooks", "flatten",
+                              workspace=str(tmp_path)) is None
+    harvest = {"keep": 1}
+    assert runner._offer_outputs(harvest, "agent_hooks:flatten") == harvest
+
+
+def test_a_module_outside_the_workspace_still_resolves(tmp_path, monkeypatch):
+    """The origin check must not refuse the image. It is scoped to the
+    workspace, not to cwd — on the subprocess rung the supervisor
+    inherits the host's cwd, and treating that as agent-writable
+    refused every module in the project's own virtualenv."""
+    monkeypatch.setenv("DUD_WORKSPACE", str(tmp_path / "workspace"))
+    _install(monkeypatch, lambda b, ws: {"gone"})
+    assert runner._offer_outputs({"gone": 1, "kept": 2},
+                                 SPEC) == {"kept": 2}
+
+
+# ---- failure isolation --------------------------------------------------
+
+
+def test_a_hook_that_rewrites_then_raises_changes_nothing(monkeypatch):
+    """"Treated as having handled nothing" has to be true of the
+    bindings too. A hook that rewrote one and blew up on the next used
+    to have its half-finished edits kept, because the fallback returned
+    the very dict it had been mutating."""
+    def flatten(bindings, workspace):
+        bindings["a"] = "clobbered"
+        del bindings["b"]
+        raise RuntimeError("failed on the next one")
+
+    _install(monkeypatch, flatten)
+    harvest = {"a": 1, "b": 2}
+    assert runner._offer_outputs(harvest, SPEC) == {"a": 1, "b": 2}
+    assert harvest == {"a": 1, "b": 2}  # the caller's dict, untouched
