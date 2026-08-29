@@ -15,7 +15,7 @@ jobs:
       fail-fast: false  # one flaky runner must not cancel the matrix
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
 
     steps:
