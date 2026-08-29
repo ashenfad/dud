@@ -45,6 +45,36 @@ def test_timeout_kills(session):
     assert r.timed_out and r.exit_code == 124
 
 
+def test_runaway_output_is_bounded(session):
+    """A chatty script must not be able to size the supervisor's memory.
+
+    On a VM rung that buffer belongs to PID 1, so an unbounded one makes
+    `cat` of a big log an OOM of the machine — and PID 1 as the OOM
+    victim is a panic, not a failed exec. The script still runs to
+    completion: the bound drops output, it does not close the pipe and
+    stall the writer.
+    """
+    r = session.shell("yes ABCDEFGHIJ | head -c 4000000", timeout=60)
+    assert r.ok
+    assert len(r.transcript) < 2_000_000, "transcript is unbounded"
+    assert r.transcript.startswith("ABCDEFGHIJ")  # the head survives
+    assert "truncated" in r.transcript  # and says so
+
+
+def test_a_background_process_does_not_hold_the_call_open(session):
+    """`nohup server &` — the script is finished, but what it started
+    inherited stdout. Waiting for end-of-pipe there is waiting for the
+    daemon, which turned an instant successful script into a full
+    timeout. The exit is the script's, not its children's.
+
+    (The backgrounded `sleep` outlives this call by design — that is
+    what makes `timed_out` the discriminator rather than a stopwatch.)
+    """
+    r = session.shell("sleep 20 & echo started", timeout=5)
+    assert not r.timed_out, "waited on a survivor's fd instead of the script"
+    assert r.exit_code == 0 and r.transcript.strip() == "started"
+
+
 def test_workspace_env_var(session):
     r = session.shell("test -d \"$DUD_WORKSPACE\" && echo yes")
     assert r.transcript.strip() == "yes"

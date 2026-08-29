@@ -9,16 +9,28 @@ exits nonzero.
 
 Transcript is stdout+stderr merged (terminal-faithful, the termish
 precedent). Timeout kills the whole process group.
+
+Output is read incrementally and bounded as it arrives, rather than
+collected with ``communicate()``. That is not a style preference: the
+supervisor holding this buffer is PID 1 on a VM rung, so an unbounded
+one turns any chatty script into a memory attack on the machine (one
+second of ``yes`` was 200 MB), and a ``communicate()`` with no deadline
+hands a background process the power to wedge the guest for as long as
+it lives. See :class:`_Transcript` and :func:`_pump`.
 """
 
 from __future__ import annotations
 
 import os
+import select
 import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .runner import _CAP_STDOUT
 
 # The env dump uses only builtins (compgen/printf): the external `env`
 # binary would need the whole environment passed through execve, whose
@@ -35,6 +47,17 @@ _TRAP = (
 _DROP_VARS = {"__DUD_CWD__", "__DUD_ENV__", "_", "SHLVL", "OLDPWD"}
 _MAX_ENV_ENTRY = 96 * 1024  # comfortably under Linux MAX_ARG_STRLEN
 
+# The transcript ceiling, imported rather than restated: this is the
+# same concept as the python runner's transcript and the two drifting
+# apart is exactly the failure this bound was added to fix (the python
+# path had a cap from the start; bash had none, so the identical field
+# on the identical result object differed by 200x).
+_CAP_TRANSCRIPT = _CAP_STDOUT
+
+_DRAIN_BUDGET = 0.5  # post-kill: how long a dead script's tail may take
+_REAP_BUDGET = 5.0   # waitpid on a killed script
+_POLL = 0.25         # how often to re-check a script that is quiet
+
 
 @dataclass
 class ShellState:
@@ -47,6 +70,135 @@ class ShellOutcome:
     transcript: str
     exit_code: int
     timed_out: bool = False
+
+
+class _Transcript:
+    """The script's output, bounded as it arrives.
+
+    Keeps the HEAD and counts the rest, matching how the runner caps
+    the python transcript: a terminal session is read from the top, and
+    what the script was doing is worth more than the ten-thousandth
+    line of its output. (The supervisor's ``_Spill`` keeps the TAIL
+    instead, for the opposite reason — it is evidence from a process
+    that died without answering, where the last thing printed says how
+    far it got. Two different questions, two different halves.)
+
+    Draining continues past the cap rather than closing the pipe. A
+    writer that fills the 64 KB pipe buffer blocks, so a script whose
+    output we stopped reading would stall until its timeout instead of
+    running to completion — turning a memory bound into a behavior
+    change, which is not a trade worth making.
+    """
+
+    def __init__(self, cap: int = _CAP_TRANSCRIPT):
+        self._cap = cap
+        self._buf = bytearray()
+        self.dropped = 0
+
+    def read(self, fd: int) -> bool:
+        """One read; False at EOF or on a dead pipe."""
+        try:
+            chunk = os.read(fd, 65536)
+        except (OSError, ValueError):
+            return False
+        if not chunk:
+            return False
+        room = max(0, self._cap - len(self._buf))
+        if room:
+            self._buf += chunk[:room]
+        self.dropped += len(chunk) - min(room, len(chunk))
+        return True
+
+    def text(self) -> str:
+        # Bytes, not chars: the cap is applied to what was read, and
+        # naming the unit honestly beats matching the runner's wording
+        # for a number that means something slightly different.
+        out = self._buf.decode(errors="replace")
+        if self.dropped:
+            out += (f"\n… [truncated at {self._cap} bytes; "
+                    f"{self.dropped} more not captured]")
+        return out
+
+
+def _killpg(proc: subprocess.Popen) -> None:
+    """Kill the script's whole process group.
+
+    ``PermissionError`` is caught alongside the obvious
+    ``ProcessLookupError`` because Darwin raises EPERM — not ESRCH —
+    when the group's only remaining member is a zombie, which is the
+    normal state at a timeout whose script already exited. Uncaught, it
+    escaped ``run_shell`` and reached the host as a ``PermissionError``
+    from ``exec_shell`` instead of a timeout. ``supervisor._kill``
+    already caught both; this path had not learned it yet.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _drain(out: _Transcript, fd: int, budget: float = _DRAIN_BUDGET) -> None:
+    """Take whatever the pipe still holds now its writer has been killed.
+
+    Bounded by a deadline as well as by EOF, exactly as the
+    supervisor's ``_Spill.drain`` is and for exactly the same reason: a
+    process that survived the group kill holds the write end open, and
+    a timed-out exec must still answer. The absence of this bound is
+    what let one ``setsid`` background process wedge the supervisor —
+    single-threaded, PID 1 — for as long as that process lived.
+    """
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        try:
+            ready, _, _ = select.select([fd], [], [], 0)
+        except (OSError, ValueError):
+            return
+        if not ready or not out.read(fd):
+            return
+
+
+def _pump(proc: subprocess.Popen, timeout: float) -> tuple[_Transcript, bool]:
+    """Read the script's output until it is done, or kill it at the
+    deadline. Returns ``(transcript, timed_out)``.
+
+    "Done" is the script's own exit, NOT end-of-pipe. Those differ
+    whenever the script leaves something running that inherited its
+    stdout — ``nohup server &``, the most ordinary thing an agent does
+    — and waiting for the pipe there means waiting for that daemon to
+    die. A perfectly successful one-second script used to burn its
+    entire timeout and come back ``timed_out=True`` because of it.
+    Anything the script itself wrote has already been read by then;
+    what stays open is somebody else's fd.
+    """
+    fd = proc.stdout.fileno()
+    out = _Transcript()
+    open_pipe = True
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            _killpg(proc)
+            _drain(out, fd)
+            return out, True
+        if open_pipe:
+            try:
+                ready, _, _ = select.select([fd], [], [], min(remaining, _POLL))
+            except (OSError, ValueError):
+                # An fd we can no longer watch. Stop watching it and
+                # keep waiting on the process rather than returning: the
+                # only non-timeout exit below is one where poll() has
+                # answered, which is what keeps `returncode` a number.
+                ready, open_pipe = (), False
+            if ready:
+                if out.read(fd):
+                    continue
+                open_pipe = False  # EOF: every writer has let go
+        else:
+            # The script closed its own stdout but is still running
+            # (`exec >&-; work`). Nothing to select on, so poll it.
+            time.sleep(min(remaining, _POLL))
+        if proc.poll() is not None:
+            return out, False
 
 
 def run_shell(
@@ -75,22 +227,29 @@ def run_shell(
             start_new_session=True,
         )
         try:
-            out, _ = proc.communicate(timeout=timeout)
-            timed_out = False
+            out, timed_out = _pump(proc, timeout)
+        finally:
+            proc.stdout.close()
+
+        # waitpid, not communicate: reaping does not touch the pipe, so
+        # a process still holding the write end cannot stall it. Bounded
+        # anyway — nothing after a group kill is worth blocking on.
+        try:
+            proc.wait(timeout=_REAP_BUDGET)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            out, _ = proc.communicate()
-            timed_out = True
+            _killpg(proc)
 
         if not timed_out:
+            # Only after a clean exit. A timeout is SIGKILL, so the EXIT
+            # trap never ran, and it can be killed BETWEEN its two
+            # writes — replaying then would take a cwd with no env and
+            # call the pair a session state. Nothing to restore is the
+            # honest reading of a script that was shot.
             _replay(state, cwd_file, env_file)
 
         return ShellOutcome(
-            transcript=out.decode(errors="replace"),
-            exit_code=proc.returncode if not timed_out else 124,
+            transcript=out.text(),
+            exit_code=(proc.returncode if not timed_out else 124),
             timed_out=timed_out,
         )
 

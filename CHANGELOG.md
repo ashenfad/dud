@@ -84,6 +84,43 @@ record for those.
   owner's blocked call now ends at once instead of waiting out its
   deadline.
 
+- **`shell()` transcripts are capped**, at the same 1 MiB the Python
+  runner has always applied to its own transcript. Past the cap the
+  head is kept and the transcript ends with a line saying how much was
+  dropped. The script still runs to completion — the bound stops
+  *storing* output, it does not close the pipe and stall the writer.
+
+  Why it needed one: an uncapped transcript let any chatty script size
+  the supervisor's memory, and on a VM rung the supervisor is PID 1
+  with the machine's whole RAM. One second of `yes` produced 200 MB.
+  Nothing about it required malice — `cat` a large log, run a verbose
+  build. If you were relying on transcripts above 1 MiB, write the
+  output to a workspace file and read it from the diff.
+
+### Fixed
+
+- **A background process no longer holds a `shell()` call open.**
+  `shell("nohup server &")` returned only when the *server* exited,
+  because the call waited for end-of-pipe and the server had inherited
+  stdout — so an instant, successful script burned its entire timeout
+  and came back `timed_out=True`. The call now ends when the script
+  ends, and reports the script's own exit code.
+
+- **A shell timeout can no longer wedge the guest.** The drain after
+  the kill was an unbounded read, so one process that escaped the
+  process-group kill (anything that calls `setsid`) blocked the
+  single-threaded supervisor for as long as that process lived. On a VM
+  rung that cost the whole machine. The drain is now bounded by a
+  deadline as well as by EOF, matching what the Python runner's spill
+  already did.
+
+- **A shell timeout no longer surfaces as `PermissionError`.** On macOS
+  the process-group kill raises EPERM — not ESRCH — when the group's
+  only remaining member is an unreaped corpse, which is the ordinary
+  state at a timeout whose script had already exited. The error escaped
+  as a `RemoteError` from `exec_shell` instead of a normal
+  `timed_out=True` result.
+
 ## 0.3.0 - 2026-08-20
 
 ### Breaking
