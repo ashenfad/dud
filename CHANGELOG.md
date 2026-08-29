@@ -3,6 +3,44 @@
 Starts at 0.3.0. Earlier releases predate this file; `git log` is the
 record for those.
 
+## Unreleased
+
+### Changed behavior
+
+- **A wedged guest now fails instead of hanging.** Every host→guest
+  request carries a wall-clock deadline, so a guest that stops
+  answering raises `SessionLost` rather than blocking its caller
+  forever. Death always recovered on its own — the channel closes and
+  the owner re-acquires — but a hang had nothing to recover *from*.
+
+  The budget is per verb rather than one number, because a `ping` and a
+  `push_tree` of a 200 MB tree are not the same wait: execs derive
+  theirs from the `timeout` you already pass (plus the guest's
+  kill-and-report tail), `push_tree` from the payload size, and the
+  rest are fixed ceilings. All of them bound a *stuck* guest rather
+  than expressing a service level — the operations themselves are
+  milliseconds — so nothing healthy should come near one.
+
+  The one workload that could newly fail is a `push_tree` slower than
+  60 s plus a second per 10 MB. If you push trees that large over a
+  slow link, that is the number to know.
+
+- **`SessionLost` now covers the whole loss surface.** It already meant
+  EOF, reset and broken pipe; it now also covers a deadline expiring,
+  and the framing errors (`ProtocolError`, JSON/UTF-8 decode failures)
+  that a pool reclaim can produce by tearing a frame under an owner
+  mid-call. Consumers still catch exactly one thing, which is what the
+  recovery contract always promised.
+
+  A protocol version mismatch at connect is deliberately *not* one of
+  these: it stays a `ProtocolError`, because it is a real
+  incompatibility and no amount of re-acquiring will fix it.
+
+- **A reclaimed session releases its owner immediately.** When
+  `max_total` pressure reclaims a VM that still has an owner, that
+  owner's blocked call now ends at once instead of waiting out its
+  deadline.
+
 ## 0.3.0 - 2026-08-20
 
 ### Breaking
