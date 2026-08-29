@@ -77,7 +77,9 @@ class FakeVM:
 
 
 def _pool(monkeypatch, **kw):
-    monkeypatch.setattr(poolmod, "VfkitSession", FakeVM)
+    # The pool asks _default_cls() which rung this host runs; the
+    # fake stands in for whichever that is.
+    monkeypatch.setattr(poolmod, "_default_cls", lambda: FakeVM)
     FakeVM.booted = 0
     return poolmod.VmPool(**kw)
 

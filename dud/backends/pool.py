@@ -59,7 +59,7 @@ from typing import Any
 
 from ..errors import DudError
 from .base import require_allowlist
-from .vfkit import VfkitSession
+from .vm import VmSession
 
 # Everything the pool does on the failure side is recoverable, which is
 # exactly why it is worth reporting: silent recovery is indistinguishable
@@ -88,7 +88,7 @@ def _fingerprint(kwargs: dict[str, Any], session_cls: type = None) -> str:
     do). Self-consistent either way — just pick one style per app, or
     mixed call sites warm separate buckets."""
     params = inspect.signature(
-        (session_cls or VfkitSession).__init__
+        (session_cls or _default_cls()).__init__
     ).parameters
     ident: dict[str, Any] = {}
     for name, p in params.items():
@@ -97,6 +97,25 @@ def _fingerprint(kwargs: dict[str, Any], session_cls: type = None) -> str:
         default = None if p.default is inspect.Parameter.empty else p.default
         ident[name] = kwargs.get(name, default)
     return json.dumps(ident, sort_keys=True, default=str)
+
+
+def _default_cls() -> type:
+    """The VM rung this host can run.
+
+    The pool itself is rung-agnostic — it only needs *a* class to
+    construct and to read constructor defaults off. Defaulting to a
+    named backend (it used to be vfkit) quietly made rung 2 the norm
+    and rung 3 the special case, which is backwards on a Linux fleet.
+    """
+    import platform
+
+    if platform.system() == "Darwin":
+        from .vfkit import VfkitSession
+
+        return VfkitSession
+    from .firecracker import FirecrackerSession
+
+    return FirecrackerSession
 
 
 class VmPool:
@@ -119,12 +138,12 @@ class VmPool:
         self.max_idle = max_idle
         self.ttl = ttl
         self.max_total = max_total
-        self.session_cls = session_cls or VfkitSession
-        self._idle: dict[str, list[tuple[float, VfkitSession]]] = {}
+        self.session_cls = session_cls or _default_cls()
+        self._idle: dict[str, list[tuple[float, VmSession]]] = {}
         # Bound = checked out and held by a session owner. Tracked so
         # max_total can reclaim the LRU one under demand (id() keys:
         # sessions aren't hashable-by-value and identity is the point).
-        self._bound: dict[int, VfkitSession] = {}
+        self._bound: dict[int, VmSession] = {}
         self._targets: dict[str, tuple[int, dict[str, Any]]] = {}
         self._filling: set[str] = set()
         self._lock = threading.Lock()
@@ -132,7 +151,7 @@ class VmPool:
 
     # ---- lifecycle ----------------------------------------------------
 
-    def acquire(self, state: str | None = None, **kwargs: Any) -> VfkitSession:
+    def acquire(self, state: str | None = None, **kwargs: Any) -> VmSession:
         """Hand out a VM for this config; prefer one parked with tag
         ``state`` (content-addressed workspace identity, e.g. a kvgit
         commit). On a tag match the returned session has
@@ -365,7 +384,7 @@ class VmPool:
             with self._lock:
                 self._filling.discard(key)
 
-    def release(self, session: VfkitSession) -> None:
+    def release(self, session: VmSession) -> None:
         """Reset the guest and park; a VM that fails reset is torn down.
 
         If the releasing owner stamped ``session.park_state`` (the
@@ -427,7 +446,7 @@ class VmPool:
 
     # ---- internals ----------------------------------------------------
 
-    def _rebind(self, session: VfkitSession, binding: dict[str, Any]) -> None:
+    def _rebind(self, session: VmSession, binding: dict[str, Any]) -> None:
         # Checked again at the assignment point, not just in acquire:
         # these fields bypass the constructor entirely, and a security
         # default that holds on a fresh boot but lapses on a pool hit is
@@ -441,7 +460,7 @@ class VmPool:
         session._closed = False
 
     @staticmethod
-    def _abort_channel(session: VfkitSession) -> None:
+    def _abort_channel(session: VmSession) -> None:
         """Release anyone blocked reading this session's channel.
 
         Only reached for a session that still had an owner, which is the
@@ -476,7 +495,7 @@ class VmPool:
         except OSError:
             pass  # already dead, or never connected: nothing to release
 
-    def _teardown(self, session: VfkitSession, had_owner: bool = False) -> None:
+    def _teardown(self, session: VmSession, had_owner: bool = False) -> None:
         # A parked session already ran close() once (that's what parked
         # it), so clear both the pool hook AND the closed latch — else
         # close() no-ops and the VM process would leak.
@@ -509,7 +528,7 @@ class VmPool:
         except Exception:  # noqa: BLE001 — disposal must not leak a VM
             _log.debug("close failed during teardown", exc_info=True)
 
-    def _expire_locked(self) -> list[VfkitSession]:
+    def _expire_locked(self) -> list[VmSession]:
         """Prune expired idle VMs; returns them for the CALLER to tear
         down after releasing the lock — close() does channel I/O and can
         wait seconds, which must not stall every acquire/release."""
@@ -543,15 +562,7 @@ def shared_pool(session_cls: type | None = None) -> VmPool:
     means uncapped — macOS pages out untouched guest memory, so idle
     VMs cost less than their headline size and a hard cap is opt-in.
     """
-    if session_cls is None:
-        import platform
-
-        if platform.system() == "Darwin":
-            session_cls = VfkitSession
-        else:
-            from .firecracker import FirecrackerSession
-
-            session_cls = FirecrackerSession
+    session_cls = session_cls or _default_cls()
     with _shared_lock:
         pool = _shared.get(session_cls)
         if pool is None:
@@ -562,6 +573,8 @@ def shared_pool(session_cls: type | None = None) -> VmPool:
         return pool
 
 
-def acquire_vfkit(**kwargs: Any) -> VfkitSession:
+def acquire_vfkit(**kwargs: Any) -> VmSession:
     """Acquire from the shared vfkit pool. ``close()`` parks it."""
+    from .vfkit import VfkitSession
+
     return shared_pool(VfkitSession).acquire(**kwargs)

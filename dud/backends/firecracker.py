@@ -1,23 +1,26 @@
 """Rung 3 (Linux/KVM): the guest supervisor inside a Firecracker microVM.
 
 Same guest, same wire protocol, same conformance corpus as rungs 1-2 —
-only the transport changes (the ladder's whole invariant). Firecracker
-is configured over its HTTP-over-unix-socket API (machine-config,
+only the VMM changes (the ladder's whole invariant). Everything above
+the hypervisor lives in :mod:`dud.backends.vm`; this file owns the
+Firecracker API plane and snapshot parking.
+
+Firecracker is configured over HTTP-on-a-unix-socket (machine-config,
 boot-source, drives, vsock, InstanceStart); the guest's
-``dud.guest.init`` dials CID 2 as always, which Firecracker forwards
-to a host unix socket at ``<uds>_<port>``.
+``dud.guest.init`` dials CID 2 as always, which Firecracker forwards to
+a host unix socket at ``<uds>_<port>``.
 
 Deltas from the vfkit transport, all simplifications:
   - erofs roots attach with ``is_read_only`` — no per-boot clone, and
     concurrent VMs of one image share the host page cache (the thing
-    vfkit's missing readOnly flag cost us).
+    vfkit's missing readOnly flag costs).
   - no empty-initrd appeasement: kernel/initrd/cmdline are independent
     API fields, so a block root just omits the initrd.
-  - extra ``disks=`` attach read-only too (they are read-only
-    artifacts by contract; vfkit could only enforce that by cloning).
+  - extra ``disks=`` attach read-only too (they are read-only artifacts
+    by contract; vfkit could only enforce that by cloning).
 
-The scratch volume keeps its per-boot clone (it is writable by
-design); ``_clone_or_copy`` reflinks where the host fs can.
+The scratch volume keeps its per-boot clone (it is writable by design);
+the shared base reflinks it where the host fs can.
 
 Requesting this rung where it can't run fails closed
 (:class:`IsolationUnavailable`): Linux + /dev/kvm + a firecracker
@@ -33,36 +36,15 @@ import platform
 import shutil
 import socket as socketlib
 import subprocess
-import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from ..errors import IsolationUnavailable
-from ..images import build as build_rootfs, dud_home
-from ..images.scratch import _clone_or_copy, promote_clone
 from ..proto import Channel
-from .base import HostSession
-from .vfkit import (
-    _RUNDIR_PREFIX,
-    _host_arch,
-    _medium_cmdline,
-    _resolve_kernel,
-    _scratch_device,
-    _sweep_once,
-)
+from .vm import VSOCK_PORT, BootSpec, VmSession, _write_marker
 
-_VSOCK_PORT = 1024
 _GUEST_CID = 3  # any CID > 2; the guest still dials CID 2 (the host)
-
-
-def _write_marker(path: Path, text: str) -> None:
-    """Atomic marker write (tmp + rename): a concurrent sweep must see
-    the old content or the new content, never a torn/empty file (which
-    reads as a garbage marker and gets the bundle reaped)."""
-    tmp = path.with_name(path.name + f".tmp.{os.getpid()}")
-    tmp.write_text(text)
-    os.replace(tmp, path)
 
 
 def _fc_bin() -> str:
@@ -88,116 +70,40 @@ class _UnixHTTPConnection(http.client.HTTPConnection):
         self.sock = s
 
 
-class FirecrackerSession(HostSession):
+class FirecrackerSession(VmSession):
     """A workspace session backed by a disposable Firecracker microVM."""
 
-    def __init__(
-        self,
-        image: str = "python:3.12-slim",
-        arch: str | None = None,
-        workspace: str = "/workspace",
-        kernel: str | Path | None = None,
-        memory_mib: int = 2048,
-        cpus: int = 2,
-        home: str | Path | None = None,
-        boot_timeout: float = 30.0,
-        packages: list[str] | None = None,
-        debs: list[str] | None = None,
-        disks: list[str | Path] | None = None,
-        medium: str = "auto",
-        scratch: str | Path | None = None,
-        host_objects: dict[str, Any] | None = None,
-        allow: dict[str, set[str]] | None = None,
-        cache: dict[str, bytes] | None = None,
-        on_emit: Callable[[str, Any], None] | None = None,
-    ):
-        super().__init__(host_objects, allow, cache, on_emit)
+    def _preflight(self) -> None:
         if platform.system() != "Linux":
             raise IsolationUnavailable("firecracker rung requires Linux/KVM")
         if not os.access("/dev/kvm", os.R_OK | os.W_OK):
             raise IsolationUnavailable(
                 "/dev/kvm is not accessible (missing, or not in the kvm group)"
             )
-        for disk in disks or []:
-            if not Path(disk).is_file():
-                raise IsolationUnavailable(f"disk image not found: {disk}")
-        if scratch is not None and not Path(scratch).is_file():
-            raise IsolationUnavailable(f"scratch volume not found: {scratch}")
-        fc = self._fc_exe = _fc_bin()
+        self._fc_exe = _fc_bin()
 
-        # Pooling hooks: interface parity with VfkitSession. The shared
-        # pool is vfkit-typed today; firecracker pooling arrives with
-        # the snapshot/restore work, where parking becomes a file.
-        self._pool: Any = None
-        self.park_state: str | None = None
-        self.resumed = False
-        self.frozen = False
-        self._pool_kwargs = {
-            "image": image, "arch": arch, "workspace": workspace,
-            "kernel": kernel, "memory_mib": memory_mib, "cpus": cpus,
-            "home": home, "packages": packages, "debs": debs,
-            "disks": [str(d) for d in disks] if disks else None,
-            "medium": medium,
-            "scratch": str(scratch) if scratch else None,
-        }
-        home = Path(home) if home else dud_home()
-        arch = arch or _host_arch()
-
-        self.build = build_rootfs(
-            image, arch=arch, workspace=workspace, home=home,
-            packages=packages, debs=debs, medium=medium,
-        )
-        kernel_path = _resolve_kernel(kernel, arch, home)
-
-        _sweep_once()
-        # /tmp anchoring is inherited from vfkit (macOS sun_path cap)
-        # and kept for sweep symmetry. Known tradeoff: on distros where
-        # /tmp is tmpfs (Fedora/Arch), the writable scratch clone lives
-        # in RAM for the VM's lifetime — revisit if those become
-        # deployment targets (validated targets: Ubuntu, ubuntu-latest).
-        self._rundir = tempfile.mkdtemp(dir="/tmp", prefix=_RUNDIR_PREFIX)
-        self._api_sock = os.path.join(self._rundir, "fc.sock")
-        self._vsock_uds = os.path.join(self._rundir, "vsock")
-        self._console = os.path.join(self._rundir, "console.log")
-
-        self._scratch_master = Path(scratch) if scratch else None
-        self._scratch_clone: Path | None = None
-        if self._scratch_master is not None:
-            self._scratch_clone = Path(self._rundir) / "scratch.img"
-            _clone_or_copy(self._scratch_master, self._scratch_clone)
-
+    def _listen_path(self) -> str:
         # Guest-initiated vsock connections to port P land on the unix
-        # socket at "<uds>_<P>" — listen before boot so the guest's
-        # early dial has a peer (same discipline as the vfkit rung).
-        self._srv = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
-        self._srv.bind(f"{self._vsock_uds}_{_VSOCK_PORT}")
-        self._srv.listen(1)
+        # socket at "<uds>_<P>".
+        self._vsock_uds = os.path.join(self._rundir, "vsock")
+        return f"{self._vsock_uds}_{VSOCK_PORT}"
 
-        # Console (serial) rides the firecracker process's stdout.
-        self._fc_log = open(self._console, "wb")
-        self._proc = subprocess.Popen(
-            [fc, "--api-sock", self._api_sock],
-            stdout=self._fc_log, stderr=subprocess.STDOUT,
+    def _console_arg(self) -> str:
+        return "console=ttyS0 reboot=k panic=-1"
+
+    def _vmm_log_path(self, spec: BootSpec) -> str:
+        # The guest's serial console rides firecracker's own stdout, so
+        # the VMM log and the console are one file here.
+        return spec.console
+
+    def _start_vmm(self, spec: BootSpec) -> subprocess.Popen:
+        self._api_sock = os.path.join(spec.rundir, "fc.sock")
+        proc = subprocess.Popen(
+            [self._fc_exe, "--api-sock", self._api_sock],
+            stdout=self._vmm_log, stderr=subprocess.STDOUT,
         )
-        Path(self._rundir, "pid").write_text(str(self._proc.pid))
-
-        try:
-            self._configure(kernel_path, workspace, cpus, memory_mib,
-                            disks or [])
-            conn = self._accept(boot_timeout)
-        except Exception as e:
-            self._teardown_vm()
-            tail = self._console_tail()  # empty for pre-InstanceStart failures
-            try:
-                self._srv.close()
-            except OSError:
-                pass
-            shutil.rmtree(self._rundir, ignore_errors=True)
-            raise IsolationUnavailable(
-                f"firecracker boot failed ({e}); console tail:\n{tail}"
-            ) from e
-        self._ch = Channel(conn, handler=self._handle)
-        self._ch.hello_recv()
+        self._configure(spec)
+        return proc
 
     # ---- firecracker API plane ----------------------------------------
 
@@ -231,47 +137,36 @@ class FirecrackerSession(HostSession):
                     raise
                 time.sleep(0.02)
 
-    def _configure(self, kernel_path: Path, workspace: str, cpus: int,
-                   memory_mib: int, disks: list) -> None:
+    def _configure(self, spec: BootSpec) -> None:
         self._await_api()
         self._api("PUT", "/machine-config",
-                  {"vcpu_count": cpus, "mem_size_mib": memory_mib,
+                  {"vcpu_count": spec.cpus, "mem_size_mib": spec.memory_mib,
                    "smt": False})
-        cmdline = (
-            f"console=ttyS0 reboot=k panic=-1 "
-            f"dud.mode=connect dud.cid=2 dud.port={_VSOCK_PORT} "
-            f"dud.root={workspace}"
-        ) + _medium_cmdline(self.build.medium)
-        if self._scratch_clone is not None:
-            cmdline += (
-                f" dud.scratch="
-                f"{_scratch_device(self.build.medium, len(disks))}"
-            )
         boot: dict[str, Any] = {
-            "kernel_image_path": str(kernel_path),
-            "boot_args": cmdline,
+            "kernel_image_path": str(spec.kernel),
+            "boot_args": spec.cmdline,
         }
-        if self.build.medium == "initramfs":
-            boot["initrd_path"] = str(self.build.rootfs_path)
+        if spec.medium == "initramfs":
+            boot["initrd_path"] = str(spec.rootfs)
         self._api("PUT", "/boot-source", boot)
-        if self.build.medium == "erofs":
+        if spec.medium == "erofs":
             # Read-only attach: no clone, and N VMs of one image share
             # the host page cache — structurally what the medium wants.
             self._api("PUT", "/drives/rootfs", {
                 "drive_id": "rootfs", "is_root_device": True,
                 "is_read_only": True,
-                "path_on_host": str(self.build.rootfs_path),
+                "path_on_host": str(spec.rootfs),
             })
-        for i, disk in enumerate(disks):
+        for i, disk in enumerate(spec.disks):
             self._api("PUT", f"/drives/disk{i}", {
                 "drive_id": f"disk{i}", "is_root_device": False,
-                "is_read_only": True, "path_on_host": str(Path(disk)),
+                "is_read_only": True, "path_on_host": str(disk),
             })
-        if self._scratch_clone is not None:
+        if spec.scratch_clone is not None:
             self._api("PUT", "/drives/scratch", {
                 "drive_id": "scratch", "is_root_device": False,
                 "is_read_only": False,
-                "path_on_host": str(self._scratch_clone),
+                "path_on_host": str(spec.scratch_clone),
             })
         self._api("PUT", "/vsock",
                   {"guest_cid": _GUEST_CID, "uds_path": self._vsock_uds})
@@ -283,32 +178,6 @@ class FirecrackerSession(HostSession):
         except IsolationUnavailable:
             pass
         self._api("PUT", "/actions", {"action_type": "InstanceStart"})
-
-    # ---- boot / teardown ------------------------------------------------
-
-    def _accept(self, timeout: float) -> socketlib.socket:
-        self._srv.settimeout(timeout)
-        conn, _ = self._srv.accept()
-        return conn
-
-    def _console_tail(self, n: int = 25) -> str:
-        try:
-            lines = Path(self._console).read_text(errors="replace").splitlines()
-            return "\n".join(lines[-n:])
-        except OSError:
-            return "(no console output)"
-
-    def _teardown_vm(self) -> None:
-        if self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-        try:
-            self._fc_log.close()
-        except OSError:
-            pass
 
     # ---- freeze / thaw ---------------------------------------------------
 
@@ -388,19 +257,18 @@ class FirecrackerSession(HostSession):
         # The dead VMM's socket files linger; both would EADDRINUSE
         # the new process (firecracker refuses an existing API socket,
         # and re-creates the vsock listener from the snapshot config).
-        for stale in (self._api_sock, self._vsock_uds,
-                      f"{self._vsock_uds}_{_VSOCK_PORT}"):
+        for stale in (self._api_sock, self._vsock_uds, self._sock_path):
             try:
                 os.unlink(stale)
             except OSError:
                 pass
         self._srv = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
-        self._srv.bind(f"{self._vsock_uds}_{_VSOCK_PORT}")
+        self._srv.bind(self._sock_path)
         self._srv.listen(1)
-        self._fc_log = open(self._console, "ab")
+        self._vmm_log = open(self._console, "ab")
         self._proc = subprocess.Popen(
             [self._fc_exe, "--api-sock", self._api_sock],
-            stdout=self._fc_log, stderr=subprocess.STDOUT,
+            stdout=self._vmm_log, stderr=subprocess.STDOUT,
         )
         Path(self._rundir, "pid").write_text(str(self._proc.pid))
         try:
@@ -432,59 +300,3 @@ class FirecrackerSession(HostSession):
         except OSError:
             pass
         self._request("resync", {"epoch": time.time()})
-
-    # ---- scratch ---------------------------------------------------------
-
-    def promote_scratch(self) -> None:
-        """See DESIGN.md "The scratch plane": last CLEAN park/shutdown
-        wins; crashed clones die with the rundir."""
-        if self._scratch_master is None or self._scratch_clone is None:
-            return
-        promote_clone(self._scratch_master, self._scratch_clone,
-                      tag=f"{id(self):x}")
-
-    def close(self, park_state: str | None = None) -> None:
-        if park_state is not None:
-            self.park_state = park_state
-        if self._closed:
-            return
-        self._closed = True
-        if self._pool is not None:  # future: snapshot-backed parking
-            self._pool.release(self)
-            return
-        if self.frozen:
-            # Discarding a frozen park is a disposal path: the guest
-            # never gets a clean shutdown, so no scratch promotion —
-            # the snapshot dies with its rundir.
-            try:
-                self._fc_log.close()
-            except OSError:
-                pass
-            shutil.rmtree(self._rundir, ignore_errors=True)
-            return
-        clean = False
-        try:
-            self._request("shutdown")
-            clean = True
-        except Exception:  # noqa: BLE001 — a guest mid-death answers anything
-            pass
-        try:
-            self._ch.close()
-        except OSError:
-            pass
-        try:
-            self._proc.wait(timeout=8)
-        except subprocess.TimeoutExpired:
-            self._teardown_vm()
-            clean = False
-        if clean:
-            try:
-                self.promote_scratch()
-            except OSError:
-                pass
-        for closeable in (self._srv, self._fc_log):
-            try:
-                closeable.close()
-            except OSError:
-                pass
-        shutil.rmtree(self._rundir, ignore_errors=True)
