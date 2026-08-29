@@ -205,11 +205,23 @@ def test_ping_reports_the_live_renderer(session):
     assert session.ping()["renderer"] in ("reprobate", "plain")
 
 
-def test_ping_reports_the_outputs_hook(session):
-    """Same reason as the renderer: rich `ui` flattening falls back to
-    nothing when the image ships no dud_outputs, and a consumer needs
-    to see that rather than wonder where its charts went."""
-    assert session.ping()["outputs_hook"] in ("dud_outputs", "none")
+def test_ping_reports_no_hook_when_none_is_named(session):
+    assert session.ping()["outputs_hook"] is None
+
+
+def test_ping_shows_a_hook_that_did_not_resolve(make_session):
+    """The case that needs reporting: an exec whose hook failed to
+    import behaves exactly like one with no hook, so a typo in a
+    package name is otherwise invisible."""
+    s = make_session(outputs_hook="nope_missing.mod:flatten")
+    assert s.ping()["outputs_hook"] == "nope_missing.mod:flatten (not found)"
+
+
+def test_ping_names_a_malformed_hook_spec(make_session):
+    """A bare dotted path is ambiguous about where the module ends, so
+    it is refused rather than guessed at — and said so."""
+    s = make_session(outputs_hook="pkg.mod.flatten")
+    assert "not a 'pkg.module:function' spec" in s.ping()["outputs_hook"]
 
 
 def test_rich_values_without_a_hook_are_reported_not_invented(session):

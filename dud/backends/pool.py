@@ -71,7 +71,8 @@ _log = logging.getLogger(__name__)
 
 # Host-side binding kwargs: per-session state rebound on reuse, never
 # part of the VM's identity.
-_BINDING_KEYS = ("host_objects", "allow", "cache", "on_emit")
+_BINDING_KEYS = ("host_objects", "allow", "cache", "on_emit",
+                 "outputs_hook")
 # Constructor kwargs that don't change what was booted.
 _NON_IDENTITY = ("boot_timeout",)
 
@@ -456,6 +457,7 @@ class VmPool:
         session.host_objects = binding["host_objects"] or {}
         session.allow = allow
         session.on_emit = binding["on_emit"]
+        session.outputs_hook = binding["outputs_hook"]
         session.emits = []
         session._closed = False
 
