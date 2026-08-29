@@ -128,6 +128,33 @@ Python printed.
 bound what one exec can send back so a runaway print loop can't flood
 the channel, and they sit far above anything you'd show a model.
 
+### Rich values out
+
+`outputs` carries what the codec can represent. A live plotly figure or
+a DataFrame can't cross it, so those come back named in
+`outputs_skipped` with their type — dud tells you what it dropped
+rather than guessing at a shape for it.
+
+To get them out, put them in a `ui` dict and give the image a
+`dud_outputs` package:
+
+```python
+# in the image, via packages=["your-guest-pkg"]
+def flatten(ui: dict, workspace: str) -> set[str]:
+    """Write what you want to files under `workspace`; return the
+    names you handled."""
+```
+
+The guest offers `ui` to that hook, drops whatever it claims, and lets
+the rest harvest through. Anything it wrote is an ordinary workspace
+write, so it rides the diff like any other file.
+
+Which objects, in what format, under what path is **your** convention —
+dud has no opinion, the same way it has none about your store. Without
+a hook nothing is flattened, and `ping()["outputs_hook"]` says whether
+one is live. Serializing has to happen guest-side for the same physical
+reason rendering does: it needs the live object.
+
 ### Pooling and parking
 
 `pooled=True` reuses VMs across sessions from a process-wide warm
