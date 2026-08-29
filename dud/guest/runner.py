@@ -215,34 +215,79 @@ class HostProxy:
         return f"<host object {self._name!r}>"
 
 
-def _from_image(module: str, attr: str):
+def _workspace_root(workspace: str | None) -> str | None:
+    """The one directory a hook must not be loaded from: the agent's.
+
+    Deliberately NOT cwd, though cwd is still stripped from
+    ``sys.path``. The two are the same directory in the runner and very
+    different elsewhere: on the subprocess rung the supervisor inherits
+    the host's cwd, so treating that as agent-writable refused every
+    module in the project's own virtualenv — including reprobate, which
+    made ``ping`` report "plain" while execs were still rendering.
+    """
+    cand = workspace or os.environ.get("DUD_WORKSPACE")
+    if not cand:
+        return None  # unknown: fall back to path filtering alone
+    try:
+        real = os.path.realpath(cand)
+    except OSError:
+        return None
+    return real if real != os.sep else None
+
+
+def _is_agent_authored(origin: str, root: str) -> bool:
+    try:
+        real = os.path.realpath(origin)
+    except OSError:
+        return True  # can't tell where it came from: refuse it
+    return real == root or real.startswith(root + os.sep)
+
+
+def _from_image(module: str, attr: str, workspace: str | None = None):
     """Resolve ``module.attr`` from the IMAGE, never from workspace files.
 
     dud has two extension points — the print renderer and the outputs
     hook — and both are ordinary imports, which is exactly the problem.
     cwd is the workspace and ``python -m`` puts cwd on sys.path, so a
-    stray ``reprobate.py`` or ``dud_outputs.py`` beside the agent's own
-    code would shadow the real package, and dud would be importing
-    agent-authored code into its own print or output path. Stripping
-    the workspace entries here means neither extension point can be
-    hijacked by a file an agent wrote, and means the two cannot drift
-    apart later.
+    file beside the agent's own code can shadow the real package, and
+    dud would be running agent-authored code as its own print or output
+    path.
 
-    ``getattr``, not attribute access: if a shadow resolves anyway (user
-    code already imported one, so it is in sys.modules), a missing
-    attribute degrades to absent. A missing ``render`` used to raise
-    AttributeError out of ``print()`` and fail an exec whose only crime
-    was printing.
+    Two defenses, because one is not enough. Stripping the workspace
+    from ``sys.path`` stops the shadow being *found* — but only for an
+    import that actually searches the path. Agent code runs BEFORE the
+    harvest, so it can ``import`` the shadow itself first, and
+    ``import_module`` then returns it straight out of ``sys.modules``
+    without consulting ``sys.path`` at all. (Measured, not theorized:
+    an agent that wrote its own hook module and imported it had its
+    function called in place of the configured one.) So the resolved
+    module's ``__file__`` is checked too, and one living under the
+    workspace is refused however it got there.
+
+    A namespace package has no ``__file__`` and no code of its own, so
+    there is nothing to hijack and nothing to check.
+
+    ``getattr``, not attribute access: a module that resolves without
+    the attribute degrades to absent. A missing ``render`` used to
+    raise AttributeError out of ``print()`` and fail an exec whose only
+    crime was printing.
     """
     import importlib
 
     saved = list(sys.path)
+    here = os.getcwd()
+    root = _workspace_root(workspace)
     try:
-        here = os.getcwd()
-        ws = os.environ.get("DUD_WORKSPACE")
-        sys.path = [p for p in saved
-                    if p not in ("", ".", here) and (not ws or p != ws)]
-        return getattr(importlib.import_module(module), attr, None)
+        sys.path = [
+            p for p in saved
+            if p not in ("", ".", here)
+            and (root is None or os.path.realpath(p) != root)
+        ]
+        mod = importlib.import_module(module)
+        origin = getattr(mod, "__file__", None)
+        if origin and root and _is_agent_authored(origin, root):
+            return None
+        return getattr(mod, attr, None)
     except Exception:  # noqa: BLE001 — an absent extension is never fatal
         return None
     finally:
@@ -526,11 +571,19 @@ def _offer_outputs(harvest: dict, spec: str | None) -> dict:
     if flatten is None or not harvest:
         return harvest
     workspace = os.environ.get("DUD_WORKSPACE") or os.getcwd()
+    # The hook is handed a COPY. It may rewrite bindings in place, and
+    # a hook that rewrites one and then raises on the next would
+    # otherwise leave those edits in the dict we fall back to — so
+    # "treated as having handled nothing" would quietly not be true.
+    # Shallow, deliberately: a hook mutating a nested container it was
+    # handed is editing the agent's own object, which is no more
+    # rollback-able than the files it already wrote.
+    offered = dict(harvest)
     try:
-        handled = set(flatten(harvest, workspace) or ())
+        handled = set(flatten(offered, workspace) or ())
     except Exception:  # noqa: BLE001 — a hook over agent data, never fatal
         return harvest
-    return {k: v for k, v in harvest.items() if k not in handled}
+    return {k: v for k, v in offered.items() if k not in handled}
 
 
 def run(channel: Channel, req: dict) -> dict:

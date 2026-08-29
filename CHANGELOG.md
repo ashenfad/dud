@@ -40,7 +40,13 @@ record for those.
   literally named `reprobate` — name-squatting as an extension
   mechanism. `ping()["renderer"]` reports which step of the chain (your
   hook, reprobate, plain `str`) is actually live, including when a
-  named hook failed to import.
+  named hook failed to resolve.
+
+- Hook resolution refuses a module that lives in the workspace even
+  when the agent imported it first, so a file agent code wrote cannot
+  become dud's print or output path. `ping()` resolves the same way an
+  exec does, so it no longer reports a hook as live when only its
+  module (and not its function) exists.
 
 ### Changed behavior
 

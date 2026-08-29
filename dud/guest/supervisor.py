@@ -317,21 +317,20 @@ class Supervisor:
 
         Three possible steps — the caller's hook, reprobate, plain
         ``str`` — and the point of reporting is to say which one is
-        live. A named hook that failed to import still renders (the
+        live. A named hook that failed to resolve still renders (the
         chain continues), so without this the caller sees perfectly
         reasonable output and never learns their hook was never used.
         """
-        base = "reprobate" if self._has("reprobate") else "plain"
+        from .runner import _DEFAULT_RENDERER
+
+        base = ("reprobate" if self._has(":".join(_DEFAULT_RENDERER))
+                else "plain")
         if not spec:
             return base
-        try:
-            from .runner import split_hook_spec
-
-            module, _attr = split_hook_spec(spec)
-        except ValueError:
-            return f"{spec} (not a 'pkg.module:function' spec; using {base})"
-        if self._has(module):
+        if self._has(spec):
             return spec
+        if ":" not in spec:
+            return f"{spec} (not a 'pkg.module:function' spec; using {base})"
         return f"{spec} (not found; using {base})"
 
     def _hook_status(self, spec: str | None) -> str | None:
@@ -345,33 +344,36 @@ class Supervisor:
         """
         if not spec:
             return None
-        try:
-            from .runner import split_hook_spec
-
-            module, _attr = split_hook_spec(spec)
-        except ValueError:
+        if self._has(spec):
+            return spec
+        if ":" not in spec:
             return f"{spec} (not a 'pkg.module:function' spec)"
-        return spec if self._has(module) else f"{spec} (not found)"
+        return f"{spec} (not found)"
 
-    @staticmethod
-    def _has(module: str) -> bool:
-        """Can this image offer ``module``?
+    def _has(self, spec: str) -> bool:
+        """Would an exec actually get a usable callable for ``spec``?
 
-        Both of dud's extension points — the print renderer and the
-        outputs hook — fall back silently when the image doesn't ship
-        them, and a fallback nobody can see is one tests pass over. So
-        ping reports each, for the same reason it reports which staging
-        strategy is live.
+        Resolved through the runner's own ``_from_image``, not through
+        ``find_spec``, and that is the whole point: this field exists to
+        say what is live, so answering it any other way than the runner
+        does is how it comes to lie. find_spec only proves a module is
+        importable — it said "live" for a hook whose function name was
+        misspelled, and said "not found" for one an agent had hijacked
+        and which was really running.
 
-        find_spec rather than an import: answering a ping must not pay
-        for a module the exec may never ask for.
+        The cost is that PID 1 imports the caller's hook once and keeps
+        it. Accepted: the caller named this module deliberately, the
+        runner is going to import it on the first exec anyway, and a
+        diagnostic that can disagree with reality is worth less than
+        the memory it saves.
         """
-        import importlib.util
+        from .runner import _from_image, split_hook_spec
 
         try:
-            return importlib.util.find_spec(module) is not None
-        except (ImportError, ValueError):
+            module, attr = split_hook_spec(spec)
+        except ValueError:
             return False
+        return _from_image(module, attr, workspace=str(self.work)) is not None
 
     def do_shutdown(self, body, bins):
         shutdown_served()
