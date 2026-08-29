@@ -7,21 +7,23 @@ record for those.
 
 ### Breaking
 
-- **Rich `ui` flattening moved out of dud into the image.** The guest
-  no longer knows what a plotly figure or a pandas DataFrame is. It
-  offers the `ui = {...}` dict to an optional `dud_outputs.flatten(ui,
-  workspace) -> set[str]` supplied by the image, and drops whatever
-  that returns; without one, nothing is flattened and unrepresentable
-  values land in `outputs_skipped` with their type names.
+- **Rich value flattening moved out of dud into the image.** The guest
+  no longer knows what a plotly figure or a pandas DataFrame is, nor
+  that anyone calls their output dict `ui`. It offers every top-level
+  binding to an optional `dud_outputs.flatten(bindings, workspace) ->
+  set[str]` supplied by the image and drops the names it returns
+  (bindings may also be rewritten in place); without a hook, nothing is
+  flattened and unrepresentable values land in `outputs_skipped` with
+  their type names.
 
   If you relied on the built-in behavior, layer a package providing
   `dud_outputs` (`packages=["your-guest-pkg"]`). `ping()["outputs_hook"]`
   reports `"dud_outputs"` or `"none"`, so an absent hook is visible
   rather than a mystery about where the charts went.
 
-  Why: which objects flatten, into what shape, under what path is the
-  consuming layer's convention, not dud's. The old module encoded one
-  consumer's choices — `ui/<name>.plotly.json`, `head(200)` with
+  Why: which objects flatten, into what shape, under what path — and
+  which binding collects them — is the consuming layer's convention,
+  not dud's. The old module encoded one consumer's choices — `ui/<name>.plotly.json`, `head(200)` with
   `orient="split"`, an 8 MB cap "for parity with the host renderer" in
   another repo — which made dud know about the layer above it. It is
   now on the same footing as the print renderer: optional, layered

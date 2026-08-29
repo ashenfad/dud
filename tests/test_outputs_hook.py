@@ -1,12 +1,12 @@
-"""The outputs hook: dud offers rich `ui` values, the image shapes them.
+"""The outputs hook: dud offers the bindings, the image shapes them.
 
 dud used to carry this itself, in a guest module that knew plotly
 figures serialize to `ui/<name>.plotly.json` and that DataFrames get
-`head(200)`. Those are the consuming layer's conventions, so they now
-live in a package the image supplies. What is tested here is dud's half
-of the contract: find the hook, offer it the values, respect what it
-claims, survive it misbehaving, and never resolve it from files the
-agent wrote.
+`head(200)` — and that the magic dict was called `ui`. Formats and
+vocabulary both belong to whoever consumes the diff, so both moved into
+a package the image supplies. What is tested here is dud's half: find
+the hook, offer it everything, respect what it claims, survive it
+misbehaving, and never resolve it from files the agent wrote.
 """
 
 from __future__ import annotations
@@ -43,49 +43,70 @@ def test_no_hook_means_nothing_is_flattened(monkeypatch):
     unrepresentable values reported in outputs_skipped, not invented
     files in its workspace."""
     monkeypatch.delitem(sys.modules, "dud_outputs", raising=False)
-    g = {"ui": {"chart": object()}}
-    runner._flatten_ui(g)
-    assert set(g["ui"]) == {"chart"}  # untouched, still unrepresentable
+    harvest = {"chart": object()}
+    assert runner._offer_outputs(harvest) == harvest
 
 
 def test_handled_names_are_dropped_and_the_rest_crosses(monkeypatch):
-    """The partition: what the hook claims it wrote is removed from
-    `ui`, and the representable remainder still harvests to the host."""
+    """The partition: what the hook claims is removed from the harvest,
+    and the rest still crosses to the host."""
     seen = {}
 
-    def flatten(ui, workspace):
-        seen["ui"], seen["workspace"] = ui, workspace
+    def flatten(bindings, workspace):
+        seen["bindings"], seen["workspace"] = dict(bindings), workspace
         return {"chart"}
 
     _install(monkeypatch, flatten)
     monkeypatch.setenv("DUD_WORKSPACE", "/workspace")
-    g = {"ui": {"chart": object(), "cards": [{"label": "x", "value": 1}]}}
-    runner._flatten_ui(g)
-    assert set(g["ui"]) == {"cards"}
-    assert set(seen["ui"]) == {"chart", "cards"}  # offered everything
+    out = runner._offer_outputs({"chart": object(), "n": 7})
+    assert set(out) == {"n"}
+    assert set(seen["bindings"]) == {"chart", "n"}  # offered everything
     assert seen["workspace"] == "/workspace"
+
+
+def test_dud_names_no_binding(monkeypatch):
+    """The hook sees every top-level binding, not one dud picked. An
+    earlier cut passed only a binding literally named `ui`, which moved
+    the formats out while leaving the vocabulary in."""
+    seen = {}
+    _install(monkeypatch, lambda b, ws: seen.update(b) or set())
+    runner._offer_outputs({"fig": object(), "ui": {}, "whatever": 1})
+    assert set(seen) == {"fig", "ui", "whatever"}
+
+
+def test_a_hook_may_rewrite_a_binding_in_place(monkeypatch):
+    """How a `ui = {...}`-style convention is expressed now: write some
+    of the dict to files, put back the remainder, claim nothing at the
+    top level. dud never learns the word."""
+    def flatten(bindings, workspace):
+        ui = bindings.get("ui")
+        if isinstance(ui, dict):
+            bindings["ui"] = {k: v for k, v in ui.items() if k != "chart"}
+        return set()
+
+    _install(monkeypatch, flatten)
+    out = runner._offer_outputs({"ui": {"chart": object(), "n": 1}})
+    assert out["ui"] == {"n": 1}
 
 
 def test_a_hook_that_raises_does_not_fail_the_exec(monkeypatch):
     """It runs third-party serializers over agent data, so it will
     raise eventually. An exec must not fail because a chart could not
     be written."""
-    def flatten(ui, workspace):
+    def flatten(bindings, workspace):
         raise RuntimeError("boom")
 
     _install(monkeypatch, flatten)
-    g = {"ui": {"chart": object()}}
-    runner._flatten_ui(g)
-    assert set(g["ui"]) == {"chart"}
+    harvest = {"chart": object()}
+    assert runner._offer_outputs(harvest) == harvest
 
 
 def test_a_hook_returning_none_is_tolerated(monkeypatch):
     """`-> set[str]` is the contract; a hook that forgets to return is
     a bug in the hook, not grounds for taking down the exec."""
-    _install(monkeypatch, lambda ui, workspace: None)
-    g = {"ui": {"chart": object()}}
-    runner._flatten_ui(g)
-    assert set(g["ui"]) == {"chart"}
+    _install(monkeypatch, lambda bindings, workspace: None)
+    harvest = {"chart": object()}
+    assert runner._offer_outputs(harvest) == harvest
 
 
 def test_a_module_without_flatten_is_absent(monkeypatch):
@@ -95,12 +116,13 @@ def test_a_module_without_flatten_is_absent(monkeypatch):
     assert runner._outputs_hook() is None
 
 
-def test_empty_or_non_dict_ui_is_left_alone(monkeypatch):
-    _install(monkeypatch, lambda ui, ws: {"anything"})
-    for value in ({}, None, "not a dict", 7):
-        g = {"ui": value}
-        runner._flatten_ui(g)
-        assert g["ui"] == value
+def test_an_empty_harvest_never_reaches_the_hook(monkeypatch):
+    """An exec that bound nothing has nothing to offer; don't pay for
+    an import, and don't hand a hook an empty dict to reason about."""
+    called = []
+    _install(monkeypatch, lambda b, ws: called.append(1) or {"x"})
+    assert runner._offer_outputs({}) == {}
+    assert not called
 
 
 # ---- resolution hygiene -------------------------------------------------

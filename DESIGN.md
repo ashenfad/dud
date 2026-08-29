@@ -260,13 +260,13 @@ Population is per-runtime sugar over the language-neutral `emit` service
 (a well-known channel in the exec environment — **not stdout markers**,
 which agent code echoing untrusted data could forge). The Python runner
 harvests top-level bindings post-exec and emits what's
-codec-representable; the `ui = {...}` convention works unchanged, with
-figures flattening guest-side — through a hook the *image* supplies
-(`dud_outputs.flatten`), not through anything dud knows about plotly.
-Which objects flatten, into what shape, under what path is the
-consuming layer's convention; dud's part is offering the values to
-whoever holds one, on the same footing as the print renderer. A future
-Node runner would harvest
+codec-representable, offering the whole harvest first to a hook the
+*image* supplies (`dud_outputs.flatten`). A `ui = {...}` convention
+still works, but as something the hook implements rather than something
+dud knows: which objects flatten, into what shape, under what path, and
+which binding collects them, all belong to whoever consumes the diff.
+dud's part is offering the values to whoever holds a convention, on the
+same footing as the print renderer. A future Node runner would harvest
 `exports` or explicit `emit()` calls — an image plus a small runner, no
 core changes. Bash gets a `dud-emit` CLI or writes files and returns
 refs.

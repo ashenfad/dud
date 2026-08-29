@@ -212,16 +212,17 @@ def test_ping_reports_the_outputs_hook(session):
     assert session.ping()["outputs_hook"] in ("dud_outputs", "none")
 
 
-def test_rich_ui_without_a_hook_is_reported_not_invented(session):
+def test_rich_values_without_a_hook_are_reported_not_invented(session):
     """dud's zero-knowledge default. Without an image hook, a value
     that cannot cross the codec is named in outputs_skipped with its
     type — never guessed at, never written somewhere the consumer did
-    not ask for."""
-    r = session.python("class Fig:\n    pass\nui = {'chart': Fig()}")
+    not ask for. Note the binding is not called `ui`: dud names no
+    binding, so the default holds whatever the caller called it."""
+    r = session.python("class Fig:\n    pass\nchart = Fig()")
     assert r.ok, r.error
-    assert "ui" in r.outputs_skipped
-    ls = session.shell("ls ui 2>/dev/null || true")
-    assert ls.transcript.strip() == ""
+    assert r.outputs_skipped.get("chart") == "Fig"
+    ls = session.shell("ls 2>/dev/null || true")
+    assert "ui" not in ls.transcript
 
 
 def test_no_render_budget_means_plain_text(session):
