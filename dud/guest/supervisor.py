@@ -308,26 +308,30 @@ class Supervisor:
     def do_ping(self, body, bins):
         return {"pong": True, "workspace": str(self.work),
                 "staging": self.stage.kind,
-                "renderer": self._renderer_kind(),
+                "renderer": "reprobate" if self._has("reprobate") else "plain",
+                "outputs_hook": ("dud_outputs" if self._has("dud_outputs")
+                                 else "none"),
                 "view_worker": self._worker_state()}, []
 
     @staticmethod
-    def _renderer_kind() -> str:
-        """Which print renderer this image can offer.
+    def _has(module: str) -> bool:
+        """Can this image offer ``module``?
 
-        Reported for the same reason ``staging`` is: rendering falls
-        back silently when reprobate isn't installed, and a fallback
-        nobody can see is one tests pass over. find_spec rather than an
-        import — answering a ping must not pay for a module the exec
-        may never ask for.
+        Both of dud's extension points — the print renderer and the
+        outputs hook — fall back silently when the image doesn't ship
+        them, and a fallback nobody can see is one tests pass over. So
+        ping reports each, for the same reason it reports which staging
+        strategy is live.
+
+        find_spec rather than an import: answering a ping must not pay
+        for a module the exec may never ask for.
         """
         import importlib.util
 
         try:
-            found = importlib.util.find_spec("reprobate") is not None
+            return importlib.util.find_spec(module) is not None
         except (ImportError, ValueError):
-            found = False
-        return "reprobate" if found else "plain"
+            return False
 
     def do_shutdown(self, body, bins):
         shutdown_served()
