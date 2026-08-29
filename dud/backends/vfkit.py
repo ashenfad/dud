@@ -58,7 +58,7 @@ class VfkitSession(VmSession):
     def _console_arg(self) -> str:
         return "console=hvc0 random.trust_cpu=on"
 
-    def _start_vmm(self, spec: BootSpec) -> subprocess.Popen:
+    def _spawn_vmm(self, spec: BootSpec) -> subprocess.Popen:
         args = [
             _vfkit_bin(),
             "--cpus", str(spec.cpus), "--memory", str(spec.memory_mib),

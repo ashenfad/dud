@@ -96,14 +96,18 @@ class FirecrackerSession(VmSession):
         # the VMM log and the console are one file here.
         return spec.console
 
-    def _start_vmm(self, spec: BootSpec) -> subprocess.Popen:
+    def _spawn_vmm(self, spec: BootSpec) -> subprocess.Popen:
         self._api_sock = os.path.join(spec.rundir, "fc.sock")
-        proc = subprocess.Popen(
+        return subprocess.Popen(
             [self._fc_exe, "--api-sock", self._api_sock],
             stdout=self._vmm_log, stderr=subprocess.STDOUT,
         )
+
+    def _configure_vmm(self, spec: BootSpec) -> None:
+        """Everything here talks to a VMM that is already running, and
+        any of it can be rejected — which is why it is not part of the
+        spawn hook: the base has to hold a killable handle first."""
         self._configure(spec)
-        return proc
 
     # ---- firecracker API plane ----------------------------------------
 
