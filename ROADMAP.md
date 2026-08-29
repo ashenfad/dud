@@ -78,12 +78,6 @@ rendering) across rungs in one corpus — become valuable exactly here.
 
 ### Loose ends
 
-- **No host-side deadline.** Death recovers — the channel closes and
-  the owner re-acquires — but a *hang* doesn't: `Channel` sets no
-  socket timeout, so a wedged guest blocks the host forever. Needs a
-  decision about legitimately slow calls (`push_tree` on a large tree)
-  before it can be a single number.
-
 - **Boot latency**: ~2.5 s of the 3 s initramfs boot is the guest
   retrying its vsock dial until the VMM's bridge is ready (erofs boots
   in ~1 s). Find or add a readiness signal. Matters less now that pool
