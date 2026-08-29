@@ -35,8 +35,10 @@ class Session(HostSession):
         cache: dict[str, bytes] | None = None,
         on_emit: Callable[[str, Any], None] | None = None,
         outputs_hook: str | None = None,
+        render_hook: str | None = None,
     ):
-        super().__init__(host_objects, allow, cache, on_emit, outputs_hook)
+        super().__init__(host_objects, allow, cache, on_emit, outputs_hook,
+                         render_hook)
         self._tmp = None
         if root is None:
             self._tmp = tempfile.TemporaryDirectory(prefix="dud-")

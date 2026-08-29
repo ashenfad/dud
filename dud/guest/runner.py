@@ -249,25 +249,45 @@ def _from_image(module: str, attr: str):
         sys.path = saved
 
 
-_RENDERER: Any = None  # unresolved; False once known absent
+# Resolved renderers, keyed by spec ("" = whatever the default chain
+# finds). Cached for the same reason hooks are: the fork template
+# outlives one exec.
+_RENDERERS: dict[str, Any] = {}
+
+#: The renderer dud ships against when the caller names none. Unlike the
+#: outputs hook, dud *defines* this contract — ``render(obj, budget)``
+#: exists because ``render_budget`` does — so naming a default
+#: implementation of it is ordinary. See DESIGN, "Policy collapses to
+#: the image".
+_DEFAULT_RENDERER = ("reprobate", "render")
 
 
-def _renderer():
-    """reprobate's budget-controlled repr, if the image has it.
+def _renderer(spec: str | None):
+    """A budget-controlled repr: the caller's, else reprobate, else none.
 
-    Resolved lazily so an exec that never asks for rendering pays
-    nothing, and cached because the runner is one process per exec (the
-    fork template warms it for view execs).
+    Three steps, best available first, because each is a real
+    improvement on the next and none of them is a policy decision an
+    agent's output should turn on. ``ping()`` reports which one is
+    actually live, so landing a step lower than intended is visible
+    rather than a silent difference in what an agent sees.
 
-    Optional by design: dud keeps no dependencies, and the image is the
-    config surface. Callers layer ``packages=["reprobate"]`` when they
-    want it; ``ping()`` reports which renderer is live, so the fallback
-    is observable rather than a silent difference in what an agent sees.
+    Resolved lazily, so an exec that never asks for rendering pays
+    nothing, and cached per spec.
     """
-    global _RENDERER
-    if _RENDERER is None:
-        _RENDERER = _from_image("reprobate", "render") or False
-    return _RENDERER or None
+    key = spec or ""
+    if key not in _RENDERERS:
+        resolved = None
+        if spec:
+            try:
+                module, attr = split_hook_spec(spec)
+            except ValueError:
+                resolved = None
+            else:
+                resolved = _from_image(module, attr)
+        if resolved is None:
+            resolved = _from_image(*_DEFAULT_RENDERER)
+        _RENDERERS[key] = resolved or False
+    return _RENDERERS[key] or None
 
 
 # Resolved hooks, keyed by spec: the fork template serves many execs and
@@ -348,8 +368,13 @@ class PrintCapture:
 
     def __init__(self, stdout: io.StringIO, entry_cap: int,
                  max_entries: int, total_cap: int,
-                 render_budget: int | None = None):
+                 render_budget: int | None = None,
+                 render_hook: str | None = None):
         self.stdout = stdout
+        # "pkg.module:function" the caller named, or None for the
+        # default chain. Carried rather than resolved here: an exec
+        # that never renders must not pay for the import.
+        self.render_hook = render_hook
         self.entry_cap = entry_cap
         self.max_entries = max_entries
         # Per-entry render budget, supplied by the host. Absent means
@@ -396,7 +421,8 @@ class PrintCapture:
         stream is where a summary belongs (the Jupyter split).
         """
         try:
-            render = _renderer() if self.render_budget else None
+            render = (_renderer(self.render_hook)
+                      if self.render_budget else None)
             if render is None or not objs:
                 return plain, False
             budget, parts, used = self.render_budget, [], 0
@@ -529,7 +555,7 @@ def run(channel: Channel, req: dict) -> dict:
     # supervisor is reading, and the only way anything escapes a kill.
     stdout_buf = _TeeBuffer(sys.stdout)
     prints = PrintCapture(stdout_buf, entry_cap, max_entries, total_cap,
-                          render_budget)
+                          render_budget, req.get("render_hook"))
 
     g: dict[str, Any] = {"__name__": "__dud__", "__builtins__": __builtins__}
     injected = {"__name__", "__builtins__", "print", "cache", "emit"}

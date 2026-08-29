@@ -240,6 +240,10 @@ class HostSession:
       can't carry into workspace files. dud supplies no default and
       knows no format; ``ping()["outputs_hook"]`` reports whether the
       named hook resolved.
+    - ``render_hook``: ``"pkg.module:function"`` in the guest image,
+      used to render print entries to ``render_budget`` characters.
+      Overrides the default chain (reprobate, then plain ``str``);
+      ``ping()["renderer"]`` reports which step is live.
     - ``on_emit``: callback(name, value) for guest emits; also collected
       in ``self.emits``. Emits are *events*, not state: they arrive live
       mid-exec and are kept even when the exec later fails — unlike
@@ -256,6 +260,7 @@ class HostSession:
         cache: dict[str, bytes] | None = None,
         on_emit: Callable[[str, Any], None] | None = None,
         outputs_hook: str | None = None,
+        render_hook: str | None = None,
     ):
         self.cache: dict[str, bytes] = cache if cache is not None else {}
         # "pkg.module:function" naming a hook the IMAGE provides, which
@@ -265,6 +270,13 @@ class HostSession:
         # and so a typo is something ping() can show you instead of
         # looking identical to wanting no hook at all.
         self.outputs_hook = outputs_hook
+        # The other extension point, same spelling. Overrides the
+        # default renderer chain (reprobate, then plain str) rather
+        # than replacing it: dud DEFINES this contract — render(obj,
+        # budget) exists because render_budget does — so it can ship a
+        # default implementation of it. The outputs hook has none,
+        # because there any default would be somebody's convention.
+        self.render_hook = render_hook
         self.host_objects = host_objects or {}
         self.allow = require_allowlist(host_objects, allow)
         self.emits: list[tuple[str, Any]] = []
@@ -481,6 +493,7 @@ class HostSession:
              "caps": caps or {}, "render_budget": render_budget,
              "host_objects": sorted(self.host_objects),
              "outputs_hook": self.outputs_hook,
+             "render_hook": self.render_hook,
              "cache_readonly": cache_readonly, "fs_readonly": fs_readonly},
         )
         if body.get("ok"):
@@ -537,7 +550,8 @@ class HostSession:
         behaves exactly like no hook at all, so the difference has to
         be visible somewhere. Here.
         """
-        body, _ = self._request("ping", {"outputs_hook": self.outputs_hook})
+        body, _ = self._request("ping", {"outputs_hook": self.outputs_hook,
+                                         "render_hook": self.render_hook})
         return body
 
     def close(self) -> None:  # pragma: no cover - overridden

@@ -284,8 +284,10 @@ class VmSession(HostSession):
         cache: dict[str, bytes] | None = None,
         on_emit: Callable[[str, Any], None] | None = None,
         outputs_hook: str | None = None,
+        render_hook: str | None = None,
     ):
-        super().__init__(host_objects, allow, cache, on_emit, outputs_hook)
+        super().__init__(host_objects, allow, cache, on_emit, outputs_hook,
+                         render_hook)
         self._preflight()
         for disk in disks or []:
             # Validate up front: fail before any pull/build work is spent.

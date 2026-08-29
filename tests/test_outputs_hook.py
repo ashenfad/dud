@@ -28,10 +28,10 @@ def _unresolved():
     """Hooks cache per spec, and the fork template outlives one exec;
     tests need each case resolved fresh."""
     runner._OUTPUTS_HOOKS.clear()
-    runner._RENDERER = None
+    runner._RENDERERS.clear()
     yield
     runner._OUTPUTS_HOOKS.clear()
-    runner._RENDERER = None
+    runner._RENDERERS.clear()
 
 
 def _install(monkeypatch, flatten, module: str = "acme_outputs.hooks"):
@@ -216,3 +216,45 @@ def test_resolution_restores_sys_path(monkeypatch):
     before = list(sys.path)
     runner._from_image("acme_outputs", "flatten")
     assert sys.path == before
+
+
+# ---- the renderer's fallback chain --------------------------------------
+#
+# The asymmetry with the outputs hook is deliberate. dud DEFINES the
+# render contract — render(obj, budget) exists because render_budget
+# does — so it can ship a default implementation of it. The outputs
+# hook gets no default, because there any default would be somebody's
+# convention. Rule: name a default when dud defines the operation;
+# require the caller to name one when the consumer defines the meaning.
+
+
+def test_a_named_renderer_wins_over_the_default(monkeypatch):
+    _install(monkeypatch, None)  # the package exists...
+    sys.modules["acme_outputs.hooks"].render = lambda obj, budget=0: "mine"
+    monkeypatch.setattr(runner, "_DEFAULT_RENDERER", ("reprobate", "render"))
+    render = runner._renderer("acme_outputs.hooks:render")
+    assert render(object()) == "mine"
+
+
+def test_an_unnamed_renderer_falls_back_to_the_default(monkeypatch):
+    _install(monkeypatch, None, "fallback_pkg.r")
+    sys.modules["fallback_pkg.r"].render = lambda obj, budget=0: "default"
+    monkeypatch.setattr(runner, "_DEFAULT_RENDERER", ("fallback_pkg.r", "render"))
+    assert runner._renderer(None)(object()) == "default"
+
+
+def test_a_missing_named_renderer_still_renders(monkeypatch):
+    """The chain continues rather than dropping to plain str: each step
+    is a real improvement on the next, and which one is live is a
+    diagnostic (ping) rather than something an agent's output should
+    turn on."""
+    _install(monkeypatch, None, "fallback_pkg.r")
+    sys.modules["fallback_pkg.r"].render = lambda obj, budget=0: "default"
+    monkeypatch.setattr(runner, "_DEFAULT_RENDERER", ("fallback_pkg.r", "render"))
+    assert runner._renderer("nope.missing:render")(object()) == "default"
+
+
+def test_no_renderer_at_all_is_none(monkeypatch):
+    monkeypatch.setattr(runner, "_DEFAULT_RENDERER", ("nope_absent", "render"))
+    assert runner._renderer(None) is None
+    assert runner._renderer("also.missing:render") is None
