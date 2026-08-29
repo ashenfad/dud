@@ -19,7 +19,10 @@ A subclass provides:
 - ``_preflight()`` — refuse this rung where it cannot run
   (``IsolationUnavailable``), before any pull or build is paid for
 - ``_listen_path()`` — where the host listens for the guest's dial
-- ``_start_vmm(spec)`` — boot the machine; return the VMM ``Popen``
+- ``_spawn_vmm(spec)`` — start the VMM; return its ``Popen``
+- ``_configure_vmm(spec)`` — optional, for a rung brought up over an
+  API after spawn; the base records the process first so a failure
+  here still has something killable
 
 and, where the substrate can do it, ``freeze`` / ``thaw``. The pool
 duck-types those two: a backend that has them parks as files, one that
@@ -362,10 +365,20 @@ class VmSession(HostSession):
         )
         self._vmm_log = open(self._vmm_log_path(spec), "wb")
         try:
-            self._proc = self._start_vmm(spec)
+            # Spawn and configure are separate hooks so that `self._proc`
+            # is recorded BEFORE anything that can fail with a live VMM
+            # behind it. A rung brought up over an API after spawn
+            # (firecracker) would otherwise raise out of a combined hook
+            # with the process still only a local, and the cleanup below
+            # — which kills `self._proc` — would remove the rundir around
+            # a VMM it could not see, leaving it running and no longer
+            # reachable by the sweep. Structural rather than a note,
+            # because the failure is silent and off the happy path.
+            self._proc = self._spawn_vmm(spec)
             # Liveness record for sweep_stale_rundirs (a future host
             # process cleaning up after a crash of THIS one).
             Path(self._rundir, "pid").write_text(str(self._proc.pid))
+            self._configure_vmm(spec)
             conn = self._accept(boot_timeout)
         except Exception as e:
             tail = self._abandon()
@@ -388,9 +401,19 @@ class VmSession(HostSession):
         """Host-side unix socket the guest's vsock dial is bridged to."""
         raise NotImplementedError
 
-    def _start_vmm(self, spec: BootSpec) -> subprocess.Popen:
-        """Boot the machine. Return the VMM process."""
+    def _spawn_vmm(self, spec: BootSpec) -> subprocess.Popen:
+        """Start the VMM process. Do no work that can fail after it is
+        running — that belongs in :meth:`_configure_vmm`, which the base
+        calls once the process is recorded and therefore killable."""
         raise NotImplementedError
+
+    def _configure_vmm(self, spec: BootSpec) -> None:
+        """Bring the machine up, for a rung configured after spawn.
+
+        Default is nothing: a rung that takes its whole configuration on
+        the VMM's command line (vfkit) is already booting by the time
+        :meth:`_spawn_vmm` returns.
+        """
 
     def _cmdline(self, workspace: str, n_disks: int) -> str:
         """Kernel cmdline. The ``dud.*`` knobs are the guest contract

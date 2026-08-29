@@ -236,7 +236,11 @@ def install(
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .backends.vfkit import _host_arch
+    # From the shared VM module, not from a rung: a kernel is a
+    # rung-agnostic asset, and which arch this host is has nothing to do
+    # with which hypervisor it runs. Importing it from vfkit was part of
+    # the same false structure the VmSession extraction removed.
+    from .backends.vm import _host_arch
 
     ap = argparse.ArgumentParser(prog="dud.kernels")
     ap.add_argument("--arch", default=None, help="guest arch (default: host)")

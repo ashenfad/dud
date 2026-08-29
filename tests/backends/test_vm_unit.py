@@ -197,3 +197,99 @@ def test_sweep_freezing_dead_owner_dead_vmm_reaps(tmp_path, monkeypatch):
     removed = vm.sweep_stale_rundirs(tmp_path)
     assert removed == [str(d)] and not d.exists()
 
+
+
+# ---- boot failure must not leak the VMM --------------------------------
+
+
+def test_configure_failure_kills_the_spawned_vmm(monkeypatch, tmp_path):
+    """A rung configured over an API after spawn (firecracker) can fail
+    with a live VMM behind it.
+
+    That is why spawn and configure are separate hooks: the base records
+    `self._proc` between them, so the cleanup below has something to
+    kill. Combined, the process stayed a local, cleanup could not see
+    it, and the rundir was removed around a VMM still running and no
+    longer reachable by the sweep — an orphan with no marker.
+    """
+    import os
+    import subprocess
+
+    from dud.backends.vm import BootSpec, VmSession
+
+    killed = []
+
+    class _FakeProc:
+        pid = 4242
+        returncode = None
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            killed.append("terminate")
+            self.returncode = -15
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+        def kill(self):
+            killed.append("kill")
+
+    class _Rung(VmSession):
+        def _preflight(self):
+            pass
+
+        def _listen_path(self):
+            # Under /tmp, not tmp_path: pytest's tmp dirs blow past the
+            # 104-char AF_UNIX sun_path cap on macOS, which is the same
+            # reason the real rundir is anchored there.
+            return os.path.join(self._rundir, "sock")
+
+        def _console_arg(self):
+            return "console=none"
+
+        def _spawn_vmm(self, spec: BootSpec):
+            return _FakeProc()
+
+        def _configure_vmm(self, spec: BootSpec):
+            raise RuntimeError("machine-config rejected")
+
+    monkeypatch.setattr(
+        "dud.backends.vm.build_rootfs",
+        lambda *a, **k: type("B", (), {
+            "rootfs_path": tmp_path / "rootfs", "medium": "initramfs",
+        })(),
+    )
+    monkeypatch.setattr(
+        "dud.backends.vm._resolve_kernel", lambda *a, **k: tmp_path / "Image"
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: None)
+
+    with pytest.raises(IsolationUnavailable, match="machine-config rejected"):
+        _Rung(home=tmp_path)
+    assert killed, "a VMM live at configure time must be torn down"
+
+
+# ---- module CLIs -------------------------------------------------------
+
+
+def test_module_clis_are_importable_and_parse_args():
+    """`python -m dud.kernels` is the documented install step for both
+    VM rungs — the first command a user runs after `pip install dud`.
+
+    Its `_host_arch` import moved with the VmSession extraction and
+    nothing noticed: 348 tests passed while the entrypoint raised
+    ImportError before argparse ever ran. A suite that never invokes a
+    CLI cannot see a CLI break.
+    """
+    import subprocess
+    import sys
+
+    for mod in ("dud.kernels", "dud.images.builder"):
+        r = subprocess.run(
+            [sys.executable, "-m", mod, "--help"],
+            capture_output=True, text=True,
+        )
+        assert r.returncode == 0, f"{mod} --help failed:\n{r.stderr}"
+        assert "usage:" in r.stdout
