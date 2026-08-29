@@ -270,29 +270,53 @@ def _renderer():
     return _RENDERER or None
 
 
-_OUTPUTS_HOOK: Any = None  # unresolved; False once known absent
+# Resolved hooks, keyed by spec: the fork template serves many execs and
+# a pooled VM can be rebound to a caller naming a different hook.
+_OUTPUTS_HOOKS: dict[str, Any] = {}
 
 
-def _outputs_hook():
-    """The image's ``dud_outputs.flatten``, if it ships one.
+def split_hook_spec(spec: str) -> tuple[str, str]:
+    """``"pkg.module:func"`` -> ``("pkg.module", "func")``.
 
-    Whatever convention the consumer has for getting live objects out.
-    dud used to carry one itself, in a guest module that knew plotly
-    figures serialize to ``ui/<name>.plotly.json``, that DataFrames get
-    ``head(200)`` with ``orient="split"``, that the artifact cap was
-    8 MB "for parity with the host renderer" — a file in another repo —
-    and that the dict holding all this was called ``ui``. That is the
-    layer above's convention compiled into dud, and it was the one
-    place the storage-blind, knows-nothing-above design was not true.
-
-    Same footing as the renderer, for the same reason: optional,
-    layered via ``packages=[...]``, resolved from the image, silently
-    absent, and reported by ``ping()`` so the absence is observable.
+    Entry-point syntax rather than a bare dotted path, because
+    ``a.b.c`` cannot say whether ``b`` is a module or an attribute, and
+    guessing means a typo in a package name and a typo in a function
+    name produce the same unhelpful failure.
     """
-    global _OUTPUTS_HOOK
-    if _OUTPUTS_HOOK is None:
-        _OUTPUTS_HOOK = _from_image("dud_outputs", "flatten") or False
-    return _OUTPUTS_HOOK or None
+    module, sep, attr = spec.partition(":")
+    if not sep or not module or not attr:
+        raise ValueError(
+            f"outputs_hook must look like 'pkg.module:function', got {spec!r}"
+        )
+    return module, attr
+
+
+def _outputs_hook(spec: str | None):
+    """The hook the caller named, if the image actually has it.
+
+    Named by the host on ``session(outputs_hook=...)`` rather than
+    discovered under a well-known module name. The magic-name version
+    of this looked like the renderer's ``reprobate`` and wasn't: dud
+    names *reprobate* because dud depends on that library's API, where
+    a well-known ``dud_outputs`` would have been dud claiming a global
+    module namespace on the consumer's behalf — one owner ever, nothing
+    in the API hinting the mechanism exists, and a typo indistinguishable
+    from "no hook wanted".
+
+    Absent is still not fatal: an exec whose hook failed to import
+    behaves exactly like one with no hook, and ``ping()`` is where the
+    difference is visible.
+    """
+    if not spec:
+        return None
+    if spec not in _OUTPUTS_HOOKS:
+        try:
+            module, attr = split_hook_spec(spec)
+        except ValueError:
+            _OUTPUTS_HOOKS[spec] = False
+        else:
+            _OUTPUTS_HOOKS[spec] = _from_image(module, attr) or False
+    return _OUTPUTS_HOOKS[spec] or None
 
 
 def _meta_for(obj: Any) -> dict:
@@ -445,7 +469,7 @@ def _clean_traceback(exc: BaseException) -> str:
     return "".join(out) if keep else "".join(parts[:1] + parts[-1:])
 
 
-def _offer_outputs(harvest: dict) -> dict:
+def _offer_outputs(harvest: dict, spec: str | None) -> dict:
     """Offer the harvested bindings to the image's outputs hook.
 
     Live objects that can't cross the codec get serialized guest-side
@@ -472,7 +496,7 @@ def _offer_outputs(harvest: dict) -> dict:
     eventually, and an exec must not fail because a chart could not be
     written.
     """
-    flatten = _outputs_hook()
+    flatten = _outputs_hook(spec)
     if flatten is None or not harvest:
         return harvest
     workspace = os.environ.get("DUD_WORKSPACE") or os.getcwd()
@@ -551,7 +575,9 @@ def run(channel: Channel, req: dict) -> dict:
             k: v for k, v in g.items()
             if not k.startswith("_") and k not in injected
         }
-        outputs, skipped = encode_map(_offer_outputs(harvest))
+        outputs, skipped = encode_map(
+            _offer_outputs(harvest, req.get("outputs_hook"))
+        )
 
     transcript = stdout_buf.getvalue()
     if len(transcript) > stdout_cap:

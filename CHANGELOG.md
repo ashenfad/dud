@@ -10,16 +10,18 @@ record for those.
 - **Rich value flattening moved out of dud into the image.** The guest
   no longer knows what a plotly figure or a pandas DataFrame is, nor
   that anyone calls their output dict `ui`. It offers every top-level
-  binding to an optional `dud_outputs.flatten(bindings, workspace) ->
-  set[str]` supplied by the image and drops the names it returns
-  (bindings may also be rewritten in place); without a hook, nothing is
-  flattened and unrepresentable values land in `outputs_skipped` with
-  their type names.
+  binding to a hook you name — `session(outputs_hook="pkg.module:function")`,
+  provided by the image — and drops the names it returns (bindings may
+  also be rewritten in place). Without a hook, nothing is flattened and
+  unrepresentable values land in `outputs_skipped` with their type
+  names.
 
-  If you relied on the built-in behavior, layer a package providing
-  `dud_outputs` (`packages=["your-guest-pkg"]`). `ping()["outputs_hook"]`
-  reports `"dud_outputs"` or `"none"`, so an absent hook is visible
-  rather than a mystery about where the charts went.
+  If you relied on the built-in behavior: put the equivalent function
+  in a package, layer it with `packages=[...]`, and name it with
+  `outputs_hook=`. `ping()["outputs_hook"]` echoes the spec, marks it
+  `(not found)` when it didn't import, and is `None` when you named
+  none — so a typo is visible rather than a mystery about where the
+  charts went.
 
   Why: which objects flatten, into what shape, under what path — and
   which binding collects them — is the consuming layer's convention,

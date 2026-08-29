@@ -235,6 +235,11 @@ class HostSession:
       **required** for every registered object — see
       :func:`require_allowlist`. ``allow={"db": set()}`` registers one
       with no callable methods.
+    - ``outputs_hook``: ``"pkg.module:function"`` in the guest image,
+      handed every harvested binding so it can serialize what the codec
+      can't carry into workspace files. dud supplies no default and
+      knows no format; ``ping()["outputs_hook"]`` reports whether the
+      named hook resolved.
     - ``on_emit``: callback(name, value) for guest emits; also collected
       in ``self.emits``. Emits are *events*, not state: they arrive live
       mid-exec and are kept even when the exec later fails — unlike
@@ -250,8 +255,16 @@ class HostSession:
         allow: dict[str, set[str]] | None = None,
         cache: dict[str, bytes] | None = None,
         on_emit: Callable[[str, Any], None] | None = None,
+        outputs_hook: str | None = None,
     ):
         self.cache: dict[str, bytes] = cache if cache is not None else {}
+        # "pkg.module:function" naming a hook the IMAGE provides, which
+        # the guest offers every harvested binding to (see the runner's
+        # _offer_outputs). Host-side config rather than a well-known
+        # module name so the mechanism is visible in this signature,
+        # and so a typo is something ping() can show you instead of
+        # looking identical to wanting no hook at all.
+        self.outputs_hook = outputs_hook
         self.host_objects = host_objects or {}
         self.allow = require_allowlist(host_objects, allow)
         self.emits: list[tuple[str, Any]] = []
@@ -467,6 +480,7 @@ class HostSession:
             {"code": code, "inputs": enc_inputs, "timeout": timeout,
              "caps": caps or {}, "render_budget": render_budget,
              "host_objects": sorted(self.host_objects),
+             "outputs_hook": self.outputs_hook,
              "cache_readonly": cache_readonly, "fs_readonly": fs_readonly},
         )
         if body.get("ok"):
@@ -515,7 +529,15 @@ class HostSession:
         self._request("reset_stage")
 
     def ping(self) -> dict:
-        body, _ = self._request("ping")
+        """Guest liveness plus what this image can actually offer.
+
+        ``outputs_hook`` rides along because the hook is host-side
+        config the supervisor never sees otherwise, and reporting it is
+        the whole reason to name it here: a hook that failed to import
+        behaves exactly like no hook at all, so the difference has to
+        be visible somewhere. Here.
+        """
+        body, _ = self._request("ping", {"outputs_hook": self.outputs_hook})
         return body
 
     def close(self) -> None:  # pragma: no cover - overridden

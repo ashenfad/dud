@@ -261,12 +261,16 @@ Population is per-runtime sugar over the language-neutral `emit` service
 which agent code echoing untrusted data could forge). The Python runner
 harvests top-level bindings post-exec and emits what's
 codec-representable, offering the whole harvest first to a hook the
-*image* supplies (`dud_outputs.flatten`). A `ui = {...}` convention
-still works, but as something the hook implements rather than something
-dud knows: which objects flatten, into what shape, under what path, and
-which binding collects them, all belong to whoever consumes the diff.
-dud's part is offering the values to whoever holds a convention, on the
-same footing as the print renderer. A future Node runner would harvest
+caller names (`session(outputs_hook="pkg.module:function")`) and the
+*image* provides. A `ui = {...}` convention still works, but as
+something the hook implements rather than something dud knows: which
+objects flatten, into what shape, under what path, and which binding
+collects them, all belong to whoever consumes the diff. dud's part is
+to offer the values and report whether the named hook resolved —
+host-side config rather than a well-known module name, because dud
+naming *reprobate* is dud depending on a library's API, where naming a
+`dud_outputs` would be dud claiming a module namespace on the
+consumer's behalf. A future Node runner would harvest
 `exports` or explicit `emit()` calls — an image plus a small runner, no
 core changes. Bash gets a `dud-emit` CLI or writes files and returns
 refs.

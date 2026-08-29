@@ -146,11 +146,12 @@ quietly filtering — you decide what's noise.)
 
 Nothing is lost — but nothing is delivered either. To get such values
 out, serialize them **guest-side** into workspace files, where they
-ride home in the diff like any other write. That's what the hook is
-for: put a module named `dud_outputs` in the image, exposing `flatten`.
+ride home in the diff like any other write. Write an ordinary function
+in an ordinary module, put it in the image, and point the session at
+it:
 
 ```python
-# your-guest-pkg/dud_outputs.py — layered in via packages=[...]
+# my_guest_pkg/outputs.py — an ordinary module, any name you like
 import os
 
 
@@ -163,15 +164,28 @@ def flatten(bindings: dict, workspace: str) -> set[str]:
     return handled
 ```
 
-The same exec, with that package in the image:
-
 ```python
 s = dud.session("vm", image="python:3.12-slim",
-                packages=["pandas", "your-guest-pkg"])
+                packages=["pandas", "my-guest-pkg"],
+                outputs_hook="my_guest_pkg.outputs:flatten")
 
 r = s.python("import pandas as pd\ndf = pd.DataFrame({'a': [1, 2]})")
 r.outputs_skipped   # {'pd': 'module'} — df is gone; the hook took it
 s.diff().writes     # {'df.csv': b'a\n1\n2\n'}
+```
+
+`outputs_hook` is `"module:function"` — the same spelling as a Python
+entry point, and colon-separated for the same reason: `a.b.c` can't say
+whether `b` is a module or an attribute.
+
+`ping()` tells you where you stand, which matters because a hook that
+failed to import produces exactly the same execs as no hook at all:
+
+```python
+s.ping()["outputs_hook"]
+# "my_guest_pkg.outputs:flatten"              resolved
+# "my_guest_pkg.outputs:flatten (not found)"  typo, or not in the image
+# None                                        you didn't name one
 ```
 
 The hook is handed **every** top-level binding and returns the names it
@@ -181,10 +195,9 @@ It can also *rewrite* a binding instead of consuming it, which is how a
 `bindings["ui"]`, write out the rich entries, put the remainder back,
 return nothing.
 
-Note what dud doesn't do here: it names no binding and knows no format.
-Which objects to write, in what shape, under what path is yours, the
-same way your store is. Without a hook nothing is flattened, and
-`ping()["outputs_hook"]` tells you whether one is live.
+Note what dud doesn't do here: it names no binding, knows no format,
+and picks no default. Which objects to write, in what shape, under what
+path is yours, the same way your store is.
 
 ### Pooling and parking
 

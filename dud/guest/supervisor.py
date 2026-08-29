@@ -309,9 +309,27 @@ class Supervisor:
         return {"pong": True, "workspace": str(self.work),
                 "staging": self.stage.kind,
                 "renderer": "reprobate" if self._has("reprobate") else "plain",
-                "outputs_hook": ("dud_outputs" if self._has("dud_outputs")
-                                 else "none"),
+                "outputs_hook": self._hook_status(body.get("outputs_hook")),
                 "view_worker": self._worker_state()}, []
+
+    def _hook_status(self, spec: str | None) -> str | None:
+        """What the caller's outputs_hook actually resolves to here.
+
+        None when unconfigured; the spec when its module is importable;
+        the spec marked ``(not found)`` when it is not. That last case
+        is the one worth reporting: a hook that failed to import
+        produces exactly the same execs as no hook at all, so without
+        this a typo in a package name is invisible.
+        """
+        if not spec:
+            return None
+        try:
+            from .runner import split_hook_spec
+
+            module, _attr = split_hook_spec(spec)
+        except ValueError:
+            return f"{spec} (not a 'pkg.module:function' spec)"
+        return spec if self._has(module) else f"{spec} (not found)"
 
     @staticmethod
     def _has(module: str) -> bool:
