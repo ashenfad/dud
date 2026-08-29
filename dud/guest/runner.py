@@ -215,6 +215,40 @@ class HostProxy:
         return f"<host object {self._name!r}>"
 
 
+def _from_image(module: str, attr: str):
+    """Resolve ``module.attr`` from the IMAGE, never from workspace files.
+
+    dud has two extension points — the print renderer and the outputs
+    hook — and both are ordinary imports, which is exactly the problem.
+    cwd is the workspace and ``python -m`` puts cwd on sys.path, so a
+    stray ``reprobate.py`` or ``dud_outputs.py`` beside the agent's own
+    code would shadow the real package, and dud would be importing
+    agent-authored code into its own print or output path. Stripping
+    the workspace entries here means neither extension point can be
+    hijacked by a file an agent wrote, and means the two cannot drift
+    apart later.
+
+    ``getattr``, not attribute access: if a shadow resolves anyway (user
+    code already imported one, so it is in sys.modules), a missing
+    attribute degrades to absent. A missing ``render`` used to raise
+    AttributeError out of ``print()`` and fail an exec whose only crime
+    was printing.
+    """
+    import importlib
+
+    saved = list(sys.path)
+    try:
+        here = os.getcwd()
+        ws = os.environ.get("DUD_WORKSPACE")
+        sys.path = [p for p in saved
+                    if p not in ("", ".", here) and (not ws or p != ws)]
+        return getattr(importlib.import_module(module), attr, None)
+    except Exception:  # noqa: BLE001 — an absent extension is never fatal
+        return None
+    finally:
+        sys.path = saved
+
+
 _RENDERER: Any = None  # unresolved; False once known absent
 
 
@@ -232,31 +266,33 @@ def _renderer():
     """
     global _RENDERER
     if _RENDERER is None:
-        _RENDERER = False
-        saved = list(sys.path)
-        try:
-            # Resolve from the IMAGE, never from workspace files. cwd is
-            # the workspace and `python -m` puts cwd on sys.path, so a
-            # stray `reprobate.py` beside the agent's code would shadow
-            # the real package — and dud would be importing agent-authored
-            # code into its own print path.
-            here = os.getcwd()
-            ws = os.environ.get("DUD_WORKSPACE")
-            sys.path = [p for p in saved
-                        if p not in ("", ".", here) and (not ws or p != ws)]
-            import reprobate
-
-            # getattr, not attribute access: if a shadow resolves anyway
-            # (user code already imported one, so it is in sys.modules),
-            # a missing `render` must degrade to plain text. It used to
-            # raise AttributeError out of print() and fail an exec whose
-            # only crime was printing.
-            _RENDERER = getattr(reprobate, "render", False)
-        except Exception:  # noqa: BLE001 — no renderer is never fatal
-            _RENDERER = False
-        finally:
-            sys.path = saved
+        _RENDERER = _from_image("reprobate", "render") or False
     return _RENDERER or None
+
+
+_OUTPUTS_HOOK: Any = None  # unresolved; False once known absent
+
+
+def _outputs_hook():
+    """The image's ``dud_outputs.flatten``, if it ships one.
+
+    The consumer-supplied half of the ``ui = {...}`` convention. dud
+    used to carry this itself, in a guest module that knew plotly
+    figures serialize to ``ui/<name>.plotly.json``, that DataFrames get
+    ``head(200)`` with ``orient="split"``, and that the artifact cap was
+    8 MB "for parity with the host renderer" — a file in another repo.
+    That is the layer above's convention compiled into dud, and it was
+    the one place the storage-blind, knows-nothing-above design was not
+    true.
+
+    Same footing as the renderer, for the same reason: optional,
+    layered via ``packages=[...]``, resolved from the image, silently
+    absent, and reported by ``ping()`` so the absence is observable.
+    """
+    global _OUTPUTS_HOOK
+    if _OUTPUTS_HOOK is None:
+        _OUTPUTS_HOOK = _from_image("dud_outputs", "flatten") or False
+    return _OUTPUTS_HOOK or None
 
 
 def _meta_for(obj: Any) -> dict:
@@ -410,20 +446,38 @@ def _clean_traceback(exc: BaseException) -> str:
 
 
 def _flatten_ui(g: dict) -> None:
-    """Materialize rich ``ui`` values to ``/ui`` files in the workspace.
+    """Offer rich ``ui`` values to the image's outputs hook.
 
-    The ``ui = {...}`` convention: rich live objects (plotly/pandas/etc.)
-    can't cross the codec, so serialize them guest-side into workspace
-    files (adopted by the host), and drop them from ``ui`` so the
-    representable remainder still harvests through to the host renderer.
+    The ``ui = {...}`` convention: live objects that can't cross the
+    codec get serialized guest-side into workspace files, which ride
+    back as ordinary diff writes; the representable remainder still
+    harvests through to the host. Serializing has to happen here
+    because it needs the live object — the same physical reason
+    rendering does.
+
+    *Which* objects, into what shape, under what path, is not dud's
+    business. It is a convention owned by whoever consumes the diff, so
+    it lives in a package the image supplies. Without one, nothing is
+    flattened and unrepresentable values land in ``outputs_skipped``
+    with their type names — the honest answer for a consumer that has
+    no convention.
+
+    A hook that raises is treated as having handled nothing. It runs
+    third-party serializers over agent data, so it will raise
+    eventually, and an exec must not fail because a chart could not be
+    written.
     """
     ui = g.get("ui")
     if not isinstance(ui, dict) or not ui:
         return
-    from .ui import flatten_rich
-
+    flatten = _outputs_hook()
+    if flatten is None:
+        return
     workspace = os.environ.get("DUD_WORKSPACE") or os.getcwd()
-    handled = flatten_rich(ui, workspace)
+    try:
+        handled = set(flatten(ui, workspace) or ())
+    except Exception:  # noqa: BLE001 — a hook over agent data, never fatal
+        return
     if handled:
         g["ui"] = {k: v for k, v in ui.items() if k not in handled}
 

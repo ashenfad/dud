@@ -205,6 +205,25 @@ def test_ping_reports_the_live_renderer(session):
     assert session.ping()["renderer"] in ("reprobate", "plain")
 
 
+def test_ping_reports_the_outputs_hook(session):
+    """Same reason as the renderer: rich `ui` flattening falls back to
+    nothing when the image ships no dud_outputs, and a consumer needs
+    to see that rather than wonder where its charts went."""
+    assert session.ping()["outputs_hook"] in ("dud_outputs", "none")
+
+
+def test_rich_ui_without_a_hook_is_reported_not_invented(session):
+    """dud's zero-knowledge default. Without an image hook, a value
+    that cannot cross the codec is named in outputs_skipped with its
+    type — never guessed at, never written somewhere the consumer did
+    not ask for."""
+    r = session.python("class Fig:\n    pass\nui = {'chart': Fig()}")
+    assert r.ok, r.error
+    assert "ui" in r.outputs_skipped
+    ls = session.shell("ls ui 2>/dev/null || true")
+    assert ls.transcript.strip() == ""
+
+
 def test_no_render_budget_means_plain_text(session):
     """dud never invents an observation size. Unasked, entries carry
     exactly what print produced."""

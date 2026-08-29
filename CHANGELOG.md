@@ -5,6 +5,29 @@ record for those.
 
 ## Unreleased
 
+### Breaking
+
+- **Rich `ui` flattening moved out of dud into the image.** The guest
+  no longer knows what a plotly figure or a pandas DataFrame is. It
+  offers the `ui = {...}` dict to an optional `dud_outputs.flatten(ui,
+  workspace) -> set[str]` supplied by the image, and drops whatever
+  that returns; without one, nothing is flattened and unrepresentable
+  values land in `outputs_skipped` with their type names.
+
+  If you relied on the built-in behavior, layer a package providing
+  `dud_outputs` (`packages=["your-guest-pkg"]`). `ping()["outputs_hook"]`
+  reports `"dud_outputs"` or `"none"`, so an absent hook is visible
+  rather than a mystery about where the charts went.
+
+  Why: which objects flatten, into what shape, under what path is the
+  consuming layer's convention, not dud's. The old module encoded one
+  consumer's choices — `ui/<name>.plotly.json`, `head(200)` with
+  `orient="split"`, an 8 MB cap "for parity with the host renderer" in
+  another repo — which made dud know about the layer above it. It is
+  now on the same footing as the print renderer: optional, layered
+  through the image, resolved from the image rather than the workspace,
+  silently absent, and reported by `ping()`.
+
 ### Changed behavior
 
 - **A wedged guest now fails instead of hanging.** Every host→guest

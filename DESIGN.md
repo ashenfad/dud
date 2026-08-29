@@ -261,7 +261,12 @@ Population is per-runtime sugar over the language-neutral `emit` service
 which agent code echoing untrusted data could forge). The Python runner
 harvests top-level bindings post-exec and emits what's
 codec-representable; the `ui = {...}` convention works unchanged, with
-figures flattening guest-side. A future Node runner would harvest
+figures flattening guest-side — through a hook the *image* supplies
+(`dud_outputs.flatten`), not through anything dud knows about plotly.
+Which objects flatten, into what shape, under what path is the
+consuming layer's convention; dud's part is offering the values to
+whoever holds one, on the same footing as the print renderer. A future
+Node runner would harvest
 `exports` or explicit `emit()` calls — an image plus a small runner, no
 core changes. Bash gets a `dud-emit` CLI or writes files and returns
 refs.
