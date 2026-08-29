@@ -308,9 +308,31 @@ class Supervisor:
     def do_ping(self, body, bins):
         return {"pong": True, "workspace": str(self.work),
                 "staging": self.stage.kind,
-                "renderer": "reprobate" if self._has("reprobate") else "plain",
+                "renderer": self._renderer_status(body.get("render_hook")),
                 "outputs_hook": self._hook_status(body.get("outputs_hook")),
                 "view_worker": self._worker_state()}, []
+
+    def _renderer_status(self, spec: str | None) -> str:
+        """Which renderer an exec would actually get.
+
+        Three possible steps — the caller's hook, reprobate, plain
+        ``str`` — and the point of reporting is to say which one is
+        live. A named hook that failed to import still renders (the
+        chain continues), so without this the caller sees perfectly
+        reasonable output and never learns their hook was never used.
+        """
+        base = "reprobate" if self._has("reprobate") else "plain"
+        if not spec:
+            return base
+        try:
+            from .runner import split_hook_spec
+
+            module, _attr = split_hook_spec(spec)
+        except ValueError:
+            return f"{spec} (not a 'pkg.module:function' spec; using {base})"
+        if self._has(module):
+            return spec
+        return f"{spec} (not found; using {base})"
 
     def _hook_status(self, spec: str | None) -> str | None:
         """What the caller's outputs_hook actually resolves to here.

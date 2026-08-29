@@ -117,12 +117,17 @@ r = s.python(code, render_budget=200)
 # entry text becomes [0, 1, 2, ...86 more] instead of a severed token
 ```
 
-The number stays yours; unset means plain `str()`. It needs
+The number stays yours; unset means plain `str()`. Rendering needs
 [reprobate](https://github.com/ashenfad/reprobate) in the image
-(`packages=["reprobate"]`), falls back to plain text without it, and
-`ping()["renderer"]` says which is live. Rendered entries are marked
-`elided`. The transcript is never rendered — it keeps exactly what real
-Python printed.
+(`packages=["reprobate"]`) and falls back to plain text without it.
+To render with something of your own instead, name it:
+`session(render_hook="my_guest_pkg.render:render")` — same
+`"module:function"` spelling as `outputs_hook` below. Resolution runs
+your hook, then reprobate, then plain `str()`, and
+`ping()["renderer"]` says which step is live, including when a named
+hook didn't import. Rendered entries are marked `elided`. The
+transcript is never rendered — it keeps exactly what real Python
+printed.
 
 `caps` are the other knob and are **not** an observation budget: they
 bound what one exec can send back so a runaway print loop can't flood
@@ -198,6 +203,23 @@ return nothing.
 Note what dud doesn't do here: it names no binding, knows no format,
 and picks no default. Which objects to write, in what shape, under what
 path is yours, the same way your store is.
+
+### Extension points, in general
+
+Both hooks work the same way: **you name them on the session, the image
+provides them.** `"module:function"`, resolved guest-side from the
+image and never from workspace files (a `reprobate.py` an agent wrote
+must not become dud's print path), absent rather than fatal when they
+don't import, and reported by `ping()`.
+
+They differ in one way, deliberately. `render_hook` has a default and
+`outputs_hook` doesn't, because **dud defines the render contract** —
+`render(obj, budget)` exists because `render_budget` does — so shipping
+a default implementation of it is ordinary. dud does *not* define what
+"flattened" means, so any default there would be somebody else's
+convention baked into a tool that promises not to have one. That is the
+rule for anything added later: name a default when dud defines the
+operation, require the caller to name one when you do.
 
 ### Pooling and parking
 

@@ -32,6 +32,16 @@ record for those.
   through the image, resolved from the image rather than the workspace,
   silently absent, and reported by `ping()`.
 
+### Added
+
+- **`session(render_hook="pkg.module:function")`** names your own print
+  renderer, resolved from the image ahead of the reprobate default.
+  Previously the only way to override rendering was to ship a package
+  literally named `reprobate` — name-squatting as an extension
+  mechanism. `ping()["renderer"]` reports which step of the chain (your
+  hook, reprobate, plain `str`) is actually live, including when a
+  named hook failed to import.
+
 ### Changed behavior
 
 - **A wedged guest now fails instead of hanging.** Every host→guest

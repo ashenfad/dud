@@ -198,6 +198,15 @@ def test_root_imports_survive_cwd_changes(session):
 # ---- print rendering ---------------------------------------------------
 
 
+def test_ping_shows_a_render_hook_that_did_not_resolve(make_session):
+    """A named renderer that failed to import still renders, because
+    the chain continues — so without this report the caller sees
+    reasonable output and never learns their hook was never used."""
+    s = make_session(render_hook="nope_missing.mod:render")
+    status = s.ping()["renderer"]
+    assert status.startswith("nope_missing.mod:render (not found; using ")
+
+
 def test_ping_reports_the_live_renderer(session):
     """Rendering falls back silently when the image has no reprobate, so
     the fallback has to be observable — same reason ping reports which
