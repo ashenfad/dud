@@ -7,19 +7,30 @@ keyed by the *boot fingerprint* (image, packages, kernel, sizing) hands
 an idle VM to the next session for the cost of a ``reset_guest`` +
 ``push_tree`` (~100s of ms) instead of a boot (~seconds).
 
-Two parking postures, chosen by what the backend can do:
+What a release does with a VM depends on what the backend can do:
 
-- **hot** (vfkit): the parked VM keeps running; reuse is reset + push.
-  Idle warmth costs RAM (macOS pages untouched guest memory out, so
-  less than the headline size, but not nothing).
-- **frozen** (firecracker): the parked VM is snapshotted to files and
-  its VMM killed; reuse is a thaw (~tens of ms — the memory file is
-  mmap'd, not read). Idle warmth costs disk only, so frozen VMs are
-  invisible to ``max_total`` and never reclaimed for RAM pressure.
+- **can't clone** (vfkit): the VM is parked hot — it keeps running,
+  and reuse is reset + push. The alternative there is a full boot, so
+  holding it is worth the RAM (macOS pages untouched guest memory out,
+  so less than the headline size, but not nothing).
+- **can clone** (firecracker): the VM is torn down, because the next
+  miss restores a clone of a *golden snapshot* in ~40 ms rather than
+  booting. Parking used to mean snapshotting it first — ~3 s for a
+  1 GiB guest, to save that 40 ms — which made pooling slower than not
+  pooling at all.
+
+An **affinity park** is the exception on either rung: a release
+carrying ``park_state`` holds a WORKSPACE, which is the one thing a
+clone cannot reproduce, so that VM is kept — and kept running, since
+freezing it would charge three seconds to every release that took the
+path. ``max_affinity`` bounds how many, per fingerprint, and is 0 by
+default (see its comment for the measurement behind that).
 
 The posture is duck-typed off the session (``freeze``/``thaw``); the
 acquire/release contract, fingerprints, affinity tags, and caps are
-identical either way.
+identical either way. Frozen VMs — templates, and anything ``prewarm``
+parks — are files rather than processes, so they are invisible to
+``max_total`` and never reclaimed for RAM pressure.
 
 Hygiene on release, not acquire (secrets leave promptly): wipe both
 trees, restore boot-time shell env, and kill every non-supervisor

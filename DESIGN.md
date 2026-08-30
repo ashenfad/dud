@@ -473,8 +473,14 @@ loop. The one new dangling shape — a frozen bundle whose host died — is
 covered by a marker holding the owner pid, which the rundir sweep honors
 while the owner lives and reaps once it dies.
 
-Above both sits one pool contract: vfkit parks hot, firecracker
-parks frozen at zero RAM, same acquire/release, same affinity tags.
+Above both sits one pool contract, same acquire/release, same affinity
+tags — though what a release *does* now differs by what the rung can
+do. vfkit parks the VM hot, because its alternative is a full boot.
+Firecracker discards it, because its next miss restores a clone of a
+golden snapshot in ~40 ms; parking there used to mean snapshotting
+first, paying ~3 s to save 40 ms, which made pooling slower than not
+pooling. Snapshots did not go away — they became the *template* rather
+than the park.
 
 sandtrap's fail-closed pattern transplants directly: requesting a rung
 the platform can't provide **raises** (`IsolationUnavailable`), never

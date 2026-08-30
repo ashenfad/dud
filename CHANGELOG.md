@@ -39,8 +39,8 @@ now named in a signature.
   not dud's. The old module encoded one consumer's choices —
   `ui/<name>.plotly.json`, `head(200)` with `orient="split"`, an 8 MB
   cap "for parity with the host renderer" in another repo — which made
-  dud know about the layer above it. It is
-  now on the same footing as the print renderer: optional, layered
+  dud know about the layer above it. It is now on the same footing as
+  the print renderer: optional, layered
   through the image, resolved from the image rather than the workspace,
   silently absent, and reported by `ping()`.
 
@@ -61,10 +61,12 @@ now named in a signature.
   already on that VM; a golden clone skips the boot because the
   machine is already booted. Parking is unchanged.
 
-  The template costs nothing to make. `release` already freezes on the
-  frozen posture, so seeding it is a file copy of a snapshot that
-  existed anyway — no caller waits for one, and a session that runs
-  once and leaves pays nothing extra. `prewarm` seeds it too.
+  Nobody waits for the template. The first miss for a config boots
+  normally and gets its machine; the template is built behind it, on
+  its own machine, on a background thread — so a session that runs
+  once and leaves pays nothing extra. `VmPool(auto_seed=False)` turns
+  that off for a consumer who would rather build templates only where
+  it says so.
 
   `VmPool.seed(**kwargs)` builds one ahead of time, which is
   pre-warming without the cost of staying warm: a template holds no
@@ -85,20 +87,15 @@ now named in a signature.
   snapshotting it — ~3 s for a 1 GiB guest — to save what is now a
   40 ms clone, which made pooling *slower* than not pooling. A plain
   release now tears the machine down; the next miss clones a fresh
-  one, which comes up just as warm and cleaner. The template is built
-  on its own machine in the background, so no caller ever waits for a
-  freeze. `VmPool(auto_seed=False)` turns that off.
+  one, which comes up just as warm and cleaner. Freeze now has exactly
+  one use left: building the template, once per config.
 
   An **affinity park** — a release carrying `state=` — is the one
   thing a clone cannot reproduce, because it holds a workspace. Those
-  are kept, and kept *running*: `VmPool(max_affinity=1)` bounds how
-  many, and 0 disables them. Freezing them would put three seconds on
-  every release that took the path, to save RAM on a VM you are
-  parking precisely because you expect to come straight back to it.
-
-  Every failure falls back to booting. A golden snapshot is a cache:
-  not having one, or having one that will not restore, costs speed and
-  never a session.
+  are kept, and kept *running* rather than frozen — freezing them
+  would put three seconds on every release that took the path, to save
+  RAM on a VM you are parking precisely because you expect to come
+  straight back to it. Off by default; see `max_affinity` below.
 
   The template is keyed by the guest-code identity as well as the boot
   fingerprint, and carries a manifest naming the rootfs and kernel it
@@ -108,6 +105,10 @@ now named in a signature.
   VM's per-boot volume, which does not outlive it. A background seed is
   a whole VM and counts against `max_total` like any other, so a pool
   at its cap builds no template until there is room.
+
+  Every failure falls back to booting. A golden snapshot is a cache:
+  not having one, or having one that will not restore, costs speed and
+  never a session.
 
 - **The firecracker rung runs on x86-64 Linux.** It was described as a
   disposable Linux/KVM microVM but pinned only arm64 assets, so on the
