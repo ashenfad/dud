@@ -28,6 +28,47 @@ def test_cache_not_applied_on_error(session):
     assert r2.outputs["v"] == 1
 
 
+def test_a_moderate_stash_is_the_point_of_the_cache(session):
+    """The ceiling is set so ordinary stashing never meets it. Pinned
+    because a guard aimed at the wrong number would break the feature
+    it is protecting — the cache exists to carry working data between
+    execs, not to carry an observation."""
+    r = session.python("cache['data'] = 'z' * 20_000_000")
+    assert r.ok, r.error
+    r2 = session.python("n = len(cache['data'])")
+    assert r2.outputs["n"] == 20_000_000
+
+
+def test_an_oversized_stash_fails_the_exec_and_keeps_its_output(session):
+    """Failed, not silently dropped: `cache[k] = v` is something the
+    agent asked for by name, and a stash that quietly did not happen
+    surfaces next session as an unexplained miss.
+
+    The transcript survives, because an exec whose only fault was the
+    size of its last statement should not also lose the evidence of
+    what it did."""
+    r = session.python(
+        "print('work happened')\ncache['big'] = 'z' * 4_000_000",
+        caps={"cache": 1_000_000},
+    )
+    assert not r.ok
+    assert r.error.etype == "ValueTooLarge"
+    assert "cache['big']" in r.error.message
+    assert r.transcript.strip() == "work happened"
+    r2 = session.python("hit = 'big' in cache")
+    assert r2.outputs["hit"] is False  # nothing was applied
+
+
+def test_the_stash_ceiling_is_the_callers_to_raise(session):
+    r = session.python(
+        "cache['big'] = 'z' * 4_000_000",
+        caps={"cache": 8_000_000, "cache_total": 8_000_000},
+    )
+    assert r.ok, r.error
+    r2 = session.python("n = len(cache['big'])")
+    assert r2.outputs["n"] == 4_000_000
+
+
 def test_cache_delete(session):
     session.python("cache['gone'] = 1")
     session.python("del cache['gone']")

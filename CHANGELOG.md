@@ -121,10 +121,31 @@ record for those.
   Why they were needed: all three cross in the JSON body of a frame
   the guest supervisor parses whole, and on a VM rung that supervisor
   is PID 1 with the machine's RAM. One 60 MB assignment crossed in
-  0.5 s with nothing in the way. Cache writes are deliberately *not*
-  capped here — they ride raw binary frames rather than the JSON body,
-  and their size is a question about cache semantics rather than about
-  the wire (see ROADMAP, "cache-as-service semantics").
+  0.5 s with nothing in the way.
+
+- **Cache writes are bounded too, generously.** 64 MiB for one write
+  and 128 MiB across one exec, as `caps["cache"]` and
+  `caps["cache_total"]`. Eight times the ceiling on a harvested value,
+  because the two are different jobs: `outputs` carries an
+  observation, the cache is working storage, and stashing data between
+  execs is what it is *for*. Ordinary use should never meet these; a
+  30 MB DataFrame stashes exactly as before.
+
+  Over the ceiling the **exec fails** rather than the write being
+  dropped — `cache[k] = v` is something the agent asked for by name,
+  and a stash that quietly did not happen surfaces next session as an
+  unexplained miss. The transcript and prints survive the failure, so
+  an exec whose only fault was the size of its last statement does not
+  also lose the evidence of what it did.
+
+  Sizes are measured at flush rather than at assignment, because
+  in-place mutation is a supported way to write
+  (`cache["x"].append(...)` is captured), so the value at assignment
+  is not the value that ships.
+
+  These bound one *transit*. How large the cache may grow across a
+  session remains the consuming layer's question (see ROADMAP,
+  "cache-as-service semantics").
 
   Because a frame is more than the values in it, the guest channel
   also carries a ceiling on the whole JSON body it will send —

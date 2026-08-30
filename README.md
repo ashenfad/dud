@@ -135,7 +135,9 @@ channel, and they sit far above anything you'd show a model. Text is
 capped by `stdout`, `entry`, `entries` and `total`; values by `value`
 (one binding, `emit`, or hostcall argument) and `outputs` (everything
 one exec harvests). The value guards refuse rather than truncate —
-half a JSON document is a wrong answer, not a smaller one. `frame`
+half a JSON document is a wrong answer, not a smaller one. `cache` and
+`cache_total` bound what one exec stashes, and sit far higher — an
+output is an observation, the cache is working storage. `frame`
 backstops all of it with a ceiling on the whole body an exec can send,
 since names and argument counts ride the wire too; it's derived from
 the others by default, so raising one of them raises it too.

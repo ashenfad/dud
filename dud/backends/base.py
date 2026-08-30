@@ -460,8 +460,10 @@ class HostSession:
         ``caps`` are resource guards on what an exec may send back —
         ``stdout`` (transcript), ``entry`` (one print), ``entries``
         (count), ``total`` (across entries), ``value`` (one harvested
-        binding, ``emit`` value, or hostcall argument) and ``outputs``
-        (across everything one exec harvests). They exist to stop a
+        binding, ``emit`` value, or hostcall argument), ``outputs``
+        (across everything one exec harvests), ``cache`` (one cache
+        write) and ``cache_total`` (across one exec's writes). They
+        exist to stop a
         runaway exec flooding the channel, not to size an observation:
         choosing what a model should see is the caller's job, and it
         gets every entry plus its metadata to do it with. The defaults
@@ -469,11 +471,17 @@ class HostSession:
         rarely the answer; lowering them is a way to bound a specific
         untrusted exec.
 
-        The two value guards refuse rather than truncate, because half
-        a JSON document is a wrong answer rather than a smaller one. A
+        The value guards refuse rather than truncate, because half a
+        JSON document is a wrong answer rather than a smaller one. A
         harvested binding over ``value`` lands in ``outputs_skipped``
         with its size; an ``emit`` or hostcall argument over it raises
         in the guest, at the call the agent wrote.
+
+        ``cache`` is deliberately far larger than ``value``: stashing
+        data between execs is what the cache is for, while ``outputs``
+        carries an observation. Over it, the exec fails rather than
+        the write being dropped — a stash that silently did not happen
+        is discovered next session as an unexplained miss.
 
         ``render_budget`` asks the guest to render each print entry to
         roughly that many characters using structural elision
