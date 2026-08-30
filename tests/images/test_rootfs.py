@@ -224,3 +224,59 @@ def test_init_script_without_env_still_boots():
 
     text = _init_script("site", "/workspace").decode()
     assert "main(default_root='/workspace')" in text
+
+
+# ---- baked bytecode ----------------------------------------------------
+
+
+def test_bake_pyc_covers_the_stdlib_and_the_injected_runtime(make_layer):
+    """The gap this closes: python:*-slim deletes every .pyc at image
+    build, and dud's own runtime is injected as source — so a guest
+    compiled ~1100 stdlib modules on the way up, and on a read-only
+    erofs root could never cache the result.
+
+    Verified against a real cached rootfs before the fix: 1116 stdlib
+    .py, 0 .pyc; 19 dud .py, 0 .pyc.
+    """
+    import sys
+
+    tag = sys.implementation.cache_tag
+    host = f"{sys.version_info.major}.{sys.version_info.minor}"
+    site = f"usr/local/lib/python{host}/site-packages"
+    l1 = make_layer("l1", dirs=[site],
+                    files={f"usr/local/lib/python{host}/json/tool.py": b"x = 1\n"})
+    fs = rootfs.flatten_layers([l1])
+    rootfs.inject_dud(fs)
+    assert rootfs.bake_pyc(fs, site) > 0
+
+    stdlib = f"usr/local/lib/python{host}/json/__pycache__/tool.{tag}.pyc"
+    assert stdlib in fs.nodes
+    assert fs.nodes[stdlib].data[:4] == __import__("importlib.util",
+                                                   fromlist=["util"]).MAGIC_NUMBER
+
+
+def test_bake_pyc_skips_a_version_mismatch_rather_than_shipping_junk(make_layer):
+    """Bytecode is minor-version scoped. A mismatch has to degrade to
+    slower imports, never to a rootfs full of .pyc the guest will
+    refuse — same rule the layered wheels already followed."""
+    site = "usr/local/lib/python2.7/site-packages"
+    l1 = make_layer("l1", dirs=[site],
+                    files={"usr/local/lib/python2.7/json/tool.py": b"x = 1\n"})
+    fs = rootfs.flatten_layers([l1])
+    assert rootfs.bake_pyc(fs, site) == 0
+    assert not any("__pycache__" in k for k in fs.nodes)
+
+
+def test_bake_pyc_survives_an_unparseable_module(make_layer):
+    """The stdlib carries test fixtures that are deliberately invalid.
+    One of them must not fail an image build."""
+    import sys
+
+    host = f"{sys.version_info.major}.{sys.version_info.minor}"
+    site = f"usr/local/lib/python{host}/site-packages"
+    l1 = make_layer("l1", dirs=[site], files={
+        f"usr/local/lib/python{host}/lib2to3/bad.py": b"this is not python(",
+        f"usr/local/lib/python{host}/json/ok.py": b"x = 1\n",
+    })
+    fs = rootfs.flatten_layers([l1])
+    assert rootfs.bake_pyc(fs, site) >= 1  # the good one still baked

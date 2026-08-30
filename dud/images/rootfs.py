@@ -10,12 +10,16 @@ skipped: the guest init mounts ``devtmpfs`` on ``/dev``.
 
 from __future__ import annotations
 
+import logging
 import posixpath
+import sys
 import tarfile
 from pathlib import Path
 
 from . import registry
 from .cpio import FileSet, Node, S_IFDIR, S_IFLNK, S_IFREG, is_dir, is_symlink
+
+_log = logging.getLogger(__name__)
 
 _WH_PREFIX = ".wh."
 _WH_OPAQUE = ".wh..wh..opq"
@@ -245,6 +249,63 @@ def _init_script(site: str, workspace: str,
     return "\n".join(lines).encode()
 
 
+def _guest_py_version(site: str) -> str | None:
+    """The guest's Python minor version, read off its site-packages path."""
+    for part in site.split("/"):
+        if part.startswith("python3."):
+            return part[len("python"):]
+    return None
+
+
+def bake_pyc(fs: FileSet, site: str) -> int:
+    """Compile every module in the rootfs to bytecode, ahead of boot.
+
+    The base image ships none: docker-library's python:*-slim deletes
+    every .pyc at build time, and dud's own runtime is injected as
+    source. So the guest was compiling ~1100 stdlib modules from source
+    on the way up — and on an erofs root, which is mounted read-only,
+    it could never write the result, so it paid that on every exec
+    forever rather than once.
+
+    Bytecode is minor-version-scoped, so this only bakes when the host
+    interpreter matches the guest's; a mismatch skips silently and
+    costs speed, not correctness. That is the same rule the layered
+    wheels have always used — this extends it to the two much larger
+    sets that were never covered.
+
+    UNCHECKED_HASH, like the wheels: sources in a rootfs never change
+    underneath their bytecode, so validation would be a stat per
+    import for an answer that cannot vary — and it dodges the
+    deterministic zero mtimes the image is built with.
+    """
+    import importlib.util
+    from importlib._bootstrap_external import _code_to_hash_pyc
+
+    py = _guest_py_version(site)
+    host = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if py is None or py != host:
+        _log.info("guest python %s != host %s; shipping without bytecode "
+                  "(slower guest imports, same behavior)", py, host)
+        return 0
+
+    tag = sys.implementation.cache_tag
+    baked = 0
+    for path in [k for k in list(fs.nodes) if k.endswith(".py")]:
+        src = fs.nodes[path].data
+        try:
+            code = compile(src, "/" + path, "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
+            # Test fixtures and py2 leftovers live in the stdlib tree;
+            # one unparseable file must not fail an image build.
+            continue
+        pyc = _code_to_hash_pyc(code, importlib.util.source_hash(src), False)
+        parent, _, name = path.rpartition("/")
+        fs.add_file(f"{parent}/__pycache__/{name[:-3]}.{tag}.pyc", pyc, 0o644)
+        baked += 1
+    _log.info("baked %d .pyc into the rootfs", baked)
+    return baked
+
+
 _INTERPRETER = "usr/local/bin/python3"
 
 #: ``dud-emit`` on the guest's PATH. A shim, not a copy: the logic
@@ -275,6 +336,8 @@ def build_fileset(
         )
     site = inject_dud(fs)
     fs.add_dir(workspace, 0o755)
+    # After injection, so dud's own modules are covered too.
+    bake_pyc(fs, site)
     fs.add_file("usr/local/bin/dud-emit", _EMIT_SHIM, 0o755)
     fs.add_file(
         "init", _init_script(site, workspace, _image_env(image.env)), 0o755

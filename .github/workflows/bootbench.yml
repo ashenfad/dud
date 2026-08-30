@@ -1,28 +1,35 @@
-name: Firecracker conformance
+name: Boot benchmark
 
-# The rung-3 gate. Until now this corpus only ran by hand, on a nested
-# Lima VM that degrades after ~30-40 minutes of VM churn (see
-# dev/fc-test.sh) — so every ambiguous failure cost a judgement call
-# about whether the code or the environment was at fault. A hosted
-# runner is a fresh machine every time, which removes the question.
+# Boot and thaw timings, on a machine whose numbers mean something.
 #
-# Separate workflow rather than a matrix entry in test.yml: it needs
-# /dev/kvm, a VMM binary and a ~40 MB kernel, and it takes minutes
-# rather than seconds. Failing it should read as "the VM rung broke",
-# not as "the Python matrix is red".
+# The dev rig is firecracker nested inside a Lima VM on macOS, where
+# run-to-run variance measured +-0.4s — larger than most of the effects
+# worth chasing. This job runs the same measurements on a hosted runner
+# so a change can be judged against a reproducible baseline, and so
+# firecracker's own load_snapshot latency can be compared with AWS's
+# published figures.
+#
+# Deliberately NOT the conformance corpus: that takes ~20 minutes and
+# answers pass/fail, which is the wrong instrument for a number. This
+# takes a couple of minutes and prints the numbers.
 
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
-  workflow_dispatch:   # run it against a branch on demand
+  workflow_dispatch:   # aim it at a branch when a change should move a number
+
+# On main and on demand rather than on every PR. Kept, though, and for
+# a reason worth stating: the golden-snapshot path falls back to a cold
+# boot on ANY failure, by design — so if cloning silently stops
+# working, every conformance test still passes and the only symptom is
+# that sessions got 30x slower. Correctness tests cannot see that.
+# This is the thing that would.
 
 permissions:
   contents: read
 
 jobs:
-  conformance:
+  bench:
     runs-on: ubuntu-latest  # x86-64, and the only hosted runner with /dev/kvm
 
     steps:
@@ -99,22 +106,13 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: python -m dud.kernels
 
-    # The same corpus the other rungs run, unsliced: a hosted runner is
-    # fresh, so it does not need dev/fc-test.sh's restart-between-slices
-    # workaround for a dev VM that wears out.
-    - name: Conformance (firecracker)
+    - name: Boot benchmark
       env:
         DUD_BACKEND: firecracker
-        DUD_MEDIUM: erofs
-        # Sessions come from the pool, so a miss clones a golden
-        # snapshot instead of booting: measured 4x faster end to end
-        # (vfkit: 220s -> 55s), and it puts the path consumers actually
-        # take under the whole corpus rather than one lifecycle test.
-        #
-        # Not a weaker thing to assert than a cold boot per test. A
-        # clone is a fresh machine from a pristine template — cleaner
-        # than the reset VM that pooled reuse used to mean. Tests that
-        # genuinely need a boot from nothing say so with
-        # @pytest.mark.cold_boot.
-        DUD_TEST_POOL: "1"
-      run: pytest tests/conformance -v --durations=10
+        DUD_FC_METRICS: "1"
+      run: |
+        python dev/bootbench.py --medium erofs
+        echo "--- initramfs, for comparison"
+        python dev/bootbench.py --medium initramfs --boots 2
+        echo "--- golden snapshot: N clones from one snapshot"
+        python dev/goldenspike.py --clones 3

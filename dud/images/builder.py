@@ -37,13 +37,19 @@ from . import registry, rootfs
 #     of /init is not itself injected, so changing what it emits leaves
 #     the code hash untouched and every cached artifact would keep its
 #     old, env-less init.
+# v5: the rootfs ships baked .pyc for the stdlib and the injected
+#     runtime. python:*-slim deletes every .pyc at image build, and
+#     _bytecompile only ever covered layered wheels — so the guest
+#     compiled ~1100 stdlib modules on the way up, and on a read-only
+#     erofs root could never cache the result. Rides PIPELINE_VERSION
+#     for the usual reason: rootfs.py is _HOST_ONLY.
 # v4: /usr/local/bin/dud-emit ships in the rootfs. Same reasoning as v3
 #     — the shim is emitted by rootfs.py, which is _HOST_ONLY, so a
 #     cached artifact would otherwise boot without the command even
 #     though the module behind it is injected and current.
 _log = logging.getLogger(__name__)
 
-PIPELINE_VERSION = 4
+PIPELINE_VERSION = 5
 
 # Rootfs media the backend can boot. The medium is folded into the spec
 # hash so a threshold change can never serve a wrong-medium artifact, and

@@ -59,6 +59,7 @@ from typing import Any
 
 from ..errors import DudError
 from .base import require_allowlist
+from . import golden
 from .vm import VmSession
 
 # Everything the pool does on the failure side is recoverable, which is
@@ -135,7 +136,19 @@ class VmPool:
         ttl: float = 900.0,
         max_total: int | None = None,
         session_cls: type | None = None,
+        max_affinity: int = 1,
+        auto_seed: bool = True,
     ):
+        # How many tagged VMs to hold RUNNING for a same-content resume,
+        # on a rung that can clone. Small by default: an affinity park
+        # costs real RAM and buys only a skipped push_tree, where a
+        # plain miss now costs a ~40ms clone. 0 disables it entirely.
+        self.max_affinity = max_affinity
+        # Build a template automatically the first time a config misses.
+        # A consumer that wants templates only where it says so — or
+        # that cannot spare the one extra boot — turns this off and
+        # calls seed() itself.
+        self.auto_seed = auto_seed
         self.max_idle = max_idle
         self.ttl = ttl
         self.max_total = max_total
@@ -147,6 +160,10 @@ class VmPool:
         self._bound: dict[int, VmSession] = {}
         self._targets: dict[str, tuple[int, dict[str, Any]]] = {}
         self._filling: set[str] = set()
+        # Fingerprints whose template is being built right now, so a
+        # burst of misses triggers one background boot rather than one
+        # per miss.
+        self._seeding: set[str] = set()
         self._lock = threading.Lock()
         atexit.register(self.close)
 
@@ -195,9 +212,7 @@ class VmPool:
             if parked is None:
                 self._make_room()
                 self._maybe_refill(key)  # replace what we're about to boot
-                _log.debug("pool miss: booting a fresh %s",
-                           self.session_cls.__name__)
-                session = self.session_cls(**kwargs)
+                session = self._fresh(key, kwargs)
                 session._pool = self  # close() -> release
                 session.resumed = False
                 with self._lock:
@@ -227,6 +242,114 @@ class VmPool:
             with self._lock:
                 self._bound[id(session)] = session
             return session
+
+    def _seed_golden(self, key: str, frozen_session: Any) -> None:
+        """Publish an already-frozen session as this config's template.
+
+        Always best-effort: a golden snapshot is a cache, and failing to
+        make one costs a boot rather than a session.
+        """
+        path = golden.golden_dir(key)
+        if golden.usable(path):
+            return
+        try:
+            golden.publish_frozen(frozen_session, path)
+        except Exception:  # noqa: BLE001 — a cache miss, not an error
+            _log.debug("could not seed a golden snapshot", exc_info=True)
+
+    def seed(self, background: bool = True, **kwargs: Any) -> None:
+        """Build this config's golden snapshot now, before anyone asks.
+
+        The point of pre-warming without the cost of staying warm. On
+        the frozen posture a template is a *file*: it holds no VM, no
+        RAM and no process, and any number of sessions can start from
+        it at once — so unlike ``prewarm``, there is no warm level to
+        pick and nothing to shed. One boot, once, and every later miss
+        is a clone (32-52 ms against 1276 ms cold, measured on amd64).
+
+        Does nothing on a rung that cannot snapshot, and nothing if a
+        template already exists. Failures are logged, never raised:
+        this is an optimisation being requested, not a session.
+        """
+        if not hasattr(self.session_cls, "freeze"):
+            return
+        key = _fingerprint(kwargs, self.session_cls)
+        if golden.usable(golden.golden_dir(key)):
+            return
+        with self._lock:
+            if key in self._seeding:
+                return   # already being built; one boot is enough
+            self._seeding.add(key)
+        boot_kwargs = {k: v for k, v in kwargs.items() if k not in _BINDING_KEYS}
+        if background:
+            threading.Thread(target=self._seed, args=(key, boot_kwargs),
+                             daemon=True).start()
+        else:
+            self._seed(key, boot_kwargs)
+
+    def _seed(self, key: str, boot_kwargs: dict[str, Any]) -> None:
+        session = None
+        try:
+            session = self.session_cls(**boot_kwargs)
+            session.freeze()
+            self._seed_golden(key, session)
+        except (DudError, OSError) as e:
+            # Same expected-environment set prewarm tolerates: no
+            # kernel, no KVM, no vfkit. Seeding is optional.
+            _log.info("could not seed a golden snapshot: %s", e)
+        finally:
+            if session is not None:
+                try:
+                    session.close()   # frozen: disposal removes the rundir
+                except Exception:  # noqa: BLE001 — cleanup, already done
+                    _log.debug("close failed after seeding", exc_info=True)
+            with self._lock:
+                self._seeding.discard(key)
+
+    def _fresh(self, key: str, kwargs: dict[str, Any]):
+        """A machine for a miss: a golden clone if there is one, else a
+        cold boot — which then leaves a golden behind for next time.
+
+        The boot a miss used to pay is a pure function of the boot
+        fingerprint, so it is worth paying once rather than per miss.
+        Measured on amd64 CI: a clone reaches a serving VM in 32-52 ms
+        against 1276 ms cold.
+
+        Deliberately does NOT seed the snapshot itself. Freezing here
+        would make the first caller pay ~3 s of freeze plus a copy so
+        that later ones save a boot — a bad trade for anyone who runs
+        one session and leaves. `release` seeds it instead, out of a
+        freeze it was going to do anyway.
+
+        Every failure here falls back to booting. A golden snapshot is
+        a cache: not having one, or having one that will not restore,
+        must cost speed and never a session.
+        """
+        if not hasattr(self.session_cls, "freeze"):
+            return self.session_cls(**kwargs)  # rung cannot snapshot
+
+        path = golden.golden_dir(key)
+        if golden.usable(path):
+            try:
+                session = self.session_cls(restore_from=path, **kwargs)
+                _log.debug("pool miss: cloned the golden snapshot")
+                return session
+            except Exception:  # noqa: BLE001 — a bad cache is not a bad session
+                _log.warning("golden snapshot would not restore; discarding "
+                             "it and booting fresh", exc_info=True)
+                golden.discard(key)
+
+        _log.debug("pool miss: booting a fresh %s (no golden snapshot yet)",
+                   self.session_cls.__name__)
+        # Build the template behind them, on its own machine. The
+        # caller gets their boot and waits for nothing; every miss from
+        # here on is a clone. Deliberately not seeded from THIS session
+        # or from its release: both would put a ~3s freeze on somebody's
+        # critical path to save a later 40ms clone, which is the trade
+        # that made pooling slower than not pooling.
+        if self.auto_seed:
+            self.seed(**kwargs)
+        return self.session_cls(**kwargs)
 
     def _make_room(self) -> None:
         """Demand-driven reclaim: called before booting a fresh VM when
@@ -371,6 +494,11 @@ class VmPool:
                 try:
                     if hasattr(session, "freeze"):
                         session.freeze()
+                        # Free: this VM is frozen either way, so the
+                        # template costs a copy. Without it a prewarmed
+                        # pool still cold-booted on the first miss past
+                        # its warm level.
+                        self._seed_golden(key, session)
                 except Exception:  # noqa: BLE001 — unfreezable: discard it
                     _log.warning("prewarmed VM could not freeze; discarding",
                                  exc_info=True)
@@ -418,23 +546,29 @@ class VmPool:
         except Exception:  # noqa: BLE001 — scratch is cache; a miss is not an error
             _log.debug("scratch promotion failed; next boot starts cold",
                        exc_info=True)
-        # Frozen posture: park as files, not as a process. The reset
-        # already ran, so what freezes is a clean guest; thaw at the
-        # next acquire resumes it in tens of ms with imports warm.
+        key = _fingerprint(session._pool_kwargs, self.session_cls)
         if hasattr(session, "freeze"):
-            try:
-                session.freeze()
-            except Exception:  # noqa: BLE001 — an unfreezable VM can't be parked
-                _log.warning("freeze failed on release; discarding the VM "
-                             "instead of parking it", exc_info=True)
+            # A rung that can clone never freezes on release, and never
+            # parks an untagged VM. Parking here would mean snapshotting
+            # (~3s for a 1 GiB guest) to save a ~40ms clone — which made
+            # pooling ~2.4x SLOWER than not pooling at all.
+            #
+            # An affinity park is the one thing a clone cannot
+            # reproduce: it holds a WORKSPACE. So it is kept, but kept
+            # HOT — running costs RAM, which `max_affinity` bounds,
+            # where freezing would cost three seconds of every release
+            # that took this path.
+            if state is None or self.max_affinity <= 0:
                 self._teardown(session)
                 return
-        key = _fingerprint(session._pool_kwargs, self.session_cls)
         with self._lock:
             stale = self._expire_locked()
             bucket = self._idle.setdefault(key, [])
             bucket.insert(0, (time.monotonic(), state, session))
             limit = max(self.max_idle, self._targets.get(key, (0, None))[0])
+            if hasattr(session, "freeze"):
+                # Hot parks on a cloning rung: RAM, so bounded tightly.
+                limit = self.max_affinity
             overflow = bucket[limit:]
             del bucket[limit:]
         for _, _, s in overflow:

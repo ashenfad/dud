@@ -3,11 +3,11 @@ parking posture is invisible.
 
 The disposable thesis as a contract: any VM may vanish at any moment
 (crash, pool reclaim under max_total) and the owner's recovery is
-always the same move — re-acquire, re-push, retry. And the pool's two
-parking postures (vfkit parks hot, firecracker parks frozen) must be
-indistinguishable above the acquire/release seam: same reuse, same
-state affinity, same hygiene. These tests kill real VMM processes, so
-they are VM-rung only.
+always the same move — re-acquire, re-push, retry. And what the pool
+does with a released VM — discard it and clone a golden snapshot for
+the next caller, or park it hot — must be indistinguishable above the
+acquire/release seam: same state affinity, same hygiene. These tests
+kill real VMM processes, so they are VM-rung only.
 """
 
 import os
@@ -60,21 +60,31 @@ def test_dead_vm_raises_session_lost_and_reacquire_recovers():
 
 
 def test_pooled_reuse_with_hygiene():
-    """close() parks (hot or frozen per rung); the next acquire gets
-    the same machine, reset: env gone, workspace empty, imports warm."""
+    """The next acquire is clean — env gone, workspace empty —
+    whatever the rung did with the machine in between.
+
+    The two postures diverge here, and deliberately. A rung that can
+    clone a golden snapshot DISCARDS an untagged VM: parking one would
+    mean paying ~3 s to snapshot it in order to save a ~40 ms clone,
+    which is what made pooling slower than not pooling. A rung that
+    cannot clone still parks it hot, because there the alternative is a
+    full boot. Neither is observable above the seam — what a caller is
+    promised is a clean machine, not a particular one.
+    """
     pool = _pool()
     try:
         s = pool.acquire(**_vm_kwargs())
         s.shell("export LEAK=no && echo residue > /workspace/f.txt")
         marker = s._rundir
         s.close()
-        if _BACKEND == "firecracker":
-            # Frozen posture: parked = files, no VMM process.
-            assert s.frozen and s._proc.poll() is not None
+        assert not s.frozen, "a plain release must never pay for a snapshot"
         s2 = pool.acquire(**_vm_kwargs())
-        assert s2._rundir == marker  # same machine...
+        if _BACKEND == "firecracker":
+            assert s2._rundir != marker  # discarded; this one is a clone
+        else:
+            assert s2._rundir == marker  # parked hot; the same machine
         r = s2.shell("echo ${LEAK:-clean}; ls /workspace")
-        assert "clean" in r.transcript  # ...new session
+        assert "clean" in r.transcript
         assert "residue" not in r.transcript
         s2.close()
     finally:
@@ -119,7 +129,9 @@ def test_the_reset_sweep_does_not_burn_its_deadline():
 
 def test_state_affinity_across_park():
     """park_state tags the parked tree; a matching acquire resumes
-    without a push — through a freeze/thaw on the frozen posture."""
+    without a push. The workspace is the one thing a golden clone
+    cannot reproduce, so this is the park that is still worth keeping —
+    and it is kept hot on every rung."""
     pool = _pool()
     try:
         s = pool.acquire(**_vm_kwargs())
