@@ -75,6 +75,21 @@ class ChannelClosed(Exception):
     """EOF on the socket."""
 
 
+class FrameTooLarge(DudError):
+    """A message body exceeded this channel's send ceiling.
+
+    Distinct from :class:`~dud.values.ValueTooLarge`, which bounds one
+    value: this bounds the whole JSON object a peer will have to parse,
+    and so covers everything a per-value check cannot see — the names
+    beside the values, and the aggregate of many individually-legal
+    ones. Both exist because the guest's peer is a supervisor that is
+    PID 1 on a VM rung, and per-value limits turned out to be a
+    guarantee about payloads rather than about frames.
+
+    The channel stays usable: nothing was written.
+    """
+
+
 def _arm(sock: socket.socket, deadline: float | None) -> None:
     """Point the socket at the remaining budget before a blocking call.
 
@@ -115,10 +130,24 @@ class Channel:
     incoming request is a protocol error).
     """
 
-    def __init__(self, sock: socket.socket, handler: Handler | None = None):
+    def __init__(self, sock: socket.socket, handler: Handler | None = None,
+                 send_cap: int | None = None):
         self._sock = sock
         self.handler = handler
         self._next_id = 0
+        # Ceiling on the JSON body of anything sent from this end, or
+        # None for no ceiling. Set by the guest runner, whose peer is a
+        # single-threaded supervisor that parses each body whole — and
+        # is PID 1 on a VM rung, where exhausting it is a panic rather
+        # than a failed exec. Left None on the host side: a body the
+        # host composed is not a payload anyone needs protecting from.
+        #
+        # Binary attachments are deliberately outside it. They are read
+        # as opaque bytes rather than parsed, and capping them here
+        # would silently make cache writes a wire question when their
+        # size is a question about cache semantics (see ROADMAP,
+        # "cache-as-service semantics").
+        self.send_cap = send_cap
 
     # ---- framing ----------------------------------------------------
 
@@ -127,6 +156,15 @@ class Channel:
     ) -> None:
         msg = dict(msg, nbin=len(bins))
         data = json.dumps(msg, separators=(",", ":")).encode()
+        if self.send_cap is not None and len(data) > self.send_cap:
+            # Checked here, at the one place everything funnels through,
+            # because the per-value guards upstream can only bound what
+            # they were pointed at. Names, argument counts, and any path
+            # nobody thought to guard all arrive here anyway.
+            raise FrameTooLarge(
+                f"message body is {len(data)} bytes, over this channel's "
+                f"{self.send_cap} byte limit; nothing was sent"
+            )
         out = bytearray(_LEN.pack(len(data)) + data)
         for b in bins:
             out += _LEN.pack(len(b)) + b

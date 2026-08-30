@@ -42,6 +42,23 @@ def _mib(n: int) -> str:
     return f"{n / (1 << 20):.1f} MiB"
 
 
+_REPORT_KEY_MAX = 64
+
+
+def _report_key(k: str) -> str:
+    """The name to file a skip under.
+
+    Truncated, because ``skipped`` rides the very frame the caller is
+    being told about: reporting a 40 MB binding name under itself would
+    put that name on the wire anyway, and the guard would be reporting
+    the problem by causing it. Long names collapse together, which is
+    the right trade for input nobody legitimately produces.
+    """
+    if len(k) <= _REPORT_KEY_MAX:
+        return k
+    return k[: _REPORT_KEY_MAX - 3] + "..."
+
+
 def _encode_sized(v: Any) -> tuple[dict, int]:
     """``(tagged form, its size on the wire)``.
 
@@ -131,18 +148,26 @@ def encode_map(
     skipped: dict[str, str] = {}
     used = 0
     for k, v in d.items():
+        # The name is on the wire too, and nothing else was measuring
+        # it: `globals()['k' * 40_000_000] = 1` charged one byte to the
+        # total and put 40 MB in the frame. Counting it costs nothing
+        # and closes a hole that a value-shaped guard cannot see.
+        kbytes = len(k.encode()) + 3  # the quotes and the colon ride along
         try:
             tagged, size = _encode_sized(v)
         except NotRepresentable:
-            skipped[k] = type(v).__name__
+            skipped[_report_key(k)] = type(v).__name__
             continue
+        size += kbytes
         if cap is not None and size > cap:
-            skipped[k] = (f"{type(v).__name__} ({_mib(size)} exceeds the "
-                          f"{_mib(cap)} per-value limit)")
+            skipped[_report_key(k)] = (
+                f"{type(v).__name__} ({_mib(size)} exceeds the "
+                f"{_mib(cap)} per-value limit)")
             continue
         if total is not None and used + size > total:
-            skipped[k] = (f"{type(v).__name__} ({_mib(size)} would exceed "
-                          f"the {_mib(total)} total)")
+            skipped[_report_key(k)] = (
+                f"{type(v).__name__} ({_mib(size)} would exceed "
+                f"the {_mib(total)} total)")
             continue
         out[k] = tagged
         used += size

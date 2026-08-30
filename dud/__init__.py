@@ -17,7 +17,12 @@ from typing import Any
 from .backends.base import public_methods
 from .backends.subprocess import Session
 from .errors import DudError
-from .proto import PROTO_VERSION, ProtocolError, RemoteError
+from .proto import (
+    PROTO_VERSION,
+    FrameTooLarge,
+    ProtocolError,
+    RemoteError,
+)
 from .results import Diff, ExecError, PythonResult, ShellResult
 from .values import NotRepresentable, ValueTooLarge
 
@@ -41,6 +46,7 @@ __all__ = [
     "NotRepresentable",
     "ValueTooLarge",
     "ProtocolError",
+    "FrameTooLarge",
     "RemoteError",
     "PROTO_VERSION",
 ]

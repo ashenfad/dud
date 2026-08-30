@@ -104,3 +104,26 @@ def test_the_per_value_limit_is_named_before_the_total():
     raise the wrong number."""
     _enc, skipped = encode_map({"big": "z" * 5000}, cap=1000, total=1_000_000)
     assert "per-value limit" in skipped["big"]
+
+
+def test_a_binding_name_counts_toward_the_limits():
+    """The name is on the wire beside the value, and nothing was
+    measuring it: `globals()['k' * 40_000_000] = 1` charged one byte to
+    the total and put 40 MB in the frame."""
+    enc, skipped = encode_map({"k" * 5000: 1, "ok": 2}, cap=1000)
+    assert list(enc) == ["ok"]
+    assert len(skipped) == 1
+
+
+def test_an_oversized_name_is_not_reported_under_itself():
+    """`skipped` rides the very frame the caller is being warned about,
+    so filing a 40 MB name under itself would put that name on the wire
+    anyway — the guard causing the problem it reports."""
+    _enc, skipped = encode_map({"k" * 5000: 1}, cap=1000)
+    reported = next(iter(skipped))
+    assert len(reported) <= 64 and reported.endswith("...")
+
+
+def test_a_short_name_is_reported_verbatim():
+    _enc, skipped = encode_map({"df": object()})
+    assert skipped == {"df": "object"}
