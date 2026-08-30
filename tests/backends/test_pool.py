@@ -1247,3 +1247,24 @@ def test_shared_pool_does_not_infer_affinity_from_a_tag(monkeypatch, tmp_path):
     s.close(park_state="commit-abc")
     assert s.torn_down
     pool.close()
+
+
+def test_max_affinity_does_not_gate_a_rung_that_cannot_clone(monkeypatch):
+    """The asymmetry, pinned so the docs cannot drift off it again.
+
+    `max_affinity` asks "is holding a VM worth skipping a push", and
+    that question only exists where the alternative is a ~40 ms clone.
+    On vfkit the alternative is a ~1 s boot, so every release parks
+    under `max_idle` and a tag resumes even at 0. Documented rather
+    than fixed, because the implementation is the right way round —
+    but a reader who takes `max_affinity=0` to mean "no affinity
+    anywhere" would be wrong, which is what this guards.
+    """
+    p = _pool(monkeypatch, max_affinity=0)   # plain FakeVM: no freeze
+    s = p.acquire(image="x")
+    s.close(park_state="commit-abc")
+    assert not s.torn_down, "vfkit discarded a tagged park"
+
+    hit = p.acquire(state="commit-abc", image="x")
+    assert hit is s and hit.resumed, "vfkit affinity did not resume at 0"
+    p.close()
