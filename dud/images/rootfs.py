@@ -175,13 +175,22 @@ def _site_packages(fs: FileSet) -> str:
 # Host-only code the guest never imports: excluded from injection so
 # edits to it don't bust the rootfs cache (the spec hash covers exactly
 # the injected set). dud/__init__ pulls backends.subprocess -> base, so
-# those two stay; the VMM driver and pool are pure host machinery.
+# those two stay; everything that drives or pools a VMM is host
+# machinery.
+#
+# `vm.py` and `golden.py` were shipped for a while, and the giveaway
+# that they never belonged is that they could not have run: both import
+# `dud.images`, which is itself host-only and therefore absent from the
+# image. So they were unimportable weight whose only effect was to bust
+# the rootfs cache whenever host-side VMM code changed.
 _HOST_ONLY = {
     ("dud", "images"),
     ("dud", "kernels.py"),
     ("dud", "backends", "vfkit.py"),
     ("dud", "backends", "firecracker.py"),
     ("dud", "backends", "pool.py"),
+    ("dud", "backends", "vm.py"),
+    ("dud", "backends", "golden.py"),
 }
 
 
