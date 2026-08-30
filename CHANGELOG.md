@@ -126,8 +126,26 @@ record for those.
   and their size is a question about cache semantics rather than about
   the wire (see ROADMAP, "cache-as-service semantics").
 
-  `dud.ValueTooLarge` is the new exception, a subclass of
-  `NotRepresentable` so existing handling keeps working.
+  Because a frame is more than the values in it, the guest channel
+  also carries a ceiling on the whole JSON body it will send —
+  `caps["frame"]`, derived by default from the other caps so raising
+  one of those can never leave this as the thing that refuses an exec.
+  Per-value limits are what give a good error and a precise
+  `outputs_skipped` entry; this is what makes the bound a guarantee.
+  It covers the three ways past a value-shaped check:
+
+  - a **binding name** (`globals()['k' * 40_000_000] = 1` charged one
+    byte to the total and put 40 MB in the frame — names now count,
+    and an oversized one is reported under a truncated key, since
+    filing it under itself would put it on the wire anyway);
+  - an **emit name**, bounded like its value;
+  - **many individually-legal hostcall arguments** — twenty of 7 MiB
+    each pass an 8 MiB per-value check and assemble into 140 MB.
+
+  `dud.ValueTooLarge` and `dud.FrameTooLarge` are the new exceptions.
+  The first subclasses `NotRepresentable` so existing handling keeps
+  working; the second is raised before anything is written, so the
+  channel stays usable.
 
 ### Fixed
 

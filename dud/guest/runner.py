@@ -32,8 +32,8 @@ from collections.abc import MutableMapping
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
 
-from ..proto import Channel, RemoteError
-from ..values import decode_map, encode_map, encode_value
+from ..proto import Channel, FrameTooLarge, RemoteError
+from ..values import ValueTooLarge, decode_map, encode_map, encode_value
 
 _RUNNER_FILE = "<session>"
 
@@ -68,6 +68,13 @@ _CAP_TOTAL = 1 << 21    # 2 MiB across entries — bounds entry * count
 # layer's policy, not a wire question. See the CHANGELOG note.
 _CAP_VALUE = 8 << 20     # 8 MiB for one harvested binding, emit, or arg
 _CAP_OUTPUTS = 32 << 20  # 32 MiB across everything one exec harvests
+
+# Headroom over the sum of the parts, for names and framing. The frame
+# ceiling is DERIVED from the other caps rather than fixed, so raising
+# one of them can never leave this as the thing that refuses the exec —
+# a ceiling that silently overrides the knob above it is worse than no
+# ceiling, because the message names the wrong number.
+_FRAME_SLACK = 8 << 20
 
 # Smallest render budget worth giving one print argument; below this a
 # value renders to punctuation. Always clamped to the budget that is
@@ -225,6 +232,18 @@ class HostProxy:
                      "args": [enc_args[str(i)] for i in range(len(args))],
                      "kwargs": enc_kwargs},
                 )
+            except FrameTooLarge as e:
+                # Each argument was individually legal and the total was
+                # not: 20 arguments of 7 MiB pass a per-value ceiling of
+                # 8 MiB and assemble into 140 MB. Caught rather than
+                # pre-computed because the channel already measures the
+                # exact body, and re-serializing every argument here to
+                # sum it would double the cost of every large hostcall
+                # to catch a case the wire refuses anyway.
+                raise TypeError(
+                    f"{name}.{method}: arguments are too large in "
+                    f"aggregate — {e}"
+                ) from None
             except RemoteError as e:
                 raise RuntimeError(f"{name}.{method}: {e.message}") from None
             from ..values import decode_value
@@ -619,6 +638,10 @@ def run(channel: Channel, req: dict) -> dict:
     render_budget = int(render_budget) if render_budget else None
     value_cap = int(caps.get("value", _CAP_VALUE))
     outputs_cap = int(caps.get("outputs", _CAP_OUTPUTS))
+    # Everything this exec can legitimately put in one body, plus slack.
+    channel.send_cap = int(caps.get(
+        "frame", outputs_cap + stdout_cap + total_cap + _FRAME_SLACK
+    ))
 
     # Workspace-root imports, cwd-independent: filesystem modules resolve
     # from the workspace root (`import app.api...` works after `cd app`),
@@ -647,11 +670,20 @@ def run(channel: Channel, req: dict) -> dict:
         is an explicit call, and an event that silently never arrived
         is the worst shape for one — the host cannot tell it from an
         event that was never fired.
+
+        The NAME is bounded on the same argument as the value. It goes
+        into the same body and gets parsed by the same supervisor, so
+        guarding only the value made ``emit('n' * 40_000_000, None)`` a
+        way straight past the guard.
         """
-        channel.request(
-            "emit",
-            {"name": str(name), "value": encode_value(value, cap=value_cap)},
-        )
+        name = str(name)
+        tagged = encode_value(value, cap=value_cap)
+        if len(name.encode()) > value_cap:
+            raise ValueTooLarge(
+                f"emit name is {len(name)} characters, over the "
+                f"{value_cap} byte limit"
+            )
+        channel.request("emit", {"name": name, "value": tagged})
 
     g["emit"] = emit
     for name in req.get("host_objects", []):

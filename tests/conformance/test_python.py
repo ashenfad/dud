@@ -276,6 +276,53 @@ def test_the_value_guard_is_the_callers_to_raise(session):
     assert r.outputs_skipped == {}
 
 
+def test_a_binding_name_cannot_smuggle_a_payload(session):
+    """The guard has to bound the FRAME, not just the values in it.
+
+    `globals()['k' * N] = 1` charged one byte to the harvest total and
+    put the whole name in the body the supervisor parses. The name is
+    counted now — and the skip is filed under a truncated key, because
+    reporting it verbatim would put the payload on the wire anyway.
+    """
+    r = session.python("globals()['k' * 10_000_000] = 1\nkeep = 2")
+    assert r.ok, r.error
+    assert r.outputs == {"keep": 2}
+    assert len(r.outputs_skipped) == 1
+    reported = next(iter(r.outputs_skipped))
+    assert len(reported) <= 64, "the oversized name was echoed back whole"
+
+
+def test_many_legal_hostcall_arguments_are_refused_together(make_session):
+    """Individually legal, collectively enormous. A per-value ceiling
+    cannot see an argument count, and the supervisor parses the whole
+    request either way.
+
+    Driven with small caps rather than large data: the property is the
+    arithmetic, and making a VM allocate 90 MB to prove it would be a
+    slow way to learn the same thing.
+    """
+    class Echo:
+        def echo(self, *a):
+            return len(a)
+
+    with make_session(host_objects={"svc": Echo()},
+                      allow={"svc": {"echo"}}) as s:
+        r = s.python(
+            "x = svc.echo(*['z' * 90_000 for _ in range(10)])",
+            caps={"value": 100_000, "frame": 500_000},
+        )
+        assert not r.ok
+        assert r.error.etype == "TypeError"
+        assert "aggregate" in r.error.message
+
+        # And one argument of the same size still goes through, so the
+        # aggregate check is what refused it rather than the per-value one.
+        ok = s.python("y = svc.echo('z' * 90_000)",
+                      caps={"value": 100_000, "frame": 500_000})
+        assert ok.ok, ok.error
+        assert ok.outputs["y"] == 1
+
+
 def test_an_oversized_emit_raises_where_it_was_called(session):
     """Emits are events, and a dropped event is indistinguishable from
     one that never fired. So this fails at the `emit()` the agent
@@ -283,6 +330,17 @@ def test_an_oversized_emit_raises_where_it_was_called(session):
     r = session.python("emit('big', 'z' * 20_000_000)")
     assert not r.ok
     assert r.error.etype == "ValueTooLarge"
+    assert session.emits == []
+
+
+def test_an_oversized_emit_name_is_refused_too(session):
+    """The name rides the same body and is parsed by the same
+    supervisor, so guarding only the value left `emit('n' * N, None)`
+    as a way straight past the guard."""
+    r = session.python("emit('n' * 200_000, None)", caps={"value": 100_000})
+    assert not r.ok
+    assert r.error.etype == "ValueTooLarge"
+    assert "name" in r.error.message
     assert session.emits == []
 
 

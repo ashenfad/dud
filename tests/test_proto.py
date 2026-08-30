@@ -15,6 +15,7 @@ import pytest
 from dud.proto import (
     Channel,
     ChannelClosed,
+    FrameTooLarge,
     ProtocolError,
     PROTO_VERSION,
     RemoteError,
@@ -197,3 +198,54 @@ def test_serve_reports_why_it_stopped():
     server = Channel(b, handler=handler)
     a.close()
     assert server.serve() == "eof"
+
+
+# ---- send ceiling -------------------------------------------------------
+
+
+def test_send_cap_refuses_an_oversized_body():
+    """The structural backstop. Per-value guards can only bound what
+    they were pointed at; names, argument counts and any path nobody
+    thought to guard all funnel through here anyway."""
+    a, b = socket.socketpair()
+    try:
+        ch = Channel(a, send_cap=1000)
+        with pytest.raises(FrameTooLarge) as e:
+            ch._send_msg({"kind": "req", "verb": "x", "body": {"v": "z" * 5000}}, [])
+        assert "nothing was sent" in str(e.value)
+        # And nothing was: the peer has no frame waiting.
+        b.settimeout(0.1)
+        with pytest.raises((TimeoutError, OSError)):
+            b.recv(1)
+    finally:
+        a.close()
+        b.close()
+
+
+def test_send_cap_ignores_binary_attachments():
+    """Attachments are read as opaque bytes rather than parsed, and
+    capping them here would quietly make cache writes a wire question
+    when their size is a question about cache semantics."""
+    a, b = socket.socketpair()
+    try:
+        # Comfortably over the cap, comfortably under the socket buffer:
+        # nobody is draining the far end, so a payload big enough to
+        # fill it would block in sendall and hang the test rather than
+        # fail it.
+        Channel(a, send_cap=100)._send_msg({"kind": "req", "verb": "x"},
+                                            [b"z" * 4_000])
+        assert b.recv(4)  # it went out
+    finally:
+        a.close()
+        b.close()
+
+
+def test_no_send_cap_by_default():
+    """The host side sets none: a body the host composed is not a
+    payload anyone needs protecting from."""
+    a, b = socket.socketpair()
+    try:
+        assert Channel(a).send_cap is None
+    finally:
+        a.close()
+        b.close()
