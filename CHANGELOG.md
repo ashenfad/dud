@@ -8,9 +8,11 @@ record for those.
 The theme is that a session should cost what it does, and that when it
 doesn't, you can find out why.
 
-A pool miss no longer boots a machine — it clones one, in ~40 ms
-against 1276 ms — which made the firecracker conformance suite go from
-~20 minutes to under three. The firecracker rung runs on x86-64, where
+On firecracker, a pool miss stops booting a machine once there is a
+template for the config: it clones one, in ~40 ms against 1276 ms,
+which took the firecracker conformance suite from ~20 minutes to under
+three. (The first miss for a config still boots — that is what builds
+the template — and `scratch`-backed configs always do.) The firecracker rung runs on x86-64, where
 most Linux servers are. Every unbounded payload a guest could push
 across the wire now has a ceiling, and every ceiling reports itself.
 And the two extension points that were discovered by convention are
@@ -189,8 +191,11 @@ now named in a signature.
   three rungs' identical pooled/state handling collapsed to one copy
   while there.
 
-- **`max_affinity` on `VmPool`** (default 0 — off): how many tagged VMs
-  to keep hot *per boot fingerprint* for a same-content resume. An
+- **`max_affinity` on `VmPool`** (default 0 — off; firecracker only):
+  how many tagged VMs to keep hot *per boot fingerprint* for a
+  same-content resume. vfkit never consults it — there the alternative
+  to parking is a full boot, so every release parks under `max_idle`
+  and a tag resumes even at 0. An
   affinity park now buys exactly one thing — a skipped `push_tree` —
   since a plain miss clones in ~40 ms instead of booting, so whether it
   is worth a 1-2 GiB guest is entirely a question of what a push costs.

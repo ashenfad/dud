@@ -316,10 +316,13 @@ anyway.
 
 `state="<your content hash>"` **parks** a VM — sets it aside still
 holding that exact tree — so the next session with the same content
-resumes it (`resumed=True`) instead of re-pushing. It is **off by
-default**, and worth understanding before turning on: a park keeps a
-whole VM running, and the only thing it saves is one `push_tree`, since
-a miss now clones rather than boots. A push costs ~40 µs per file, so
+resumes it (`resumed=True`) instead of re-pushing. On macOS/vfkit this
+just works — the VM was going to be parked anyway, since the
+alternative there is a full boot.
+
+On firecracker it is **off by default**, and worth understanding before
+turning on: a park keeps a whole VM running, and the only thing it
+saves is one `push_tree`, since a miss there clones rather than boots. A push costs ~40 µs per file, so
 on the dozens-of-files workspaces this usually serves that is
 single-digit milliseconds against a ~45 ms acquire. It starts paying
 around ten thousand files (~420 ms).

@@ -19,12 +19,20 @@ What a release does with a VM depends on what the backend can do:
   1 GiB guest, to save that 40 ms — which made pooling slower than not
   pooling at all.
 
-An **affinity park** is the exception on either rung: a release
+On a cloning rung, an **affinity park** is the exception: a release
 carrying ``park_state`` holds a WORKSPACE, which is the one thing a
 clone cannot reproduce, so that VM is kept — and kept running, since
 freezing it would charge three seconds to every release that took the
 path. ``max_affinity`` bounds how many, per fingerprint, and is 0 by
 default (see its comment for the measurement behind that).
+
+``max_affinity`` is meaningless on a rung that cannot clone, and is
+not consulted there. vfkit parks every release, tagged or not, bounded
+by ``max_idle`` — so a tag still resumes on vfkit with
+``max_affinity=0``. That is not an inconsistency to fix: the knob asks
+"is holding a VM worth skipping a push", and that question only exists
+where the alternative is a 40 ms clone. Where the alternative is a
+~1 s boot, holding it always wins.
 
 The posture is duck-typed off the session (``freeze``/``thaw``); the
 acquire/release contract, fingerprints, affinity tags, and caps are
@@ -137,8 +145,9 @@ class VmPool:
     ``acquire`` returns a session whose ``close()`` parks the VM here
     (after guest reset) instead of powering it off; the pool tears VMs
     down on idle-cap overflow, TTL expiry (checked lazily), ``close()``,
-    or process exit. ``session_cls`` picks the rung (default vfkit);
-    sessions that can ``freeze`` park frozen (see the module docstring).
+    or process exit. ``session_cls`` picks the rung; what a release
+    does with the VM depends on whether that rung can clone (see the
+    module docstring).
     """
 
     def __init__(
@@ -151,10 +160,16 @@ class VmPool:
         auto_seed: bool = True,
     ):
         # How many tagged VMs to hold RUNNING **per boot fingerprint**
-        # for a same-content resume, on a rung that can clone. Per-key,
-        # not global: a pool serving several configs holds up to this
-        # many for each, and `max_total` (None by default) is the only
-        # global bound. That alone argues for a conservative default.
+        # for a same-content resume. Per-key, not global: a pool serving
+        # several configs holds up to this many for each, and
+        # `max_total` (None by default) is the only global bound. That
+        # alone argues for a conservative default.
+        #
+        # CLONING RUNGS ONLY (firecracker). A rung that cannot clone
+        # never consults this: vfkit parks every release under
+        # `max_idle`, so a tag resumes there even at 0. See the module
+        # docstring for why that asymmetry is correct rather than an
+        # oversight.
         #
         # Off by default, which took a measurement to get right. An
         # affinity park keeps a whole VM alive to skip exactly one
