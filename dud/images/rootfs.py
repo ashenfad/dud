@@ -247,6 +247,19 @@ def _init_script(site: str, workspace: str,
 
 _INTERPRETER = "usr/local/bin/python3"
 
+#: ``dud-emit`` on the guest's PATH. A shim, not a copy: the logic
+#: lives in ``dud.guest.emit``, which is injected into site-packages
+#: like the rest of the guest runtime — so editing it moves
+#: ``_dud_code_hash`` and busts the rootfs cache, which a script
+#: generated from here does not (``dud/images`` is _HOST_ONLY, the same
+#: trap ``/init`` carries; hence the PIPELINE_VERSION bump that shipped
+#: with this).
+_EMIT_SHIM = b"""#!/usr/local/bin/python3
+import sys
+from dud.guest.emit import main
+sys.exit(main())
+"""
+
 
 def build_fileset(
     image: registry.PulledImage, workspace: str = "/workspace"
@@ -262,6 +275,7 @@ def build_fileset(
         )
     site = inject_dud(fs)
     fs.add_dir(workspace, 0o755)
+    fs.add_file("usr/local/bin/dud-emit", _EMIT_SHIM, 0o755)
     fs.add_file(
         "init", _init_script(site, workspace, _image_env(image.env)), 0o755
     )

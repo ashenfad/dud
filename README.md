@@ -79,6 +79,40 @@ change, so `chmod +x` on an otherwise untouched file still shows up.
 
 Symlinks and empty directories do not round-trip today.
 
+### Structured output from shell work
+
+`emit` is not Python-only. Shell execs get `dud-emit`, and it lands on
+the same `on_emit` callback with the same shape — the host can't tell
+which side fired it:
+
+```python
+s = dud.session("vm", on_emit=lambda name, value: print(name, value))
+s.shell("""
+  make test 2>&1 | tail -5
+  dud-emit tests '{"failed": 3}'
+""")
+```
+
+```
+dud-emit NAME [VALUE]
+```
+
+`VALUE` is JSON if it parses and a plain string otherwise, so both
+`dud-emit rows '{"n": 3}'` and `dud-emit status running` do the
+obvious thing. The one sharp edge: `dud-emit n 42` emits the *number*
+42 — quote it as `'"42"'` for the string. Omitting the value emits
+`null`, matching `emit(name)` in Python.
+
+Emits arrive **live, mid-exec**, so a long build can report progress
+while it runs rather than at the end, and they survive a timeout —
+they're events, not results. Every child bash spawns inherits the
+channel, so it works inside `$(...)`, pipelines and backgrounded jobs.
+
+This exists because bash is the honest test of whether the emit
+contract is language-neutral: no objects, no namespace, no pickle. It
+needed no new wire verb and no host-side code — which is the actual
+evidence, rather than the ergonomics.
+
 ### Where the files live
 
 The guest mounts its workspace at **`/workspace`** (`session(...,
