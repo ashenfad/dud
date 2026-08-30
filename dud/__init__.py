@@ -19,7 +19,7 @@ from .backends.subprocess import Session
 from .errors import DudError
 from .proto import PROTO_VERSION, ProtocolError, RemoteError
 from .results import Diff, ExecError, PythonResult, ShellResult
-from .values import NotRepresentable
+from .values import NotRepresentable, ValueTooLarge
 
 __all__ = [
     "__version__",
@@ -39,6 +39,7 @@ __all__ = [
     "IsolationUnavailable",
     "PolicyError",
     "NotRepresentable",
+    "ValueTooLarge",
     "ProtocolError",
     "RemoteError",
     "PROTO_VERSION",

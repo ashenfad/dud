@@ -246,6 +246,46 @@ def test_rich_values_without_a_hook_are_reported_not_invented(session):
     assert "ui" not in ls.transcript
 
 
+def test_an_oversized_binding_is_skipped_not_shipped(session):
+    """The value guard, at the session level.
+
+    An uncapped harvest let one assignment size the supervisor's
+    memory — and on a VM rung the supervisor is PID 1 with the
+    machine's whole RAM, so the failure is a panic rather than a bad
+    exec. Skipped rather than truncated: half a value is a wrong
+    answer, not a smaller one, and the name still comes back saying
+    what happened.
+    """
+    r = session.python("data = 'z' * 20_000_000\nkeep = 7")
+    assert r.ok, r.error
+    assert r.outputs == {"keep": 7}  # the small one is untouched
+    assert "data" in r.outputs_skipped
+    assert "str" in r.outputs_skipped["data"]
+
+
+def test_the_value_guard_is_the_callers_to_raise(session):
+    """A guard, not a policy: a caller who wants a big value can have
+    one. Both ceilings have to move — the per-value one and the total —
+    and the message a skip carries names whichever is in the way."""
+    r = session.python(
+        "data = 'z' * 20_000_000",
+        caps={"value": 64_000_000, "outputs": 64_000_000},
+    )
+    assert r.ok, r.error
+    assert len(r.outputs["data"]) == 20_000_000
+    assert r.outputs_skipped == {}
+
+
+def test_an_oversized_emit_raises_where_it_was_called(session):
+    """Emits are events, and a dropped event is indistinguishable from
+    one that never fired. So this fails at the `emit()` the agent
+    wrote, rather than vanishing the way a harvested binding does."""
+    r = session.python("emit('big', 'z' * 20_000_000)")
+    assert not r.ok
+    assert r.error.etype == "ValueTooLarge"
+    assert session.emits == []
+
+
 def test_no_render_budget_means_plain_text(session):
     """dud never invents an observation size. Unasked, entries carry
     exactly what print produced."""

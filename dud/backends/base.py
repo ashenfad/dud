@@ -459,13 +459,21 @@ class HostSession:
 
         ``caps`` are resource guards on what an exec may send back —
         ``stdout`` (transcript), ``entry`` (one print), ``entries``
-        (count), ``total`` (across entries). They exist to stop a
-        runaway print loop flooding the channel, not to size an
-        observation: choosing what a model should see is the caller's
-        job, and it gets every entry plus its metadata to do it with.
-        The defaults sit far above any plausible observation, so raising
-        them is rarely the answer; lowering them is a way to bound a
-        specific untrusted exec.
+        (count), ``total`` (across entries), ``value`` (one harvested
+        binding, ``emit`` value, or hostcall argument) and ``outputs``
+        (across everything one exec harvests). They exist to stop a
+        runaway exec flooding the channel, not to size an observation:
+        choosing what a model should see is the caller's job, and it
+        gets every entry plus its metadata to do it with. The defaults
+        sit far above any plausible observation, so raising them is
+        rarely the answer; lowering them is a way to bound a specific
+        untrusted exec.
+
+        The two value guards refuse rather than truncate, because half
+        a JSON document is a wrong answer rather than a smaller one. A
+        harvested binding over ``value`` lands in ``outputs_skipped``
+        with its size; an ``emit`` or hostcall argument over it raises
+        in the guest, at the call the agent wrote.
 
         ``render_budget`` asks the guest to render each print entry to
         roughly that many characters using structural elision
