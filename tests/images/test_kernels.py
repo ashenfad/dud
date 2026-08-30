@@ -192,3 +192,43 @@ def _spec_replace(spec: KernelSpec, **overrides) -> KernelSpec:
     from dataclasses import asdict
 
     return KernelSpec(**{**asdict(spec), **overrides})
+
+
+def test_both_architectures_are_pinned():
+    """rung 3 is described as "a disposable Linux/KVM microVM", and for
+    a long time it could only boot on arm64 — most Linux servers are
+    x86-64. Names rather than a count, as with the deb pins."""
+    from dud.kernels import KERNELS
+
+    assert set(KERNELS) == {"arm64", "amd64"}
+
+
+def test_both_arches_pin_the_same_kernel_version():
+    """One conformance corpus over three rungs is the invariant; a
+    different kernel per arch would quietly make it two corpora, and
+    erofs and overlayfs are exactly where versions diverge."""
+    from dud.kernels import KERNELS
+
+    assert len({k.kernel for k in KERNELS.values()}) == 1
+    assert len({k.name for k in KERNELS.values()}) == 1
+
+
+def test_the_amd64_asset_is_a_vmlinux_not_a_vmlinuz():
+    """x86-64 firecracker loads an uncompressed ELF and refuses a
+    bzImage; aarch64 takes a PE `Image`. Kata's tarball ships both
+    spellings side by side, so picking the wrong member is a live
+    mistake that would only show up as a boot failure.
+    """
+    from dud.kernels import KERNELS
+
+    assert "vmlinux" in KERNELS["amd64"].url.rsplit("/", 1)[1]
+    assert "vmlinuz" not in KERNELS["amd64"].url
+    assert KERNELS["arm64"].url.rsplit("/", 1)[1].startswith("Image-")
+
+
+def test_every_kernel_pin_carries_a_digest():
+    from dud.kernels import KERNELS
+
+    for arch, spec in KERNELS.items():
+        assert len(spec.image_sha256) == 64, arch
+        assert arch in spec.url, f"{arch} pin points at another arch's asset"
