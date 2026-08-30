@@ -165,3 +165,46 @@ def test_fetch_deb_digest_mismatch_raises(tmp_path, monkeypatch):
 def test_unknown_pin_raises():
     with pytest.raises(DebError, match="no pinned deb"):
         debs.deb_spec("nonexistent-tool", "arm64")
+
+
+def test_every_pin_covers_both_architectures():
+    """The drift this closes: dud pinned arm64 only, so `rung 3` — a
+    "disposable Linux/KVM microVM" — could not run on the x86-64
+    machines most Linux servers are. The gap was a comment ("Add the
+    bookworm amd64 erofs-utils pin before running on Intel"), which is
+    not something a build can notice.
+
+    Names, not counts: a count passes if somebody adds two arm64 pins.
+    """
+    from dud.images.debs import DEBS
+
+    by_arch: dict[str, set[str]] = {}
+    for name, arch in DEBS:
+        by_arch.setdefault(arch, set()).add(name)
+    assert set(by_arch) == {"arm64", "amd64"}
+    assert by_arch["arm64"] == by_arch["amd64"]
+
+
+def test_a_pin_agrees_with_its_own_url_and_arch():
+    """The fields are hand-written per entry, so the URL is where a
+    copy-paste shows up — an amd64 row still pointing at the arm64
+    file would fetch a working deb of the wrong architecture, and the
+    digest would match it."""
+    from dud.images.debs import DEBS
+
+    for (name, arch), spec in DEBS.items():
+        assert spec.name == name and spec.arch == arch
+        assert spec.url.endswith(f"{name}_{spec.version}_{arch}.deb"), spec.url
+        assert len(spec.sha256) == 64
+
+
+def test_pinned_versions_match_across_arches():
+    """Same Debian version on both, so a guest built on either arch has
+    the same tools. Not required by anything mechanical — which is why
+    it is worth pinning here."""
+    from dud.images.debs import DEBS
+
+    versions: dict[str, set[str]] = {}
+    for (name, _arch), spec in DEBS.items():
+        versions.setdefault(name, set()).add(spec.version)
+    assert all(len(v) == 1 for v in versions.values()), versions

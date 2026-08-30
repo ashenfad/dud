@@ -49,8 +49,10 @@ class DebSpec:
     sha256: str
 
 
-# arm64-only for now: an amd64 erofs build fails loud in deb_spec.
-# Add the bookworm amd64 erofs-utils pin before running on Intel.
+# Both arches, same Debian bookworm versions. Pinned per (name, arch)
+# rather than templated by arch because the digest is the point: a
+# URL built from a format string would still need its own hash, and
+# the table is where a reader can see exactly what will be fetched.
 DEBS: dict[tuple[str, str], DebSpec] = {
     ("erofs-utils", "arm64"): DebSpec(
         name="erofs-utils",
@@ -102,6 +104,54 @@ DEBS: dict[tuple[str, str], DebSpec] = {
         ),
         sha256=(
             "36c15f933a965b50f4c9558d792d9556934c84e532703935d8ae7e69dd3fa863"
+        ),
+    ),
+    ("erofs-utils", "amd64"): DebSpec(
+        name="erofs-utils",
+        version="1.5-1",
+        arch="amd64",
+        url=(
+            "https://deb.debian.org/debian/pool/main/e/erofs-utils/"
+            "erofs-utils_1.5-1_amd64.deb"
+        ),
+        sha256=(
+            "902aa0a3791f4dc86f223359141b0b39991e432b95687873502587329b8e843d"
+        ),
+    ),
+    ("e2fsprogs", "amd64"): DebSpec(
+        name="e2fsprogs",
+        version="1.47.0-2+b2",
+        arch="amd64",
+        url=(
+            "https://deb.debian.org/debian/pool/main/e/e2fsprogs/"
+            "e2fsprogs_1.47.0-2+b2_amd64.deb"
+        ),
+        sha256=(
+            "fedd424691c08ef0739729026be298e7be8236337bf8e031b3c7ec66794e6fc2"
+        ),
+    ),
+    ("libext2fs2", "amd64"): DebSpec(
+        name="libext2fs2",
+        version="1.47.0-2+b2",
+        arch="amd64",
+        url=(
+            "https://deb.debian.org/debian/pool/main/e/e2fsprogs/"
+            "libext2fs2_1.47.0-2+b2_amd64.deb"
+        ),
+        sha256=(
+            "dff731f2318df99da4b8bf5f330f415f95b94c609bac29e7b2edba0a38f22a98"
+        ),
+    ),
+    ("libcom-err2", "amd64"): DebSpec(
+        name="libcom-err2",
+        version="1.47.0-2+b2",
+        arch="amd64",
+        url=(
+            "https://deb.debian.org/debian/pool/main/e/e2fsprogs/"
+            "libcom-err2_1.47.0-2+b2_amd64.deb"
+        ),
+        sha256=(
+            "a2bac7015e78fbc0c504df3e441f3a22292f1d2d77f9ccda760057f3690e22f2"
         ),
     ),
 }
