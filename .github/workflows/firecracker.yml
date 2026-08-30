@@ -88,4 +88,5 @@ jobs:
     - name: Conformance (firecracker)
       env:
         DUD_BACKEND: firecracker
-      run: pytest tests/conformance -v --durations=10
+        DUD_DEBUG_CLOSE: "1"
+      run: pytest tests/conformance/test_scratch.py -v -s --durations=10

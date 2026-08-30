@@ -549,18 +549,33 @@ class VmSession(HostSession):
             return
         # shutdown verb -> supervisor stops serving -> init powers off.
         clean = False
+        _dbg = os.environ.get("DUD_DEBUG_CLOSE")
+        import time as _t
+        _t0 = _t.monotonic()
         try:
             self._request("shutdown")
             clean = True
-        except Exception:  # noqa: BLE001 — a guest mid-death answers anything
-            pass
+        except Exception as _e:  # noqa: BLE001 — a guest mid-death answers anything
+            if _dbg:
+                print(f"[dbg] shutdown verb raised: {type(_e).__name__}: {_e}",
+                      flush=True)
+        if _dbg:
+            print(f"[dbg] shutdown ok={clean} in {_t.monotonic()-_t0:.2f}s",
+                  flush=True)
         try:
             self._ch.close()
         except OSError:
             pass
+        _t1 = _t.monotonic()
         try:
             self._proc.wait(timeout=8)
+            if _dbg:
+                print(f"[dbg] vmm exited in {_t.monotonic()-_t1:.2f}s "
+                      f"rc={self._proc.returncode}", flush=True)
         except subprocess.TimeoutExpired:
+            if _dbg:
+                print(f"[dbg] vmm did NOT exit in 8s; console tail:\n"
+                      f"{self._console_tail(25)}", flush=True)
             self._teardown_vm()
             clean = False
         if clean:
@@ -568,8 +583,14 @@ class VmSession(HostSession):
             # the way down, so the clone is promotable.
             try:
                 self.promote_scratch()
-            except OSError:
-                pass
+                if _dbg:
+                    print(f"[dbg] promoted master={self._scratch_master} "
+                          f"clone={self._scratch_clone}", flush=True)
+            except OSError as _e:
+                if _dbg:
+                    print(f"[dbg] promote raised: {_e}", flush=True)
+        elif _dbg:
+            print("[dbg] NOT promoting (unclean shutdown)", flush=True)
         for closeable in (self._srv, self._vmm_log):
             try:
                 closeable.close()
