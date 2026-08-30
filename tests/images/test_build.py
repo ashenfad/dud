@@ -161,3 +161,42 @@ def test_resolve_medium_auto(tmp_path):
     assert _resolve_medium("auto", small, ("pandas",)) == "erofs"
     assert _resolve_medium("initramfs", big, ("pandas",)) == "initramfs"
     assert _resolve_medium("erofs", small, ()) == "erofs"
+
+
+def test_build_reports_whether_it_shipped_bytecode(tmp_path):
+    """Read from the metadata, not recomputed from the current host.
+
+    The field describes the ARTIFACT: a rootfs baked on 3.12 is still
+    baked when a 3.13 host reuses it. Recomputing would report the
+    opposite and be wrong in the direction that matters, since a cache
+    hit is the common case.
+    """
+    from dud.images.builder import RootfsBuild
+    from dud.atomic import write_json
+
+    build = RootfsBuild(
+        spec="s", ref="python:3.12-slim", digest="sha256:d",
+        rootfs_path=tmp_path / "rootfs.img", workspace="/workspace",
+        env=[], workdir="/",
+    )
+    write_json(build.meta_path, {"bytecode": "baked"})
+    assert build.bytecode == "baked"
+
+    write_json(build.meta_path, {"bytecode": "skipped: host python 3.13 != guest 3.12"})
+    assert build.bytecode.startswith("skipped:")
+
+
+def test_build_bytecode_is_unknown_without_metadata(tmp_path):
+    """A cache entry from a dud that predates the field must not read
+    as a confident 'baked'."""
+    from dud.images.builder import RootfsBuild
+
+    build = RootfsBuild(
+        spec="s", ref="r", digest="d", rootfs_path=tmp_path / "rootfs.img",
+        workspace="/workspace", env=[], workdir="/",
+    )
+    assert build.bytecode == "unknown"          # no meta.json at all
+    build.meta_path.write_text("{}")
+    assert build.bytecode == "unknown"          # meta, but no field
+    build.meta_path.write_text("not json")
+    assert build.bytecode == "unknown"          # unreadable

@@ -12,6 +12,7 @@ working and always will.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from .backends.base import public_methods
@@ -99,6 +100,21 @@ def session(
     *,
     pooled: bool = False,
     state: str | None = None,
+    # ---- what the guest may reach, and what interprets what it makes.
+    # Named rather than left to **kwargs because these ARE the
+    # extension points: a seam nobody can find in `help()` teaches
+    # nothing, and `outputs_hook` in particular was moved onto the
+    # session so the mechanism would be visible in a signature.
+    host_objects: dict[str, Any] | None = None,
+    allow: dict[str, set[str]] | None = None,
+    cache: dict[str, bytes] | None = None,
+    on_emit: Callable[[str, Any], None] | None = None,
+    outputs_hook: str | None = None,
+    render_hook: str | None = None,
+    # ---- what gets booted (VM rungs; rung 1 has no image)
+    image: str | None = None,
+    packages: list[str] | None = None,
+    memory_mib: int | None = None,
     **kwargs: Any,
 ):
     """Open a session on the chosen rung — the one blessed entry point.
@@ -114,8 +130,12 @@ def session(
     ``pooled=True`` (VM rungs only) acquires from the process-wide
     warm pool instead of booting; ``state`` is the content tag for
     park affinity — a parked VM already holding that exact tree comes
-    back with ``resumed=True`` and the caller skips its push. Extra
-    kwargs go to the backend constructor.
+    back with ``resumed=True`` and the caller skips its push.
+
+    The named kwargs above are the ones worth discovering; the rest of
+    a backend's constructor (``kernel``, ``cpus``, ``medium``,
+    ``debs``, ``disks``, ``scratch``, ``arch``, ``home``,
+    ``workspace``, ``boot_timeout``) still passes through unchanged.
     """
     if backend == "vm":
         # The best VM rung for this host: configs written against
@@ -123,33 +143,44 @@ def session(
         import platform
 
         backend = "vfkit" if platform.system() == "Darwin" else "firecracker"
-    if backend == "vfkit":
-        if pooled:
-            from .backends.pool import shared_pool
-            from .backends.vfkit import VfkitSession
 
-            return shared_pool(VfkitSession).acquire(state=state, **kwargs)
-        if state is not None:
-            raise ValueError("state= is park affinity; it requires pooled=True")
-        from .backends.vfkit import VfkitSession
+    # Only what the caller actually named. None means "unspecified"
+    # for every one of these, and forwarding it would be wrong rather
+    # than merely noisy: `image=None` would override the backend's own
+    # default instead of leaving it alone.
+    named = {
+        "host_objects": host_objects, "allow": allow, "cache": cache,
+        "on_emit": on_emit, "outputs_hook": outputs_hook,
+        "render_hook": render_hook, "image": image, "packages": packages,
+        "memory_mib": memory_mib,
+    }
+    opts = {k: v for k, v in named.items() if v is not None}
+    opts.update(kwargs)
 
-        return VfkitSession(**kwargs)
-    if backend == "firecracker":
-        from .backends.firecracker import FirecrackerSession
-
-        if pooled:
-            from .backends.pool import shared_pool
-
-            return shared_pool(FirecrackerSession).acquire(
-                state=state, **kwargs
-            )
-        if state is not None:
-            raise ValueError("state= is park affinity; it requires pooled=True")
-        return FirecrackerSession(**kwargs)
     if backend == "subprocess":
         if pooled or state is not None:
-            raise ValueError("pooling is a VM-rung concept (rung 1 has no boot to skip)")
-        return Session(**kwargs)
-    raise ValueError(
-        f"unknown backend {backend!r} (subprocess | vfkit | firecracker | vm)"
-    )
+            raise ValueError(
+                "pooling is a VM-rung concept (rung 1 has no boot to skip)"
+            )
+        return Session(**opts)
+
+    if backend == "vfkit":
+        from .backends.vfkit import VfkitSession as session_cls
+    elif backend == "firecracker":
+        from .backends.firecracker import FirecrackerSession as session_cls
+    else:
+        raise ValueError(
+            f"unknown backend {backend!r} "
+            f"(subprocess | vfkit | firecracker | vm)"
+        )
+
+    # One copy of the pooled/state rule, rather than one per rung: the
+    # rungs became interchangeable here when they got a shared base,
+    # and three copies of a two-line policy is how they drift.
+    if pooled:
+        from .backends.pool import shared_pool
+
+        return shared_pool(session_cls).acquire(state=state, **opts)
+    if state is not None:
+        raise ValueError("state= is park affinity; it requires pooled=True")
+    return session_cls(**opts)

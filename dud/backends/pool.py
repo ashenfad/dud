@@ -140,9 +140,20 @@ class VmPool:
         auto_seed: bool = True,
     ):
         # How many tagged VMs to hold RUNNING for a same-content resume,
-        # on a rung that can clone. Small by default: an affinity park
-        # costs real RAM and buys only a skipped push_tree, where a
-        # plain miss now costs a ~40ms clone. 0 disables it entirely.
+        # on a rung that can clone. An affinity park costs real RAM and
+        # buys exactly one thing: a skipped push_tree, since a plain
+        # miss now restores a clone in ~40 ms rather than booting.
+        #
+        # Measured (dev/pushbench.py, vfkit/arm64): a push is 3 ms for
+        # 10 files and 104 ms for 2000, tracking file COUNT more than
+        # bytes. So a hit saves ~40-140 ms.
+        #
+        # That is modest, and 1 is still the right default because the
+        # cost is opt-in: `release` only parks a VM whose owner stamped
+        # `park_state`, so a caller who never tags never holds one.
+        # Nothing is spent on those who don't use it, and the callers
+        # who gain most are the ones with the biggest trees. 0 disables
+        # it entirely.
         self.max_affinity = max_affinity
         # Build a template automatically the first time a config misses.
         # A consumer that wants templates only where it says so — or

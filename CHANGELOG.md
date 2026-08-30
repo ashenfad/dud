@@ -34,6 +34,30 @@ record for those.
 
 ### Added
 
+- **`session()` names its extension points.** `host_objects`, `allow`,
+  `cache`, `on_emit`, `outputs_hook`, `render_hook`, `image`,
+  `packages` and `memory_mib` are explicit keyword parameters instead
+  of anonymous `**kwargs`, so `help(dud.session)`, autocomplete and a
+  type checker all show what the one blessed entry point actually
+  takes. The rest of a backend's constructor still passes through. The
+  three rungs' identical pooled/state handling collapsed to one copy
+  while there.
+
+- **`ping()` reports whether the image shipped precompiled bytecode.**
+  Baking is skipped when the host interpreter's minor version differs
+  from the image's, which is now the common case — the default image is
+  `python:3.12-slim` and hosts are increasingly 3.13/3.14 — and it was
+  invisible: nothing raised, behavior was identical, and CI could not
+  catch it because CI pins the matching version so that baking happens.
+  `ping()["bytecode"]` is `"baked"` or `"skipped: host python X != guest
+  Y"`, read from the build metadata so a cache hit reports as
+  accurately as a fresh build. Both bakes now log the skip too.
+
+  Note this is a performance property and deliberately not part of the
+  rootfs spec hash, so two hosts on different interpreters share one
+  cache entry and whichever built it first decides what is in it. The
+  field is how to tell which you got.
+
 - **Golden snapshots: a pool miss clones a machine instead of booting
   one.** Measured on amd64 CI: **32-52 ms to a serving VM, against
   1276 ms cold.**

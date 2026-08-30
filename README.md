@@ -482,6 +482,30 @@ init diagnostics go to the VM console (captured in the session's
 rundir) and surface in the `IsolationUnavailable` message on a failed
 boot.
 
+`ping()` reports what the *image* can actually offer, which is where to
+look when sessions are slow rather than broken:
+
+```python
+>>> s.ping()
+{'pong': True, 'staging': 'overlay', 'renderer': ..., 'outputs_hook': ...,
+ 'bytecode': 'skipped: host python 3.13 != guest 3.12'}
+```
+
+`bytecode` is the one worth knowing about. dud bakes `.pyc` into the
+rootfs so the guest doesn't recompile the stdlib on every exec — but
+bytecode is minor-version scoped, so it can only bake when your
+interpreter matches the image's. The default image is
+`python:3.12-slim`, so a host on 3.13 or 3.14 gets none, and the only
+symptom is slower imports. Match the versions to get it back:
+
+```python
+dud.session("vm", image="python:3.13-slim")   # on a 3.13 host
+```
+
+`outputs_hook` is here for the same reason — a hook that failed to
+import behaves exactly like no hook at all, so `ping()` marks it
+`(not found)` rather than leaving you wondering where the charts went.
+
 ## Development
 
 ```bash
