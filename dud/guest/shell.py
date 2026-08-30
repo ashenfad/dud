@@ -61,6 +61,12 @@ _MAX_ENV_ENTRY = 96 * 1024  # comfortably under Linux MAX_ARG_STRLEN
 _CAP_TRANSCRIPT = _CAP_STDOUT
 
 _DRAIN_BUDGET = 0.5  # post-kill: how long a dead script's tail may take
+# The emit drain WAITS, unlike the transcript's, so this is a tax on
+# every exec that leaves a process holding the pipe without writing
+# (`nohup server &`). Small enough not to undo the point of that fix —
+# which took such a script from a full timeout down to ~0.3s — and
+# ample for the interpreter start a `dud-emit` needs (~30ms).
+_EMIT_DRAIN_BUDGET = 0.1
 _REAP_BUDGET = 5.0   # waitpid on a killed script
 _POLL = 0.25         # how often to re-check a script that is quiet
 
@@ -239,22 +245,45 @@ class _Emits:
         except Exception:  # noqa: BLE001 — a failed relay is not the script's fault
             self.dropped += 1
 
-    def drain(self, fd: int, budget: float = _DRAIN_BUDGET) -> None:
-        """Take the records still in the pipe now the script is done.
+    def drain(self, fd: int, budget: float = _EMIT_DRAIN_BUDGET) -> None:
+        """Take the records still in the pipe now the script is done,
+        and briefly wait for one that is on its way.
 
-        Bounded exactly as the transcript's drain is, and for the same
-        reason — but load-bearing for a different one: without it, an
-        emit fired by the last line of a script would be lost to the
-        race between the write and the exit.
+        This *waits*, where the transcript's drain deliberately does
+        not, and the difference is what the two are looking at. Output
+        still arriving after the script exits belongs to whoever
+        inherited stdout, and waiting for a daemon is the bug #26
+        fixed. A record arriving here is a `dud-emit` the script
+        started — short-lived by construction, and something the author
+        asked for by name.
+
+        Without the wait `dud-emit x 1 &` worked by luck rather than by
+        construction: the child's write is itself what wakes the select
+        upstairs, so it usually lands before the exit is noticed — but
+        only usually, and an advertised feature should not be a race
+        that happens to go our way.
+
+        Two things keep the wait cheap. EOF returns immediately, so a
+        script whose emit writers have all finished pays only their
+        actual time (~30 ms for an interpreter start). And the budget
+        is small, because the case that pays it in full is a script
+        that leaves a LONG-LIVED process holding the fd — `nohup server
+        &` inherits this pipe like any other — where there is no signal
+        to distinguish "about to write" from "never will".
         """
         deadline = time.monotonic() + budget
-        while time.monotonic() < deadline:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
             try:
-                ready, _, _ = select.select([fd], [], [], 0)
+                ready, _, _ = select.select([fd], [], [], remaining)
             except (OSError, ValueError):
                 return
-            if not ready or not self.read(fd):
-                return
+            if not ready:
+                return  # nothing came in the whole budget
+            if not self.read(fd):
+                return  # EOF: every writer has let go
 
 
 def _pump(proc: subprocess.Popen, timeout: float,
