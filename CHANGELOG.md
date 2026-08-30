@@ -5,6 +5,17 @@ record for those.
 
 ## Unreleased
 
+The theme is that a session should cost what it does, and that when it
+doesn't, you can find out why.
+
+A pool miss no longer boots a machine — it clones one, in ~40 ms
+against 1276 ms — which made the firecracker conformance suite go from
+~20 minutes to under three. The firecracker rung runs on x86-64, where
+most Linux servers are. Every unbounded payload a guest could push
+across the wire now has a ceiling, and every ceiling reports itself.
+And the two extension points that were discovered by convention are
+now named in a signature.
+
 ### Breaking
 
 - **Rich value flattening moved out of dud into the image.** The guest
@@ -25,60 +36,15 @@ record for those.
 
   Why: which objects flatten, into what shape, under what path — and
   which binding collects them — is the consuming layer's convention,
-  not dud's. The old module encoded one consumer's choices — `ui/<name>.plotly.json`, `head(200)` with
-  `orient="split"`, an 8 MB cap "for parity with the host renderer" in
-  another repo — which made dud know about the layer above it. It is
+  not dud's. The old module encoded one consumer's choices —
+  `ui/<name>.plotly.json`, `head(200)` with `orient="split"`, an 8 MB
+  cap "for parity with the host renderer" in another repo — which made
+  dud know about the layer above it. It is
   now on the same footing as the print renderer: optional, layered
   through the image, resolved from the image rather than the workspace,
   silently absent, and reported by `ping()`.
 
 ### Added
-
-- **`session()` names its extension points.** `host_objects`, `allow`,
-  `cache`, `on_emit`, `outputs_hook`, `render_hook`, `image`,
-  `packages` and `memory_mib` are explicit keyword parameters instead
-  of anonymous `**kwargs`, so `help(dud.session)`, autocomplete and a
-  type checker all show what the one blessed entry point actually
-  takes. The rest of a backend's constructor still passes through. The
-  three rungs' identical pooled/state handling collapsed to one copy
-  while there.
-
-- **`max_affinity` on `VmPool`** (default 0 — off): how many tagged VMs
-  to keep hot *per boot fingerprint* for a same-content resume. An
-  affinity park now buys exactly one thing — a skipped `push_tree` —
-  since a plain miss clones in ~40 ms instead of booting, so whether it
-  is worth a 1-2 GiB guest is entirely a question of what a push costs.
-  Measured (`dev/pushbench.py`): ~40 us per file, linearly, out to 20k
-  files. On the dozens-of-files workspaces this actually serves that is
-  **3-9 ms**, against a ~45 ms acquire — so it is off unless asked for.
-  It pays at scale (418 ms at 10k files), which is why it is a knob.
-
-  Setting it to 0 would otherwise make `park_state` silently do
-  nothing, so a tagged release with affinity off now logs a warning
-  once per pool naming the mismatch, rather than leaving a caller to
-  infer it from `resumed=False` forever. `$DUD_VM_MAX_AFFINITY` turns
-  it on for the shared pool, since `dud.session(pooled=True, state=...)`
-  builds its pool there and would otherwise be asking for something it
-  had no way to enable. Deliberately not inferred from a caller passing
-  `state=`: a consumer who tags every session is exactly the one who
-  would end up holding a VM per fingerprint without choosing to.
-
-- **`ping()` reports whether the image shipped precompiled bytecode.**
-  Baking is skipped when the host interpreter's minor version differs
-  from the image's, which is now the common case — the default image is
-  `python:3.12-slim` and hosts are increasingly 3.13/3.14 — and it was
-  invisible: nothing raised, behavior was identical, and CI could not
-  catch it because CI pins the matching version so that baking happens.
-  `ping()["bytecode"]` is `"baked"` or `"skipped: host python X != guest
-  Y"`, read from the build metadata so a cache hit reports as
-  accurately as a fresh build. Both bakes now log the skip too.
-
-  Note this is a performance property and deliberately not part of the
-  rootfs spec hash, so two hosts on different interpreters share one
-  cache entry and whichever built it first decides what is in it. The
-  field is how to tell which you got — and it reports `"unknown"`
-  rather than guessing when the artifact and its metadata disagree,
-  which two such builders publishing concurrently can produce.
 
 - **Golden snapshots: a pool miss clones a machine instead of booting
   one.** Measured on amd64 CI: **32-52 ms to a serving VM, against
@@ -134,6 +100,15 @@ record for those.
   not having one, or having one that will not restore, costs speed and
   never a session.
 
+  The template is keyed by the guest-code identity as well as the boot
+  fingerprint, and carries a manifest naming the rootfs and kernel it
+  was booted from, checked before every restore — so upgrading dud
+  cannot resume a guest built from the previous release. Configs using
+  `scratch` do not use templates at all: a snapshot records the seed
+  VM's per-boot volume, which does not outlive it. A background seed is
+  a whole VM and counts against `max_total` like any other, so a pool
+  at its cap builds no template until there is room.
+
 - **The firecracker rung runs on x86-64 Linux.** It was described as a
   disposable Linux/KVM microVM but pinned only arm64 assets, so on the
   architecture most Linux servers are it raised
@@ -144,6 +119,18 @@ record for those.
 
   `python -m dud.kernels` fetches the right one for the host; nothing
   else changes, and arm64 artifacts are byte-identical.
+
+  Making it actually work took one non-obvious fix. PID 1 asked for a
+  power-off, which aarch64 turns into a PSCI `SYSTEM_OFF` the VMM
+  handles — but firecracker on x86-64 implements no ACPI, so nothing
+  claims `pm_power_off` and Linux's power-off path ends in a halted
+  CPU. The guest went idle rather than away, and nothing failed
+  loudly: the host's `shutdown` succeeded and the cost arrived as
+  wall-clock, waiting out the VMM-exit timeout on every teardown. It
+  also silently disabled scratch promotion, since a volume is only
+  promotable after a clean exit. The guest now asks for a *reboot* on
+  x86-64, which `reboot=k` routes to the i8042 reset line firecracker
+  traps.
 
   Firecracker conformance now also runs in CI on every pull request,
   on a hosted `ubuntu-latest` runner with `/dev/kvm`. Previously it
@@ -184,9 +171,6 @@ record for those.
   fire-and-forget over a pipe; cache is request/response and would
   need a channel back into a supervisor that is mid-`select`.
 
-  Rootfs artifacts rebuild once (`PIPELINE_VERSION` 4) to pick up the
-  command.
-
 - **`session(render_hook="pkg.module:function")`** names your own print
   renderer, resolved from the image ahead of the reprobate default.
   Previously the only way to override rendering was to ship a package
@@ -194,6 +178,52 @@ record for those.
   mechanism. `ping()["renderer"]` reports which step of the chain (your
   hook, reprobate, plain `str`) is actually live, including when a
   named hook failed to resolve.
+
+- **`session()` names its extension points.** `host_objects`, `allow`,
+  `cache`, `on_emit`, `outputs_hook`, `render_hook`, `image`,
+  `packages` and `memory_mib` are explicit keyword parameters instead
+  of anonymous `**kwargs`, so `help(dud.session)`, autocomplete and a
+  type checker all show what the one blessed entry point actually
+  takes. The rest of a backend's constructor still passes through. The
+  three rungs' identical pooled/state handling collapsed to one copy
+  while there.
+
+- **`max_affinity` on `VmPool`** (default 0 — off): how many tagged VMs
+  to keep hot *per boot fingerprint* for a same-content resume. An
+  affinity park now buys exactly one thing — a skipped `push_tree` —
+  since a plain miss clones in ~40 ms instead of booting, so whether it
+  is worth a 1-2 GiB guest is entirely a question of what a push costs.
+  Measured (`dev/pushbench.py`): ~40 us per file, linearly, out to 20k
+  files. On the dozens-of-files workspaces this actually serves that is
+  **3-9 ms**, against a ~45 ms acquire — so it is off unless asked for.
+  It pays at scale (418 ms at 10k files), which is why it is a knob.
+
+  Setting it to 0 would otherwise make `park_state` silently do
+  nothing, so a tagged release with affinity off now logs a warning
+  once per pool naming the mismatch, rather than leaving a caller to
+  infer it from `resumed=False` forever. `$DUD_VM_MAX_AFFINITY` turns
+  it on for the shared pool, since `dud.session(pooled=True, state=...)`
+  builds its pool there and would otherwise be asking for something it
+  had no way to enable. Deliberately not inferred from a caller passing
+  `state=`: a consumer who tags every session is exactly the one who
+  would end up holding a VM per fingerprint without choosing to.
+
+- **`ping()` reports whether the image shipped precompiled bytecode.**
+  Baking is skipped when the host interpreter's minor version differs
+  from the image's, which is now the common case — the default image is
+  `python:3.12-slim` and hosts are increasingly 3.13/3.14 — and it was
+  invisible: nothing raised, behavior was identical, and CI could not
+  catch it because CI pins the matching version so that baking happens.
+  `ping()["bytecode"]` is `"baked"` or `"skipped: host python X != guest
+  Y"`, read from the build metadata so a cache hit reports as
+  accurately as a fresh build. Both bakes now log the skip too.
+
+  Note this is a performance property and deliberately not part of the
+  rootfs spec hash, so two hosts on different interpreters share one
+  cache entry and whichever built it first decides what is in it. The
+  field is how to tell which you got — and it reports `"unknown"`
+  rather than guessing when the artifact and its metadata disagree,
+  which two such builders publishing concurrently can produce.
 
 - Hook resolution refuses a module that lives in the workspace even
   when the agent imported it first, so a file agent code wrote cannot
@@ -228,8 +258,6 @@ record for those.
   drops it: it is how a boot failure gets explained, and it is what
   identified an amd64 poweroff bug that no host-side error described.
 
-  Rootfs artifacts rebuild once (`PIPELINE_VERSION` 5).
-
 - **A wedged guest now fails instead of hanging.** Every host→guest
   request carries a wall-clock deadline, so a guest that stops
   answering raises `SessionLost` rather than blocking its caller
@@ -259,11 +287,6 @@ record for those.
   these: it stays a `ProtocolError`, because it is a real
   incompatibility and no amount of re-acquiring will fix it.
 
-- **A reclaimed session releases its owner immediately.** When
-  `max_total` pressure reclaims a VM that still has an owner, that
-  owner's blocked call now ends at once instead of waiting out its
-  deadline.
-
 - **A lost session stays lost.** After `SessionLost`, further calls on
   the same object raise immediately instead of reaching the wire, with
   a message naming what actually died and what was refused. `close()`
@@ -282,6 +305,11 @@ record for those.
   README now documents the recovery contract end to end — what raises,
   what the two flavors of loss mean, and why re-acquiring plus
   re-pushing is a complete recovery rather than a best effort.
+
+- **A reclaimed session releases its owner immediately.** When
+  `max_total` pressure reclaims a VM that still has an owner, that
+  owner's blocked call now ends at once instead of waiting out its
+  deadline.
 
 - **The pool no longer holds VMs nobody can reach.** Two ways it did:
 
@@ -388,73 +416,6 @@ record for those.
 
 ### Fixed
 
-- **Two host-only modules were being shipped into the guest.**
-  `backends/vm.py` and `backends/golden.py` were injected into every
-  rootfs and counted in the guest code hash, so host-side VMM edits
-  busted the image cache for no reason. Neither could ever have run
-  there: both import `dud.images`, which is host-only and absent from
-  the image. Now excluded, with a test asserting the real invariant —
-  no injected module may import `dud.images`.
-
-- **Golden snapshots could outlive the code that built them.** The
-  store was keyed by the pool's boot fingerprint, which serializes raw
-  constructor kwargs: `image` is a tag rather than a digest, and dud's
-  own guest code appears nowhere in it. That is fine for in-memory
-  pool buckets, which die before anything can drift — but the store
-  lives in `~/.dud`. Upgrading dud kept every snapshot and resumed
-  guests booted from the previous release's rootfs, which is exactly
-  the host/guest skew `proto.py` documents as impossible "through the
-  normal build" (and which `PROTO_VERSION` does not catch, since that
-  moves only when the framing changes).
-
-  The key now includes the guest-code identity, and a manifest beside
-  each snapshot records the resolved rootfs and kernel it was booted
-  from — checked before restore, which costs nothing because a session
-  resolves its build before it looks at the snapshot anyway. A
-  mismatch discards and cold-boots.
-
-- **Scratch-backed configs reseeded forever.** A snapshot records the
-  seed VM's per-boot `scratch.img`, which is deleted with its rundir
-  the moment seeding finishes, so every later restore referenced a
-  missing file. Since a failed restore discards and reseeds, each miss
-  paid a failed restore, a cold boot *and* a background boot-plus-
-  freeze — permanently. Configs with `scratch` no longer use golden
-  snapshots at all.
-
-- **Background seeding ignored `max_total`.** A seed VM was built
-  outside both `_bound` and `_idle`, invisible to the cap and to
-  reclaim, so a sequential acquire on `max_total=1` could run two full
-  guests. Seeds now reserve a slot before booting, and skip when there
-  is no room.
-
-- **Baked bytecode trusted the filename.** `bake_pyc` compiled
-  anything ending in `.py`, but `Node.data` holds a symlink's *target*
-  — so `foo.py -> bar.py` baked well-formed bytecode for the
-  expression `bar.py` under foo's name, and being UNCHECKED_HASH it
-  would run without consulting the real module. Regular files only.
-
-- **Baked bytecode inherited the builder's `-O`.** `dont_inherit`
-  governs `__future__` flags, not the optimization level, which
-  defaults to the host interpreter's. Building under `python -O` wrote
-  assert-stripped, `__debug__`-false bytecode under the name a
-  normally started guest loads. Pinned to `optimize=0`.
-
-- **On x86_64 the guest never actually stopped the machine.** PID 1
-  asked for a power-off, which works on aarch64 because PSCI turns it
-  into a `SYSTEM_OFF` the VMM handles. Firecracker on x86_64 implements
-  no ACPI, so nothing claims `pm_power_off` and Linux's power-off path
-  ends in a halted CPU: the guest was idle forever rather than gone.
-
-  Nothing failed loudly. The host's `shutdown` request succeeded, and
-  the cost showed up only as wall-clock — the full VMM-exit timeout, on
-  every teardown, which a pool that discards rather than freezes pays
-  on every release. It also silently disabled scratch promotion on
-  amd64, since a volume is only promotable after a clean exit.
-
-  The guest now asks for a *reboot* on x86_64, which `reboot=k` (long
-  present on the cmdline) routes to the i8042 reset line that
-  firecracker traps and exits on. aarch64 keeps the honest power-off.
-
 - **Pooled reuse was slower than booting a fresh VM.** `reset_guest`
   took a flat 2.01 s, against a 0.94 s cold boot on vfkit — so the
   pool was a pessimization on that rung, and on firecracker it gave
@@ -492,6 +453,12 @@ record for those.
   state at a timeout whose script had already exited. The error escaped
   as a `RemoteError` from `exec_shell` instead of a normal
   `timed_out=True` result.
+
+### Upgrading
+
+Rootfs artifacts rebuild once on first use (`PIPELINE_VERSION` 3 → 5);
+image pulls are cached, so this is a rebuild rather than a re-download.
+Golden snapshots from a previous dud are ignored rather than reused.
 
 ## 0.3.0 - 2026-08-20
 
