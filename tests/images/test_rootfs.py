@@ -365,3 +365,40 @@ def test_bake_pyc_ignores_the_builders_own_optimization_level():
                          capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     assert out.stdout.strip() == "DEBUG_TRUE", out.stdout
+
+
+def test_every_injected_module_could_actually_run_in_the_guest():
+    """The property `_HOST_ONLY` is really for.
+
+    Its stated job is cache hygiene — keep host-only edits from busting
+    the rootfs. But the sharper test is whether an injected module
+    could even import: `dud/images` is host-only and absent from the
+    image, so anything reaching into it is unimportable weight that
+    only ever cost cache invalidations. `vm.py` and `golden.py` shipped
+    that way until this was checked.
+
+    Static, not an import: these run on the guest's interpreter against
+    a rootfs, not here.
+    """
+    import ast
+
+    injected = rootfs._dud_package_files()
+    offenders = []
+    for rel, data in injected.items():
+        for node in ast.walk(ast.parse(data, filename=rel)):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                # level>0 is relative: resolve it against the module's
+                # own package before judging where it points.
+                pkg = rel[:-3].replace("/", ".").split(".")
+                base = pkg[:-node.level] if node.level else ["dud"]
+                names = [".".join(base + ([node.module] if node.module else []))
+                         if node.level else (node.module or "")]
+            else:
+                continue
+            offenders += [(rel, n) for n in names
+                          if n.startswith("dud.images")]
+    assert not offenders, (
+        f"injected guest modules import host-only dud.images: {offenders}"
+    )

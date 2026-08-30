@@ -342,6 +342,14 @@ record for those.
 
 ### Fixed
 
+- **Two host-only modules were being shipped into the guest.**
+  `backends/vm.py` and `backends/golden.py` were injected into every
+  rootfs and counted in the guest code hash, so host-side VMM edits
+  busted the image cache for no reason. Neither could ever have run
+  there: both import `dud.images`, which is host-only and absent from
+  the image. Now excluded, with a test asserting the real invariant —
+  no injected module may import `dud.images`.
+
 - **Golden snapshots could outlive the code that built them.** The
   store was keyed by the pool's boot fingerprint, which serializes raw
   constructor kwargs: `image` is a tag rather than a digest, and dud's
