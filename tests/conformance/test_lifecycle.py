@@ -81,7 +81,7 @@ def test_pooled_reuse_with_hygiene():
         pool.close()
 
 
-def test_reuse_is_cheaper_than_booting():
+def test_the_reset_sweep_does_not_burn_its_deadline():
     """A pool that costs more than a boot is not a pool.
 
     Reuse used to be *slower* than starting fresh: the reset sweep
@@ -91,32 +91,28 @@ def test_reuse_is_cheaper_than_booting():
     was a pessimization on that rung and nobody noticed, because
     nothing compared the two.
 
-    Timed rather than asserted structurally, because the property IS
-    the time. The bound is deliberately loose — measured reuse is
-    ~0.02 s and the broken version was a hard 2.0 s floor — so this
-    fails the bug without being a benchmark that flakes on a loaded
-    runner.
+    Times the reset REQUEST rather than a close/acquire round trip.
+    Two earlier cuts of this got it wrong in opposite directions: the
+    first timed only the acquire and measured nothing, because the
+    reset runs in ``release()``; the second timed the whole cycle,
+    which on the frozen posture also writes a full memory snapshot
+    (``freeze`` budgets that at ~25 MiB/s, so a gigabyte guest can
+    legitimately spend seconds there) and would have failed on a slow
+    runner with the sweep working perfectly.
 
-    Timed across close-then-acquire, not acquire alone: the reset runs
-    in ``release()``, so the cost lands when a session is handed BACK.
-    A first cut of this timed only the acquire, passed happily with the
-    bug reintroduced, and measured nothing.
+    The bound is loose — measured 0.02 s against the bug's hard 2.0 s
+    floor — so it catches the regression without being a benchmark.
     """
     import time
 
     pool = _pool()
     try:
-        started = time.monotonic()
         s = pool.acquire(**_vm_kwargs())
-        boot = time.monotonic() - started
-
         started = time.monotonic()
-        s.close()  # park: this is where reset_guest runs
-        s2 = pool.acquire(**_vm_kwargs())
-        reuse = time.monotonic() - started
-        s2.close()
-
-        assert reuse < 1.5, f"reuse took {reuse:.2f}s (boot was {boot:.2f}s)"
+        s._request("reset_guest", {"keep_tree": False})
+        reset = time.monotonic() - started
+        s.close()
+        assert reset < 1.0, f"reset_guest took {reset:.2f}s"
     finally:
         pool.close()
 
