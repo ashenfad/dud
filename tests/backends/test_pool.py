@@ -86,7 +86,12 @@ class FakeVM:
         if self._scratch_master is not None:
             self.promotions += 1
 
-    def close(self):
+    def close(self, park_state=None):
+        # Mirrors VmSession.close: stamping the tag through close() is
+        # the documented way to park with affinity, so the fake has to
+        # accept it or tests silently exercise a different API.
+        if park_state is not None:
+            self.park_state = park_state
         if self._closed:
             return
         self._closed = True
@@ -665,7 +670,7 @@ def test_an_affinity_park_is_kept_hot_not_frozen(monkeypatch, tmp_path):
     of every release that took this path, to save RAM on a VM you are
     parking precisely because you expect to come back to it."""
     _golden_home(monkeypatch, tmp_path)
-    p = _fc_pool(monkeypatch)
+    p = _fc_pool(monkeypatch, max_affinity=1)
     s = p.acquire()
     s.park_state = "commit-abc"
     s.close()
@@ -692,7 +697,7 @@ def test_a_plain_release_keeps_nothing(monkeypatch, tmp_path):
 def test_frozen_idles_are_invisible_to_max_total(monkeypatch):
     """A frozen park is files, not RAM: booting past the cap must not
     sacrifice it, and it must not count against the cap."""
-    p = _fc_pool(monkeypatch, max_total=1)
+    p = _fc_pool(monkeypatch, max_total=1, max_affinity=1)
     a = p.acquire(image="a")
     a.park_state = "commit-a"
     a.close()      # hot affinity park
@@ -738,7 +743,7 @@ def test_make_room_never_victimizes_frozen_parks(monkeypatch):
     (reclaiming files frees no RAM) and fall through to the quiet
     bound LRU. Order matters: the frozen park must already be idle
     when the scan runs at-cap, or the early total check hides it."""
-    p = _fc_pool(monkeypatch, max_total=1)
+    p = _fc_pool(monkeypatch, max_total=1, max_affinity=1)
     parked = p.acquire(image="parked")
     parked.park_state = "commit-p"
     parked.close()                     # hot affinity park
@@ -1153,3 +1158,52 @@ def test_a_seed_reserves_its_slot_before_it_boots(monkeypatch, tmp_path):
         p._seeding.add("some-other-key")
         assert p._at_capacity_locked()
         assert p._live_locked() == 1
+
+
+def test_affinity_is_off_by_default(monkeypatch, tmp_path):
+    """Measured, not assumed. An affinity park keeps a whole VM alive
+    to skip one push_tree — and a push is ~40 us per file, so on the
+    dozens-of-files trees a real agent workspace actually holds, that
+    is 3-9 ms against a ~45 ms acquire. Not a 1-2 GiB trade to make on
+    someone's behalf."""
+    _golden_home(monkeypatch, tmp_path)
+    p = _fc_pool(monkeypatch)
+    assert p.max_affinity == 0
+    s = p.acquire(image="x")
+    s.close(park_state="commit-abc")
+    assert s.torn_down, "a tagged release parked despite affinity being off"
+    p.close()
+
+
+def test_an_ignored_tag_says_so_once(monkeypatch, tmp_path, caplog):
+    """The hazard that keeps this a default rather than a deletion:
+    with affinity off, park_state is a request that quietly does
+    nothing and `resumed=False` forever is not a readable symptom.
+
+    Once per pool, though — it is a configuration mismatch, not a
+    per-release event, and a warning on every close would be noise the
+    user learns to skip."""
+    import logging
+
+    _golden_home(monkeypatch, tmp_path)
+    p = _fc_pool(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="dud.backends.pool"):
+        for _ in range(3):
+            p.acquire(image="x").close(park_state="commit-abc")
+    warnings = [r for r in caplog.records if "max_affinity" in r.getMessage()]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "resumed=False" in warnings[0].getMessage()
+    p.close()
+
+
+def test_no_tag_no_warning(monkeypatch, tmp_path, caplog):
+    """The overwhelmingly common path must stay silent: a caller who
+    never asked for affinity is not misconfigured."""
+    import logging
+
+    _golden_home(monkeypatch, tmp_path)
+    p = _fc_pool(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="dud.backends.pool"):
+        p.acquire(image="x").close()
+    assert not [r for r in caplog.records if "max_affinity" in r.getMessage()]
+    p.close()

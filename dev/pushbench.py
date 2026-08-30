@@ -1,41 +1,48 @@
 """What does ``push_tree`` cost, across tree shapes?
 
-Exists because one default was set without it. An affinity park keeps a
+Exists because a default was set without it. An affinity park keeps a
 whole VM alive — RAM, indefinitely — to skip exactly one thing: the
 push. Everything else it might have saved is gone, because a plain miss
-now restores a golden clone in 32–52 ms rather than booting. So the
-question "is ``max_affinity=1`` a sensible default" reduces to "what is
-a push worth", and that number had never been measured.
+now restores a golden clone in 32–52 ms rather than booting. So "should
+affinity parking be on by default" reduces entirely to "what is a push
+worth", and that number had never been measured. It is now, and the
+answer is no.
 
-Measured on vfkit/arm64 (median of runs), against a 1-2 GiB guest:
+Measured on vfkit/arm64 (median of 3, one run, 2 GiB guest):
 
-    shape                            bytes   push (ms)   us/file
-    tiny      10 files x 1 KB         0.0M          3       300
-    small    100 files x 4 KB         0.5M          9        90
-    medium   500 files x 8 KB         4.4M         34        68
-    large   2000 files x 8 KB        17.4M        104        52
-    chunky   100 files x 256KB       26.3M         50       500
-    huge    5000 files x 4 KB        23.1M        196        39
-    huge   10000 files x 4 KB        46.1M        377        38
-    huge   20000 files x 2 KB        51.2M        690        35
+    shape                           bytes  push ms  reset+push  us/file
+    tiny      10 files x 1 KB        0.0M        4          28    391.1
+    small    100 files x 4 KB        0.5M        9          31     94.4
+    medium   500 files x 8 KB        4.4M       35          54     70.2
+    large   2000 files x 8 KB       17.4M      116         149     57.8
+    chunky   100 files x 256KB      26.3M       73          96    725.4
+    huge    5000 files x 4 KB       23.1M      226         277     45.3
+    huge   10000 files x 4 KB       46.1M      418         512     41.8
+    huge   20000 files x 2 KB       51.2M      772         890     38.6
 
-Two findings, and the second is the one that matters.
+Two findings, and then the thing they were for.
 
 A push tracks file COUNT far more than bytes: 2000 small files cost
 twice what 26 MB in 100 files does.
 
 And it scales LINEARLY out to 20k files — per-file cost drifts *down*
-(51 to 35 us) rather than degrading, so there is no cliff and no
-surprise waiting in a big workspace. That is what makes the number
-usable as a default-setting input: a push is ~40 us per file, all the
-way up. A 500-file scratch tree costs 26 ms; a 10k-file workspace with
-its dependencies installed costs 377 ms.
+(58 to 39 us across the count-scaled rows) rather than degrading — so a
+push is ~40 us per file at scale, with no cliff hiding in a big tree.
+The two fixed-count rows (`tiny`, `chunky`) carry per-request overhead
+in their us/file and are there for the bytes axis, not the slope.
 
-The first cut of this bench stopped at 2000 files and reported "40-140
-ms, modest", which nearly argued the default to 0. Extrapolation would
-have been wrong in the other direction too (linear from the small end
-predicts ~1 s at 20k, against 690 ms actual). Measuring the tail was
-the whole point.
+What that settles: affinity parking is OFF by default. The workspaces
+this actually runs against are dozens of files, not thousands — a small
+agent-generated app — which puts a push at **3-9 ms** against a ~45 ms
+acquire. Keeping a 1-2 GiB guest alive to skip that is not a trade to
+make on a caller's behalf. It only turns favourable around the 10k-file
+mark (418 ms), which is why `max_affinity` stays a knob.
+
+Measuring the tail was worth it even though the tail is not the case:
+extrapolating from the small end predicts well over a second at 20k
+against 772 ms actual, so the shape was not guessable from one end. What
+settled the default, though, was knowing which end the real workload
+sits at.
 
 Run against a rung that boots (macOS/vfkit here, or the Lima dev VM
 for firecracker — see dev/fc-test.sh):
@@ -99,8 +106,8 @@ def main() -> int:
     s = cls(memory_mib=args.memory_mib)
     try:
         s.shell("true")  # warm the channel; don't measure the first frame
-        print(f"{'shape':28s} {'bytes':>9s} {'push (ms)':>11s} "
-              f"{'reset+push':>11s}")
+        print(f"{'shape':28s} {'bytes':>8s} {'push ms':>8s} "
+              f"{'reset+push':>11s} {'us/file':>8s}")
         for label, n, size in SHAPES:
             tar = make_tar(n, size)
             pushes, cycles = [], []
@@ -117,9 +124,9 @@ def main() -> int:
                 s._request("reset_guest", {"keep_tree": False})
                 s.push_tree(tar)
                 cycles.append((time.monotonic() - started) * 1000)
-            print(f"{label:28s} {len(tar) / 1e6:8.1f}M "
-                  f"{statistics.median(pushes):10.0f} "
-                  f"{statistics.median(cycles):10.0f}")
+            push = statistics.median(pushes)
+            print(f"{label:28s} {len(tar) / 1e6:7.1f}M {push:8.0f} "
+                  f"{statistics.median(cycles):11.0f} {push * 1000 / n:8.1f}")
     finally:
         s.close()
     return 0

@@ -136,33 +136,36 @@ class VmPool:
         ttl: float = 900.0,
         max_total: int | None = None,
         session_cls: type | None = None,
-        max_affinity: int = 1,
+        max_affinity: int = 0,
         auto_seed: bool = True,
     ):
         # How many tagged VMs to hold RUNNING **per boot fingerprint**
-        # for a same-content resume, on a rung that can clone. Note the
-        # per-key part: a pool serving several configs holds up to this
+        # for a same-content resume, on a rung that can clone. Per-key,
+        # not global: a pool serving several configs holds up to this
         # many for each, and `max_total` (None by default) is the only
-        # global bound.
+        # global bound. That alone argues for a conservative default.
         #
-        # An affinity park costs real RAM and buys exactly one thing: a
-        # skipped push_tree, since a plain miss now restores a clone in
-        # ~40 ms rather than booting.
+        # Off by default, which took a measurement to get right. An
+        # affinity park keeps a whole VM alive to skip exactly one
+        # thing — a `push_tree` — because a plain miss now clones in
+        # ~40 ms instead of booting. So the question is only ever "what
+        # is a push worth", and `dev/pushbench.py` answers it: ~40 us
+        # per file, linearly. A real agent workspace is dozens of files
+        # (the shape nontainer-studio actually produces), so a push is
+        # **3-9 ms** against a ~45 ms acquire. Holding a 1-2 GiB guest
+        # to save 6% of an acquire is not a trade to make for someone
+        # by default.
         #
-        # Measured (dev/pushbench.py, vfkit/arm64): a push runs ~40 us
-        # per file, linearly, out to 20k files — 26 ms for a 500-file
-        # scratch tree, 377 ms for a 10k-file workspace with its
-        # dependencies installed. So a hit saves tens of milliseconds
-        # on small trees and most of a second on real ones.
-        #
-        # 1 rather than 0 mostly because 0 would make `park_state` a
-        # silent no-op: a caller who explicitly asks for affinity would
-        # get `resumed=False` forever with nothing to explain why. The
-        # cost is opt-in either way — `release` only parks a VM whose
-        # owner stamped a tag, so a caller who never tags never holds
-        # one. 0 disables it for consumers who would rather have the
-        # RAM.
+        # It becomes worth it at a scale most callers never reach: 377
+        # ms at 10k files. Hence a knob rather than a deletion — but
+        # one the consumer with the big tree opts into, since they are
+        # the one who knows.
         self.max_affinity = max_affinity
+        # A tagged release with affinity off is a request that silently
+        # does nothing, and `resumed=False` forever is not a symptom
+        # anyone can read. Said once per pool: it is a configuration
+        # mismatch, not a per-release event.
+        self._warned_affinity_off = False
         # Build a template automatically the first time a config misses.
         # A consumer that wants templates only where it says so — or
         # that cannot spare the one extra boot — turns this off and
@@ -620,6 +623,14 @@ class VmPool:
             # where freezing would cost three seconds of every release
             # that took this path.
             if state is None or self.max_affinity <= 0:
+                if state is not None and not self._warned_affinity_off:
+                    self._warned_affinity_off = True
+                    _log.warning(
+                        "park_state=%r was stamped but max_affinity=%d, so "
+                        "the tag is ignored and acquire will always return "
+                        "resumed=False; pass max_affinity>=1 to VmPool to "
+                        "keep tagged VMs hot", state, self.max_affinity,
+                    )
                 self._teardown(session)
                 return
         with self._lock:
