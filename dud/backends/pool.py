@@ -169,6 +169,10 @@ class VmPool:
             matched = False
             with self._lock:
                 stale = self._expire_locked()
+                # Swept here rather than on a timer: acquire is when the
+                # pool is about to spend resources, so it is the moment
+                # worth reclaiming any that are provably wasted.
+                stale += self._reap_lost_locked()
                 bucket = self._idle.get(key) or []
                 parked = None
                 if bucket:
@@ -439,11 +443,27 @@ class VmPool:
             self._teardown(s)
 
     def close(self) -> None:
+        """Tear down everything this pool holds, idle and bound alike.
+
+        Bound sessions are included because nothing else will free
+        them once the pool is gone: their ``close()`` routes through
+        ``release()``, which would park them in the ``_idle`` of a pool
+        that is no longer serving anyone. Leaving them was a leak with
+        an alibi — the process-exit cascade (channel EOF powers the
+        guest off, the VMM exits with it) meant no VM outlived the
+        run, so the rundirs and the bookkeeping were the only visible
+        cost, and only until the next boot's stale sweep.
+        """
         with self._lock:
             buckets, self._idle = self._idle, {}
+            bound, self._bound = list(self._bound.values()), {}
         for bucket in buckets.values():
             for _, _, s in bucket:
                 self._teardown(s)
+        for s in bound:
+            # had_owner: somebody may still be holding this one and
+            # blocked on it, and the pool is going away underneath them.
+            self._teardown(s, had_owner=True)
 
     # ---- internals ----------------------------------------------------
 
@@ -537,6 +557,30 @@ class VmPool:
             session.close()
         except Exception:  # noqa: BLE001 — disposal must not leak a VM
             _log.debug("close failed during teardown", exc_info=True)
+
+    def _reap_lost_locked(self) -> list[VmSession]:
+        """Bound sessions whose wire has already failed, for the CALLER
+        to tear down after releasing the lock (as ``_expire_locked``).
+
+        Reclaiming one takes nothing from its owner: a lost session can
+        never be used again — that is exactly what the latch in
+        ``HostSession._request`` established — so this is garbage that
+        happens to still be holding a VM. Emphatically NOT the
+        ``max_total`` reclaim, which interrupts a *live* session and is
+        logged as a loss somebody pays for.
+
+        It exists because the only other thing that frees a bound
+        session is its owner remembering to call ``close()``, and the
+        moment they are most likely to forget is the recovery path,
+        where the natural move is to rebind the variable to a fresh
+        session. Dropping the reference frees nothing — the pool holds
+        one too — so without this a wedged VM would keep its memory
+        until the process exited.
+        """
+        lost = [s for s in self._bound.values() if getattr(s, "_lost", None)]
+        for s in lost:
+            self._bound.pop(id(s), None)
+        return lost
 
     def _expire_locked(self) -> list[VmSession]:
         """Prune expired idle VMs; returns them for the CALLER to tear

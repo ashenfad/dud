@@ -818,3 +818,52 @@ def test_reclaiming_a_bound_vm_aborts_its_channel(monkeypatch):
     p.acquire(image="y")  # no idle to take: reclaims `a` from its owner
     assert a.torn_down is True
     assert sock.shutdowns == 1
+
+
+def test_a_lost_bound_session_is_reaped_on_the_next_acquire(monkeypatch):
+    """The recovery path's most likely mistake, made harmless.
+
+    Rebinding `s` to a fresh session frees nothing — the pool holds a
+    reference too — so a wedged VM would keep its memory until the
+    process exited. A lost session can never be used again, so
+    reclaiming it costs its owner nothing.
+    """
+    p = _pool(monkeypatch)
+    dead = p.acquire(image="x")
+    dead.dead = True
+    dead._lost = "guest lost during 'exec_python'"
+    # No close(): exactly what "s = dud.session(...)" alone would leave.
+
+    p.acquire(image="x")
+
+    assert id(dead) not in p._bound
+    assert dead.torn_down
+
+
+def test_a_live_bound_session_survives_the_sweep(monkeypatch):
+    """The half that makes the sweep safe rather than merely effective.
+
+    A reclaim that took healthy sessions would be the `max_total` path
+    without its justification — that one interrupts a live owner
+    deliberately and logs it as a loss. This one must only ever collect
+    sessions that were already unusable.
+    """
+    p = _pool(monkeypatch)
+    live = p.acquire(image="x")
+
+    p.acquire(image="x")
+
+    assert id(live) in p._bound
+    assert not live.torn_down
+    assert live._request("ping") == ({}, [])  # still usable
+
+
+def test_pool_close_tears_down_bound_sessions_too(monkeypatch):
+    """Their close() routes through release(), which would park them in
+    the _idle of a pool no longer serving anyone — so if close() does
+    not take them, nothing does."""
+    p = _pool(monkeypatch)
+    bound = p.acquire(image="x")
+    p.close()
+    assert p._bound == {}
+    assert bound.torn_down

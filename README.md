@@ -298,11 +298,19 @@ So there is exactly one thing to catch:
 try:
     r = s.python(code)
 except dud.SessionLost:
+    s.close()                                          # let go of the old one
     s = dud.session("vm", pooled=True, state=commit)   # a new machine
     if not s.resumed:
         s.push_tree(tree)                              # put the tree back
     r = s.python(code)                                 # once
 ```
+
+**Close the dead session before replacing it.** Rebinding the variable
+isn't enough: a pooled VM is held by the pool as well as by you, so
+dropping your reference frees nothing. `close()` is what removes it and
+tears the machine down — and it matters most for the wedged flavor,
+where the VM is still very much alive and still holding its memory.
+It's cheap, and never raises.
 
 `SessionLost` covers every way the guest can stop answering — EOF, a
 reset, a broken pipe, a pool reclaim tearing a frame mid-call, and a
