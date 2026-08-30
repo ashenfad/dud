@@ -84,6 +84,25 @@ record for those.
   owner's blocked call now ends at once instead of waiting out its
   deadline.
 
+- **A lost session stays lost.** After `SessionLost`, further calls on
+  the same object raise immediately instead of reaching the wire, with
+  a message naming what actually died and what was refused. `close()`
+  still works — the latch guards the wire, not the object — and a
+  pooled VM clears it on reuse.
+
+  This was already the documented contract ("the session object is
+  unusable afterward"); nothing enforced it, so a caller who caught
+  `SessionLost` and retried on the same session — the natural reading
+  of "retry once" — got undefined behavior. A failed request can leave
+  the channel desynchronized: a deadline can expire mid-frame, and a
+  guest that was merely slow leaves its late response in the channel,
+  so the next request reads a foreign id. Either way the *second*
+  failure described what happened worse than the first did.
+
+  README now documents the recovery contract end to end — what raises,
+  what the two flavors of loss mean, and why re-acquiring plus
+  re-pushing is a complete recovery rather than a best effort.
+
 - **`shell()` transcripts are capped**, at the same 1 MiB the Python
   runner has always applied to its own transcript. Past the cap the
   head is kept and the transcript ends with a line saying how much was

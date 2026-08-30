@@ -307,6 +307,80 @@ def test_body_that_cannot_be_serialized_is_not_a_death():
         assert s._in_flight == 0
 
 
+# ---- a lost session stays lost -----------------------------------------
+
+
+class _CountingChannel:
+    """Fails once, then would succeed — so a retry that reaches the wire
+    is visible as a PASS rather than as a second identical failure."""
+
+    def __init__(self, exc: Exception):
+        self._exc = exc
+        self.calls = 0
+
+    def request(self, verb, body=None, bins=None, timeout=None):
+        self.calls += 1
+        if self.calls == 1:
+            raise self._exc
+        return {"pong": True}, []
+
+
+def test_a_lost_session_refuses_the_next_call():
+    """`SessionLost` has always been documented as terminal; nothing
+    enforced it. A caller who caught it and retried on the same object —
+    the natural reading of "retry once" — reached the wire again."""
+    ch = _CountingChannel(ChannelClosed())
+    s = HostSession()
+    s._ch = ch  # type: ignore[assignment]
+
+    with pytest.raises(SessionLost):
+        s.ping()
+    with pytest.raises(SessionLost) as ei:
+        s.ping()
+
+    assert ch.calls == 1, "the retry reached the wire on a dead session"
+    assert "already lost" in str(ei.value)
+    assert s._in_flight == 0
+
+
+def test_the_latch_message_names_the_original_loss():
+    """The second failure must not be a worse description than the
+    first: by then the cause is gone, so it has to be carried."""
+    s = _session_with(ChannelClosed())
+    with pytest.raises(SessionLost):
+        s.shell("true")
+    with pytest.raises(SessionLost) as ei:
+        s.ping()
+    assert "exec_shell" in str(ei.value)  # what actually died
+    assert "ping" in str(ei.value)  # and what was refused
+
+
+def test_a_timeout_latches_too():
+    """A guest that was merely slow is not recoverable either: its late
+    response is still sitting in the channel, so the next request reads
+    a foreign id and fails with something less legible than the truth."""
+    ch = _CountingChannel(TimeoutError())
+    s = HostSession()
+    s._ch = ch  # type: ignore[assignment]
+    with pytest.raises(SessionLost):
+        s.ping()
+    with pytest.raises(SessionLost):
+        s.ping()
+    assert ch.calls == 1
+
+
+def test_the_latch_does_not_block_teardown():
+    """close() has to work on a lost session or the process leaks —
+    the latch guards the wire, not the object."""
+    from dud.backends.subprocess import Session
+
+    s = Session()
+    proc = s._proc
+    s._lost = "guest lost during 'exec_python'"
+    s.close()  # must not raise
+    assert proc.poll() is not None, "the supervisor was left running"
+
+
 # ---- allowlist shape ---------------------------------------------------
 
 
