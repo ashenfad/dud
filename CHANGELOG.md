@@ -34,6 +34,22 @@ record for those.
 
 ### Added
 
+- **The firecracker rung runs on x86-64 Linux.** It was described as a
+  disposable Linux/KVM microVM but pinned only arm64 assets, so on the
+  architecture most Linux servers are it raised
+  `IsolationUnavailable: no guest kernel for amd64`. Both the kernel
+  and the four Debian packages are now pinned for amd64 as well, at
+  the same versions arm64 uses — one kernel (6.18.35) across both, so
+  one conformance corpus still means one kernel.
+
+  `python -m dud.kernels` fetches the right one for the host; nothing
+  else changes, and arm64 artifacts are byte-identical.
+
+  Firecracker conformance now also runs in CI on every pull request,
+  on a hosted `ubuntu-latest` runner with `/dev/kvm`. Previously it
+  ran only by hand against a nested dev VM that degrades with use —
+  so a red run had to be diagnosed before it could be believed.
+
 - **`dud-emit`: the emit channel, reachable from bash.** Shell execs
   can now report structured events, not just transcript text:
 

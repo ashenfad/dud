@@ -72,6 +72,22 @@ class KernelSpec:
 # a dud release asset (18 MB direct download vs Kata's 664 MB static
 # tarball; provenance + GPL source pointers in the release notes).
 KERNELS: dict[str, KernelSpec] = {
+    # x86-64 firecracker wants an UNCOMPRESSED ELF vmlinux, where
+    # aarch64 takes a PE Image — which is why this asset is the
+    # `vmlinux-*` member of Kata's tarball and not the `vmlinuz-*`
+    # beside it. Same 6.18.35 kernel as arm64, so one conformance
+    # corpus still runs against one kernel version.
+    "amd64": KernelSpec(
+        name="kata-3.32.0",
+        kernel="6.18.35",
+        url=(
+            "https://github.com/ashenfad/dud/releases/download/"
+            "kernel-kata-3.32.0/vmlinux-amd64-kata-3.32.0"
+        ),
+        image_sha256=(
+            "43701715ae2885f936bbe5c66a2de7c14dc51de7d19412d04833e4bbcf205bd0"
+        ),
+    ),
     "arm64": KernelSpec(
         name="kata-3.32.0",
         kernel="6.18.35",

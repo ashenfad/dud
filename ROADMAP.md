@@ -21,9 +21,6 @@ that covers is the CHANGELOG's business rather than this file's.
   The remaining half of the parking story.
 - **Hardening** — jailer, cgroup budgets. The production-grade wrapper;
   not needed for local development.
-- **amd64 pins** (kernel `vmlinux`, debs) — wanted for CI anyway, since
-  GitHub's `ubuntu-latest` runners have `/dev/kvm`, so firecracker
-  conformance could run in plain hosted Actions on x86-64.
 
 ### Serving
 
@@ -51,13 +48,16 @@ calls. Serving splits that:
 
 ### CI matrix
 
-Conformance runs per-rung locally (`DUD_BACKEND=vfkit`). CI needs:
-subprocess everywhere (works today); vfkit on macOS arm64 — open
-question whether GitHub's hosted runners allow
-Virtualization.framework; may need a self-hosted Mac. Firecracker needs
-a KVM-capable Linux runner. **Golden transcripts** — pinning
-agent-visible runner semantics (echo, harvest, print caps, error
-rendering) across rungs in one corpus — become valuable exactly here.
+Subprocess runs everywhere and firecracker runs on hosted
+`ubuntu-latest` (x86-64, `/dev/kvm`). What is left is **vfkit on macOS
+arm64** — an open question whether GitHub's hosted Macs allow
+Virtualization.framework; may need a self-hosted runner. Until then
+vfkit is the one rung gated only by a local run
+(`DUD_BACKEND=vfkit`).
+
+**Golden transcripts** — pinning agent-visible runner semantics (echo,
+harvest, print caps, error rendering) across rungs in one corpus —
+become valuable exactly here.
 
 ### Workspace fidelity
 
