@@ -34,6 +34,38 @@ record for those.
 
 ### Added
 
+- **`dud-emit`: the emit channel, reachable from bash.** Shell execs
+  can now report structured events, not just transcript text:
+
+  ```bash
+  make test 2>&1 | tail -5
+  dud-emit tests '{"failed": 3}'
+  ```
+
+  They land on the same `on_emit` callback, in the same shape, as an
+  `emit()` from Python — there is no second verb and no host-side
+  branch, so the host cannot tell which side fired one. `VALUE` is
+  JSON if it parses and a plain string otherwise (`dud-emit n 42`
+  emits the number; `'"42"'` is the string); omitting it emits `null`.
+
+  Emits arrive live, mid-exec, so a long build reports progress as it
+  goes, and they survive a timeout — they are events, not results.
+  Every child bash spawns inherits the channel, so `$(...)`,
+  pipelines and backgrounded jobs all work.
+
+  Why it exists at all: DESIGN names bash as the forcing function for
+  the emit contract — no objects, no namespace, no pickle, so a
+  contract that is ergonomic from there cannot have smuggled in a
+  language assumption. That claim had been asserted in the doc and
+  absent from the code since the contract was written.
+
+  Not included, deliberately: `cache` from bash. Emit is
+  fire-and-forget over a pipe; cache is request/response and would
+  need a channel back into a supervisor that is mid-`select`.
+
+  Rootfs artifacts rebuild once (`PIPELINE_VERSION` 4) to pick up the
+  command.
+
 - **`session(render_hook="pkg.module:function")`** names your own print
   renderer, resolved from the image ahead of the reprobate default.
   Previously the only way to override rendering was to ship a package

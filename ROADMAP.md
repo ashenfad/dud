@@ -39,6 +39,13 @@ calls. Serving splits that:
   neither the binary nor a server to hit. Either an in-guest forwarder
   (see DESIGN, "The apps loop") or a wire-level shell→host bridge.
   Agents use `test_app`/preview meanwhile.
+
+  `dud-emit` is now a worked example of the second shape, for one
+  verb: a command on the guest's PATH, an fd bash inherits, and the
+  supervisor relaying onto an existing verb. It is the easy direction
+  though — fire-and-forget over a pipe. `curl` needs a *response*,
+  which is where that pattern stops being cheap (see the note against
+  cache-from-bash below).
 - **hostcall codec hardening** — a prerequisite, not a nice-to-have;
   see Design questions below for the shape of it.
 
@@ -105,7 +112,11 @@ they are rather than track what hasn't been decided.
   per-object typed stubs; how streaming and callbacks degrade. Wanted
   before anything serves untrusted traffic.
 - **cache-as-service semantics** — read-your-writes within a call,
-  staging interaction, size limits on the wire.
+  staging interaction, total size across a session (one write and one
+  exec's writes are bounded; how large the cache may *grow* is not).
+  Also where cache-from-bash lands: `dud-emit` works because emit is
+  fire-and-forget over a pipe, and cache is request/response, which
+  needs a real channel back into a supervisor sitting in `select`.
 - **Egress design**, if network is ever wanted — gvisor-tap-vsock,
   allowlist format, DNS.
 - **GitProvider** — a plain git repo as a `WorkspaceProvider`; nearly

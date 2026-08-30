@@ -21,6 +21,7 @@ it lives. See :class:`_Transcript` and :func:`_pump`.
 
 from __future__ import annotations
 
+import json
 import os
 import select
 import signal
@@ -30,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import emit as emit_mod
 from .runner import _CAP_STDOUT
 
 # The env dump uses only builtins (compgen/printf): the external `env`
@@ -44,7 +46,11 @@ _TRAP = (
     "> \"$__DUD_ENV__\"' EXIT\n"
 )
 
-_DROP_VARS = {"__DUD_CWD__", "__DUD_ENV__", "_", "SHLVL", "OLDPWD"}
+# The emit plumbing is per-exec: an fd number and a lock path from
+# one call are meaningless (and misleading) in the next, so they
+# must never survive into the persisted environment.
+_DROP_VARS = {"__DUD_CWD__", "__DUD_ENV__", "_", "SHLVL", "OLDPWD",
+              emit_mod.FD_VAR, emit_mod.LOCK_VAR}
 _MAX_ENV_ENTRY = 96 * 1024  # comfortably under Linux MAX_ARG_STRLEN
 
 # The transcript ceiling, imported rather than restated: this is the
@@ -163,7 +169,96 @@ def _drain(out: _Transcript, fd: int, budget: float = _DRAIN_BUDGET) -> None:
             return
 
 
-def _pump(proc: subprocess.Popen, timeout: float) -> tuple[_Transcript, bool]:
+class _Emits:
+    """Newline-delimited emit records, dispatched as they arrive.
+
+    Live, not collected: an emit from bash reaches the host mid-exec
+    exactly as one from the Python runner does. That is the whole
+    point of routing them through the pipe the loop already watches
+    rather than through a file read at the end.
+
+    The records come from ``dud-emit`` (see :mod:`dud.guest.emit`) and
+    are relayed upstream unopened. This layer knows nothing about the
+    value codec — it validates the shape and forwards, which is what
+    makes an emit from bash and one from Python indistinguishable to
+    the host.
+    """
+
+    #: A record no writer could legitimately produce: `dud-emit` caps
+    #: itself well below this, so passing it means somebody is writing
+    #: to the fd directly and the buffer would otherwise grow forever.
+    _CAP = (1 << 20) + (1 << 16)
+
+    def __init__(self, on_emit):
+        self._on_emit = on_emit
+        self._buf = bytearray()
+        self.dispatched = 0
+        self.dropped = 0
+
+    def read(self, fd: int) -> bool:
+        """One read; False at EOF or on a dead pipe."""
+        try:
+            chunk = os.read(fd, 65536)
+        except (OSError, ValueError):
+            return False
+        if not chunk:
+            return False
+        self._buf += chunk
+        self._flush()
+        if len(self._buf) > self._CAP:
+            # An unterminated record past any legitimate size. Drop what
+            # has accumulated rather than let one malformed writer size
+            # the supervisor's memory.
+            self._buf.clear()
+            self.dropped += 1
+        return True
+
+    def _flush(self) -> None:
+        while b"\n" in self._buf:
+            line, _, rest = self._buf.partition(b"\n")
+            self._buf = bytearray(rest)
+            if line.strip():
+                self._dispatch(bytes(line))
+
+    def _dispatch(self, line: bytes) -> None:
+        try:
+            body = json.loads(line.decode())
+        except (ValueError, UnicodeDecodeError):
+            self.dropped += 1
+            return
+        if (not isinstance(body, dict) or not isinstance(body.get("name"), str)
+                or not isinstance(body.get("value"), dict)):
+            # Only `dud-emit` should be writing here; anything else is
+            # refused rather than relayed, so a stray write into the fd
+            # cannot put an arbitrary body on the host's wire.
+            self.dropped += 1
+            return
+        try:
+            self._on_emit({"name": body["name"], "value": body["value"]})
+            self.dispatched += 1
+        except Exception:  # noqa: BLE001 — a failed relay is not the script's fault
+            self.dropped += 1
+
+    def drain(self, fd: int, budget: float = _DRAIN_BUDGET) -> None:
+        """Take the records still in the pipe now the script is done.
+
+        Bounded exactly as the transcript's drain is, and for the same
+        reason — but load-bearing for a different one: without it, an
+        emit fired by the last line of a script would be lost to the
+        race between the write and the exit.
+        """
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            try:
+                ready, _, _ = select.select([fd], [], [], 0)
+            except (OSError, ValueError):
+                return
+            if not ready or not self.read(fd):
+                return
+
+
+def _pump(proc: subprocess.Popen, timeout: float,
+          emit_fd: int | None = None, on_emit=None) -> tuple[_Transcript, bool]:
     """Read the script's output until it is done, or kill it at the
     deadline. Returns ``(transcript, timed_out)``.
 
@@ -185,6 +280,7 @@ def _pump(proc: subprocess.Popen, timeout: float) -> tuple[_Transcript, bool]:
     """
     fd = proc.stdout.fileno()
     out = _Transcript()
+    emits = _Emits(on_emit) if (emit_fd is not None and on_emit) else None
     open_pipe = True
     deadline = time.monotonic() + timeout
     while True:
@@ -192,6 +288,8 @@ def _pump(proc: subprocess.Popen, timeout: float) -> tuple[_Transcript, bool]:
         if remaining <= 0:
             _killpg(proc)
             _drain(out, fd)
+            if emits is not None:
+                emits.drain(emit_fd)
             return out, True
         # Every pass, and BEFORE the read rather than after it. A
         # survivor that writes CONTINUOUSLY — `nohup npm run dev &`, a
@@ -208,18 +306,33 @@ def _pump(proc: subprocess.Popen, timeout: float) -> tuple[_Transcript, bool]:
                 # whatever is still arriving belongs to whoever
                 # inherited the fd. Take what is there and stop.
                 _drain(out, fd)
+            if emits is not None:
+                emits.drain(emit_fd)
             return out, False
-        if open_pipe:
+        watch = [fd] if open_pipe else []
+        if emits is not None:
+            watch.append(emit_fd)
+        if watch:
             try:
-                ready, _, _ = select.select([fd], [], [], min(remaining, _POLL))
+                ready, _, _ = select.select(watch, [], [], min(remaining, _POLL))
             except (OSError, ValueError):
                 # An fd we can no longer watch. Stop watching it and
                 # keep waiting on the process rather than returning: the
                 # only non-timeout exit above is one where poll() has
                 # answered, which is what keeps `returncode` a number.
-                ready, open_pipe = (), False
-            if ready and not out.read(fd):
+                ready, open_pipe, emits = (), False, None
+            if open_pipe and fd in ready and not out.read(fd):
                 open_pipe = False  # EOF: every writer has let go
+            if emits is not None and emit_fd in ready:
+                # Relaying costs a round trip to the host, and that is
+                # ours rather than the script's — so it does not come
+                # out of the script's timeout. Same rule the wire
+                # applies to a hostcall served mid-exec: a caller is not
+                # charged for our own slowness.
+                started = time.monotonic()
+                if not emits.read(emit_fd):
+                    emits = None  # EOF on the emit side; the script may run on
+                deadline += time.monotonic() - started
         else:
             # The script closed its own stdout but is still running
             # (`exec >&-; work`). Nothing to select on, so poll it.
@@ -227,8 +340,12 @@ def _pump(proc: subprocess.Popen, timeout: float) -> tuple[_Transcript, bool]:
 
 
 def run_shell(
-    state: ShellState, script: str, timeout: float, workspace: str
+    state: ShellState, script: str, timeout: float, workspace: str,
+    on_emit=None,
 ) -> ShellOutcome:
+    """Run one script. ``on_emit`` receives each ``dud-emit`` record as
+    it arrives, already validated, for relay upstream; without it the
+    emit channel is simply not offered and ``dud-emit`` says so."""
     with tempfile.TemporaryDirectory(prefix="dud-sh-") as td:
         cwd_file = Path(td) / "cwd"
         env_file = Path(td) / "env"
@@ -243,6 +360,21 @@ def run_shell(
         if not os.path.isdir(state.cwd):
             state.cwd = workspace
 
+        # The emit channel, offered only when somebody is listening. An
+        # inherited fd rather than a path: bash hands it to every child
+        # and subshell for free, so `dud-emit` inside `$(...)`, a
+        # pipeline, or a backgrounded job all reach the same pipe.
+        emit_r = emit_w = None
+        pass_fds: tuple[int, ...] = ()
+        if on_emit is not None:
+            emit_r, emit_w = os.pipe()
+            os.set_inheritable(emit_w, True)
+            lock = Path(td) / "emit.lock"
+            lock.touch()
+            env[emit_mod.FD_VAR] = str(emit_w)
+            env[emit_mod.LOCK_VAR] = str(lock)
+            pass_fds = (emit_w,)
+
         proc = subprocess.Popen(
             ["bash", "--noprofile", "--norc", str(script_file)],
             cwd=state.cwd,
@@ -250,11 +382,24 @@ def run_shell(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            pass_fds=pass_fds,
         )
         try:
-            out, timed_out = _pump(proc, timeout)
+            if emit_w is not None:
+                # The child holds the write end now. Ours has to go, or
+                # the pipe never reaches EOF and the reader waits on a
+                # writer that is us.
+                os.close(emit_w)
+                emit_w = None
+            out, timed_out = _pump(proc, timeout, emit_r, on_emit)
         finally:
             proc.stdout.close()
+            for fd in (emit_w, emit_r):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
         # waitpid, not communicate: reaping does not touch the pipe, so
         # a process still holding the write end cannot stall it. Bounded

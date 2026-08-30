@@ -417,12 +417,29 @@ class Supervisor:
         self.shell.cwd = str(self.work)
         return {}, []
 
+    def _relay_emit(self, record: dict) -> None:
+        """Forward one ``dud-emit`` record upstream as the existing
+        ``emit`` verb.
+
+        No new verb, and no new host code: the body `dud-emit` writes is
+        already the body the Python runner's ``emit`` sends, so the host
+        cannot tell which language fired it. That indistinguishability
+        is the property DESIGN's forcing function is actually about.
+
+        Sent from inside ``exec_shell``, which is legal for the same
+        reason ``_pump_runner`` does it mid-``exec_python``: the channel
+        is bidirectional, and the host services our request from its own
+        ``request()`` loop while it waits for the exec to answer.
+        """
+        self.channel.request("emit", record)
+
     def do_exec_shell(self, body, bins):
         outcome: ShellOutcome = run_shell(
             self.shell,
             body["script"],
             float(body.get("timeout", _SHELL_DEFAULT_TIMEOUT)),
             workspace=str(self.work),
+            on_emit=self._relay_emit,
         )
         return {
             "transcript": outcome.transcript,

@@ -23,6 +23,14 @@ classifiers = [
 ]
 dependencies = []
 
+# `dud-emit` is the emit channel as a command, for shell execs. On VM
+# rungs the rootfs ships its own shim at the same path; this entry is
+# what puts it on PATH for the subprocess rung, where the guest runs as
+# host processes and inherits the host's PATH — so one conformance
+# corpus covers the command on every rung instead of two.
+[project.scripts]
+dud-emit = "dud.guest.emit:main"
+
 [project.urls]
 "Homepage" = "https://github.com/ashenfad/dud"
 "Documentation" = "https://github.com/ashenfad/dud#readme"

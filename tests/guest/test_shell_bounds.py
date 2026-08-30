@@ -239,3 +239,116 @@ def test_ordinary_scripts_are_untouched(tmp_path, script, expect):
     state = ShellState(cwd=str(tmp_path), env={"PATH": os.environ["PATH"]})
     out = run_shell(state, script, timeout=10.0, workspace=str(tmp_path))
     assert out.transcript == expect and not out.timed_out
+
+
+# ---- the emit reader ----------------------------------------------------
+
+
+def _dispatch(*lines: bytes):
+    """Feed raw bytes through _Emits as if they arrived on the pipe."""
+    from dud.guest.shell import _Emits
+
+    got = []
+    e = _Emits(got.append)
+    r, w = os.pipe()
+    try:
+        for chunk in lines:
+            os.write(w, chunk)
+        os.close(w)
+        while e.read(r):
+            pass
+    finally:
+        os.close(r)
+    return got, e
+
+
+def test_emits_are_dispatched_per_line():
+    got, e = _dispatch(b'{"name":"a","value":{"t":"json","v":1}}\n'
+                       b'{"name":"b","value":{"t":"json","v":2}}\n')
+    assert [x["name"] for x in got] == ["a", "b"]
+    assert e.dropped == 0
+
+
+def test_a_record_split_across_reads_is_reassembled():
+    """Pipe reads land where the kernel decides, not on record
+    boundaries — so a frame arriving in two chunks must not become two
+    broken ones."""
+    got, _ = _dispatch(b'{"name":"a","val', b'ue":{"t":"json","v":1}}\n')
+    assert [x["name"] for x in got] == ["a"]
+
+
+def test_a_malformed_line_does_not_take_the_good_ones_with_it():
+    got, e = _dispatch(b'garbage\n'
+                       b'{"name":"ok","value":{"t":"json","v":1}}\n')
+    assert [x["name"] for x in got] == ["ok"]
+    assert e.dropped == 1
+
+
+def test_a_well_formed_line_of_the_wrong_shape_is_refused():
+    """Only `dud-emit` should be writing there. A stray write must not
+    be able to put an arbitrary body on the host's wire."""
+    got, e = _dispatch(b'{"name":"a","value":"not-a-tagged-value"}\n',
+                       b'{"verb":"shutdown"}\n',
+                       b'[1,2,3]\n')
+    assert got == [] and e.dropped == 3
+
+
+def test_an_unterminated_flood_does_not_grow_forever():
+    """No newline means no record, so the buffer would otherwise be an
+    unbounded write into a supervisor that is PID 1 on a VM rung."""
+    from dud.guest.shell import _Emits
+
+    e = _Emits(lambda rec: None)
+    r, w = os.pipe()
+    try:
+        big = b"z" * (1 << 16)
+        for _ in range((e._CAP // len(big)) + 4):
+            os.write(w, big)
+            e.read(r)
+        assert len(e._buf) <= e._CAP
+        assert e.dropped >= 1
+    finally:
+        os.close(w)
+        os.close(r)
+
+
+def test_a_failing_relay_is_not_the_scripts_fault():
+    """The host round trip can fail on its own; that must not take down
+    an exec whose only involvement was printing a line."""
+    from dud.guest.shell import _Emits
+
+    def boom(record):
+        raise RuntimeError("upstream is unhappy")
+
+    e = _Emits(boom)
+    r, w = os.pipe()
+    try:
+        os.write(w, b'{"name":"a","value":{"t":"json","v":1}}\n')
+        os.close(w)
+        e.read(r)
+    finally:
+        os.close(r)
+    assert e.dropped == 1 and e.dispatched == 0
+
+
+def test_emit_drain_takes_what_is_left_in_the_pipe():
+    """The drain after the script ends, pinned as a mechanism.
+
+    Whether it is *needed* on any given run is a race — the select loop
+    usually reads an emit before it notices the exit — so an integration
+    test for it would pass with the drain removed most of the time.
+    What is deterministic is that a record already in the pipe when the
+    script is gone must still be collected, which is this.
+    """
+    from dud.guest.shell import _Emits
+
+    got = []
+    e = _Emits(got.append)
+    r, w = os.pipe()
+    try:
+        os.write(w, b'{"name":"last","value":{"t":"json","v":1}}\n')
+        e.drain(r, budget=0.5)  # nothing has read from the loop yet
+    finally:
+        os.close(w)
+        os.close(r)
+    assert [x["name"] for x in got] == ["last"]

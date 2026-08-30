@@ -143,6 +143,26 @@ def test_build_fileset_adds_init_and_workspace(make_layer):
     assert "from dud.guest.init import main" in body
     assert "default_root='/workspace'" in body
 
+    # dud-emit on the guest's PATH. Worth pinning here rather than
+    # leaving it to conformance: the subprocess rung gets the command
+    # from the installed console script, so every shared test would
+    # pass with the rootfs shipping nothing at all, and only a VM run
+    # would notice.
+    shim = fs.nodes["usr/local/bin/dud-emit"]
+    assert shim.mode & 0o111
+    assert shim.data.startswith(b"#!/usr/local/bin/python3")
+    assert b"from dud.guest.emit import main" in shim.data
+
+
+def test_the_emit_module_is_injected_for_its_shim(make_layer):
+    """The shim is two lines onto `dud.guest.emit`, so shipping one
+    without the other is a guest that boots with a command that cannot
+    import itself."""
+    l1 = make_layer("l1", dirs=["usr/local/lib/python3.12/site-packages"])
+    fs = rootfs.flatten_layers([l1])
+    site = rootfs.inject_dud(fs)
+    assert f"{site}/dud/guest/emit.py" in fs.nodes
+
 
 # ---- image ENV into /init ----------------------------------------------
 
