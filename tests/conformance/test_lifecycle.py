@@ -81,6 +81,46 @@ def test_pooled_reuse_with_hygiene():
         pool.close()
 
 
+def test_reuse_is_cheaper_than_booting():
+    """A pool that costs more than a boot is not a pool.
+
+    Reuse used to be *slower* than starting fresh: the reset sweep
+    counted kernel threads, which cannot be killed, so "only PID 1
+    remains" never became true and the sweep burned its whole 2 s
+    budget every time — against a 0.94 s cold boot on vfkit. Pooling
+    was a pessimization on that rung and nobody noticed, because
+    nothing compared the two.
+
+    Timed rather than asserted structurally, because the property IS
+    the time. The bound is deliberately loose — measured reuse is
+    ~0.02 s and the broken version was a hard 2.0 s floor — so this
+    fails the bug without being a benchmark that flakes on a loaded
+    runner.
+
+    Timed across close-then-acquire, not acquire alone: the reset runs
+    in ``release()``, so the cost lands when a session is handed BACK.
+    A first cut of this timed only the acquire, passed happily with the
+    bug reintroduced, and measured nothing.
+    """
+    import time
+
+    pool = _pool()
+    try:
+        started = time.monotonic()
+        s = pool.acquire(**_vm_kwargs())
+        boot = time.monotonic() - started
+
+        started = time.monotonic()
+        s.close()  # park: this is where reset_guest runs
+        s2 = pool.acquire(**_vm_kwargs())
+        reuse = time.monotonic() - started
+        s2.close()
+
+        assert reuse < 1.5, f"reuse took {reuse:.2f}s (boot was {boot:.2f}s)"
+    finally:
+        pool.close()
+
+
 def test_state_affinity_across_park():
     """park_state tags the parked tree; a matching acquire resumes
     without a push — through a freeze/thaw on the frozen posture."""
