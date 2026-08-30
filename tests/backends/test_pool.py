@@ -160,6 +160,20 @@ def test_rebind_checks_at_the_assignment_point(monkeypatch):
                       "cache": None, "on_emit": None})
 
 
+def test_rebind_clears_a_lost_latch(monkeypatch):
+    """A latch is per-session state that bypasses the constructor, so a
+    stale one would make a perfectly live VM refuse its new owner. A
+    genuinely lost session never reaches here — release() discards one
+    whose reset failed — which is why this is worth pinning rather than
+    assuming."""
+    p = _pool(monkeypatch)
+    a = p.acquire(image="x")
+    a._lost = "guest lost during 'ping'"
+    p._rebind(a, {"host_objects": None, "allow": None, "cache": None,
+                  "on_emit": None, "outputs_hook": None, "render_hook": None})
+    assert a._lost is None
+
+
 def test_a_bad_allowlist_costs_nobody_a_vm(monkeypatch):
     """The check runs before _make_room, which under max_total can
     reclaim somebody else's session — no sense paying that for a config

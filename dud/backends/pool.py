@@ -461,6 +461,13 @@ class VmPool:
         session.render_hook = binding["render_hook"]
         session.emits = []
         session._closed = False
+        # Cleared for the same reason as `_closed`: these fields bypass
+        # the constructor, and a latch left set would make a perfectly
+        # live VM refuse its new owner. A session that was actually lost
+        # cannot arrive here — release() discards one whose reset failed,
+        # and acquire() tears down a park that will not ping or thaw —
+        # so this is the defensive half of that, not the load-bearing one.
+        session._lost = None
 
     @staticmethod
     def _abort_channel(session: VmSession) -> None:

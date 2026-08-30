@@ -285,6 +285,54 @@ became what everyone shipped.
 No pickle ever crosses the wire; cache values are opaque bytes to the
 host, and everything else rides a tagged json/bytes/file codec.
 
+### When a session dies
+
+Any VM can vanish. That isn't an edge case to defend against — it's the
+premise the whole design rests on, and the reason pooling, idle
+eviction and capacity pressure need no machinery of their own: they're
+all just deliberate versions of the same death.
+
+So there is exactly one thing to catch:
+
+```python
+try:
+    r = s.python(code)
+except dud.SessionLost:
+    s = dud.session("vm", pooled=True, state=commit)   # a new machine
+    if not s.resumed:
+        s.push_tree(tree)                              # put the tree back
+    r = s.python(code)                                 # once
+```
+
+`SessionLost` covers every way the guest can stop answering — EOF, a
+reset, a broken pipe, a pool reclaim tearing a frame mid-call, and a
+deadline expiring. Two of those mean different things and it's worth
+knowing which you got: *"guest lost during …"* is a machine that went
+away, and *"guest did not answer … within Ns"* is one that's still
+there and wedged. The first is routine; the second is a bug worth
+chasing, usually in guest code.
+
+**A lost session stays lost.** The object refuses further calls rather
+than trying the wire again, because a failed request can leave the
+channel desynchronized — so a retry on the same session would fail
+again with a worse description of what happened. `close()` still works,
+and still cleans up.
+
+This is safe to build on because dud never holds the authoritative
+tree. Your layer does. Re-acquiring and re-pushing is a complete
+recovery by construction, not a best effort — which is also why
+`state=` is worth passing: a parked VM already holding that exact
+content comes back `resumed=True` and skips the push entirely.
+
+One thing that does *not* roll back: emits. They're events, delivered
+live mid-exec, and they're kept even when the exec later fails —
+unlike cache writes, which apply only on success. Don't assume
+checkpoint atomicity for them.
+
+A protocol version mismatch at connect is deliberately **not** a
+`SessionLost` — it stays a `ProtocolError`, because no amount of
+re-acquiring will fix a real incompatibility.
+
 ## The ladder
 
 The backends aren't peers — they're ordered by how hard a boundary

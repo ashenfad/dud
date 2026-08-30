@@ -282,6 +282,21 @@ class HostSession:
         self.emits: list[tuple[str, Any]] = []
         self.on_emit = on_emit
         self._closed = False
+        # Set once the wire has failed, and never cleared for the life
+        # of this session. `SessionLost` has always been documented as
+        # terminal ("the session object is unusable afterward"), and
+        # nothing enforced it — so a caller who caught it and retried on
+        # the same object, which is the natural reading of "retry once",
+        # got undefined behavior instead of an answer.
+        #
+        # Undefined rather than merely futile: a deadline can expire
+        # mid-frame, since `sendall` under a socket timeout may write
+        # part of a message and not say how much. And a guest that was
+        # only slow leaves its late response in the channel, so the next
+        # request reads a foreign id and fails again with something less
+        # legible than the truth. Both make the *second* failure a worse
+        # description of what happened than the first.
+        self._lost: str | None = None
         # Liveness bookkeeping (read by VmPool's demand-driven reclaim):
         # a bound VM with _in_flight == 0 is reclaimable, LRU by
         # last_used. Maintained by _request, the single wire seam.
@@ -324,6 +339,12 @@ class HostSession:
                 f"session is frozen (parked as a snapshot); "
                 f"call thaw() before {verb!r}"
             )
+        if self._lost is not None:
+            raise SessionLost(
+                f"session was already lost ({self._lost}) and cannot be "
+                f"reused; acquire a new one and re-push the tree "
+                f"(refusing {verb!r})"
+            )
         self.last_used = time.monotonic()
         self._in_flight += 1
         budget = _budget_for(verb, body, bins)
@@ -334,11 +355,13 @@ class HostSession:
             # Worth its own message: every other cause here is a guest
             # that went away, and "did not answer in time" is a guest
             # that is still there and wedged — a different bug to chase.
+            self._lost = f"guest did not answer {verb!r} in time"
             raise SessionLost(
                 f"guest did not answer {verb!r} within {budget:.0f}s"
             ) from e
         except (ChannelClosed, OSError, ProtocolError,
                 json.JSONDecodeError, UnicodeDecodeError) as e:
+            self._lost = f"guest lost during {verb!r}"
             raise SessionLost(
                 f"guest lost during {verb!r}: {e or type(e).__name__}"
             ) from e
