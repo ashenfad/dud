@@ -821,14 +821,28 @@ def shared_pool(session_cls: type | None = None) -> VmPool:
     parks are files and don't count) with demand-driven reclaim; unset
     means uncapped — macOS pages out untouched guest memory, so idle
     VMs cost less than their headline size and a hard cap is opt-in.
+
+    ``$DUD_VM_MAX_AFFINITY`` turns on same-content parking, which is
+    off by default (see ``VmPool.max_affinity``). It has to be reachable
+    from here, because ``dud.session(pooled=True, state=...)`` builds
+    its pool through this function and would otherwise be asking for
+    something it has no way to enable.
+
+    Deliberately NOT inferred from a caller passing ``state=``. That
+    would read as helpful and would quietly reintroduce the cost the
+    default exists to avoid: a consumer who tags every session is
+    exactly the one who would hold a VM per fingerprint without ever
+    choosing to.
     """
     session_cls = session_cls or _default_cls()
     with _shared_lock:
         pool = _shared.get(session_cls)
         if pool is None:
             cap = os.environ.get("DUD_VM_MAX_TOTAL")
+            affinity = os.environ.get("DUD_VM_MAX_AFFINITY")
             pool = _shared[session_cls] = VmPool(
-                max_total=int(cap) if cap else None, session_cls=session_cls
+                max_total=int(cap) if cap else None, session_cls=session_cls,
+                max_affinity=int(affinity) if affinity else 0,
             )
         return pool
 

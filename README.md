@@ -13,9 +13,9 @@ nothing of value goes with it.
 > posture), the vfkit microVM backend (macOS/HVF), and the firecracker
 > microVM backend (Linux/KVM) all pass the same conformance corpus
 > over the same wire protocol. OCI-image workspaces with pip-layered
-> packages, warm VM pooling with state affinity, a disk-backed scratch
-> plane, and snapshot parking on firecracker (a parked VM is inert
-> files — zero RAM, ~tens-of-ms resume) all work today. See
+> packages, warm VM pooling, a disk-backed scratch plane, and
+> golden-snapshot clones on firecracker (a pool miss restores a
+> template in ~40 ms instead of booting in ~1.3 s) all work today. See
 > [DESIGN.md](DESIGN.md) for why it's shaped this way and
 > [ROADMAP.md](ROADMAP.md) for what's left.
 
@@ -286,15 +286,7 @@ operation, require the caller to name one when you do.
 ### Pooling and parking
 
 `pooled=True` reuses VMs across sessions from a process-wide warm
-pool; `state="<your content hash>"` **parks** a VM — sets it aside
-still holding that exact tree — so the next session with the same
-content resumes it instead of booting and re-pushing.
-
-How a park is stored differs by backend, but the contract doesn't: on
-macOS the VM stays running, on firecracker it's snapshotted to disk —
-zero RAM, files that outlive the process that made them.
-
-On firecracker, a pool **miss** doesn't boot either. The first session
+pool. A pool **miss** doesn't boot. The first session
 for a given config cold-boots; releasing it leaves a *golden snapshot*
 behind, and every later miss restores a clone of that instead —
 measured at **32–52 ms to a serving VM, against 1276 ms cold**. It
@@ -321,6 +313,27 @@ shared_pool(FirecrackerSession).seed(image="python:3.12-slim",
 because what it leaves behind is a file rather than a running VM.
 Both are optional: skip them and the second session onward is fast
 anyway.
+
+`state="<your content hash>"` **parks** a VM — sets it aside still
+holding that exact tree — so the next session with the same content
+resumes it (`resumed=True`) instead of re-pushing. It is **off by
+default**, and worth understanding before turning on: a park keeps a
+whole VM running, and the only thing it saves is one `push_tree`, since
+a miss now clones rather than boots. A push costs ~40 µs per file, so
+on the dozens-of-files workspaces this usually serves that is
+single-digit milliseconds against a ~45 ms acquire. It starts paying
+around ten thousand files (~420 ms).
+
+If your trees are big enough to want it:
+
+```python
+VmPool(session_cls=FirecrackerSession, max_affinity=1)   # your own pool
+DUD_VM_MAX_AFFINITY=1                                    # the shared one
+```
+
+The count is *per boot fingerprint*, and `DUD_VM_MAX_TOTAL` is the only
+global bound. Passing `state=` with affinity off logs a warning rather
+than silently handing back `resumed=False` forever.
 
 Host objects cross the boundary as *names*, not references — guest
 code gets a proxy whose only power is making allowlisted calls:
