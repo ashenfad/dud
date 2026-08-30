@@ -179,10 +179,13 @@ def test_build_reports_whether_it_shipped_bytecode(tmp_path):
         rootfs_path=tmp_path / "rootfs.img", workspace="/workspace",
         env=[], workdir="/",
     )
-    write_json(build.meta_path, {"bytecode": "baked"})
+    build.rootfs_path.write_bytes(b"x" * 100)
+    write_json(build.meta_path, {"bytecode": "baked", "size": 100})
     assert build.bytecode == "baked"
 
-    write_json(build.meta_path, {"bytecode": "skipped: host python 3.13 != guest 3.12"})
+    write_json(build.meta_path,
+               {"bytecode": "skipped: host python 3.13 != guest 3.12",
+                "size": 100})
     assert build.bytecode.startswith("skipped:")
 
 
@@ -200,3 +203,49 @@ def test_build_bytecode_is_unknown_without_metadata(tmp_path):
     assert build.bytecode == "unknown"          # meta, but no field
     build.meta_path.write_text("not json")
     assert build.bytecode == "unknown"          # unreadable
+
+
+def test_build_bytecode_abstains_when_metadata_is_not_its_own(tmp_path):
+    """The artifact and its metadata are committed separately — an
+    atomic rename, then a write — and the spec hash does not include
+    the host's Python, so two builders on different minors produce
+    different bytes for one path. Their publishes can interleave and
+    leave one builder's rootfs beside the other's status.
+
+    The size check cannot prevent that. It stops the field *lying*
+    about it, which is the part that matters: a diagnostic nobody can
+    trust is worse than one that says it does not know.
+    """
+    from dud.atomic import write_json
+    from dud.images.builder import RootfsBuild
+
+    build = RootfsBuild(
+        spec="s", ref="r", digest="d", rootfs_path=tmp_path / "rootfs.img",
+        workspace="/workspace", env=[], workdir="/",
+    )
+    build.rootfs_path.write_bytes(b"x" * 100)
+    write_json(build.meta_path, {"bytecode": "baked", "size": 100})
+    assert build.bytecode == "baked"
+
+    # The other builder's artifact lands, its metadata has not yet.
+    build.rootfs_path.write_bytes(b"y" * 250)
+    assert build.bytecode == "unknown"
+
+    # ...and once its metadata follows, the pair agrees again.
+    write_json(build.meta_path, {"bytecode": "skipped: host python 3.13 "
+                                 "!= guest 3.12", "size": 250})
+    assert build.bytecode.startswith("skipped:")
+
+
+def test_build_bytecode_abstains_when_the_artifact_is_gone(tmp_path):
+    """A stat on a missing file must abstain, not raise: `ping()` is a
+    liveness call and has no business failing over a cache detail."""
+    from dud.atomic import write_json
+    from dud.images.builder import RootfsBuild
+
+    build = RootfsBuild(
+        spec="s", ref="r", digest="d", rootfs_path=tmp_path / "gone.img",
+        workspace="/workspace", env=[], workdir="/",
+    )
+    write_json(build.meta_path, {"bytecode": "baked", "size": 100})
+    assert build.bytecode == "unknown"

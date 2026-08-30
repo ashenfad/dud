@@ -96,14 +96,27 @@ class RootfsBuild:
         hit has to report as accurately as a fresh build, since a cache
         hit is the common case.
 
-        Note this is deliberately not part of the spec hash: whether
-        bytecode was baked is a performance property, not an identity
-        one, so two hosts on different interpreters share one cache
-        entry and whichever built it first decides what is in it. This
-        field is how you find out which you got.
+        Deliberately not part of the spec hash: whether bytecode was
+        baked is a performance property, not an identity one. The
+        consequence is that two hosts on different interpreters share
+        one cache entry and produce genuinely different bytes for it,
+        and the artifact and this metadata are committed separately --
+        an atomic rename, then a write. So their publishes can
+        interleave and leave one builder's rootfs beside the other's
+        status.
+
+        Hence the size check. It cannot prevent the tear, but it can
+        stop this field lying about it, which is the part that matters:
+        a diagnostic nobody can trust is worse than one that admits it
+        does not know. Same rule as a half-written golden snapshot.
+        O(1) -- the size is already recorded, and a stat is free.
         """
         try:
-            return json.loads(self.meta_path.read_text())["bytecode"]
+            meta = json.loads(self.meta_path.read_text())
+            status = meta["bytecode"]
+            if meta["size"] != self.rootfs_path.stat().st_size:
+                return "unknown"  # metadata is not this artifact's
+            return status
         except (OSError, ValueError, KeyError):
             return "unknown"
 

@@ -71,7 +71,9 @@ record for those.
   Note this is a performance property and deliberately not part of the
   rootfs spec hash, so two hosts on different interpreters share one
   cache entry and whichever built it first decides what is in it. The
-  field is how to tell which you got.
+  field is how to tell which you got — and it reports `"unknown"`
+  rather than guessing when the artifact and its metadata disagree,
+  which two such builders publishing concurrently can produce.
 
 - **Golden snapshots: a pool miss clones a machine instead of booting
   one.** Measured on amd64 CI: **32-52 ms to a serving VM, against
