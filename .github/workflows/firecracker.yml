@@ -71,7 +71,15 @@ jobs:
         path: ~/.dud
         key: dud-home-${{ runner.os }}-${{ hashFiles('dud/kernels.py', 'dud/images/debs.py') }}
 
+    # The asset is public and fetches anonymously, so this does not need
+    # a token to succeed. GH_TOKEN is here for the path that only runs
+    # when the plain download FAILS: dud.kernels falls back to `gh
+    # release download`, which on a hosted runner has no stored
+    # credentials — so without this the fallback is dead code exactly
+    # when a transient GitHub hiccup would call for it.
     - name: Fetch the pinned guest kernel
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: python -m dud.kernels
 
     # The same corpus the other rungs run, unsliced: a hosted runner is
