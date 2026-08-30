@@ -23,6 +23,17 @@ permissions:
 jobs:
   conformance:
     runs-on: ubuntu-latest  # x86-64, and the only hosted runner with /dev/kvm
+    strategy:
+      fail-fast: false  # a medium-specific failure must not hide the other
+      matrix:
+        # Both media, because they boot differently and the guest
+        # contract has to hold on each. erofs finishes in about half
+        # the time (measured: 4.5s vs 8.5s per boot on firecracker,
+        # because initramfs spends ~3.3s having the kernel decompress
+        # the whole rootfs into RAM), so it is also the early signal
+        # when something is broken outright.
+        medium: [erofs, initramfs]
+    name: conformance (${{ matrix.medium }})
 
     steps:
     - uses: actions/checkout@v4
@@ -69,7 +80,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ~/.dud
-        key: dud-home-${{ runner.os }}-${{ hashFiles('dud/kernels.py', 'dud/images/debs.py') }}
+        key: dud-home-${{ runner.os }}-${{ matrix.medium }}-${{ hashFiles('dud/kernels.py', 'dud/images/debs.py') }}
 
     # The asset is public and fetches anonymously, so this does not need
     # a token to succeed. GH_TOKEN is here for the path that only runs
@@ -88,4 +99,5 @@ jobs:
     - name: Conformance (firecracker)
       env:
         DUD_BACKEND: firecracker
+        DUD_MEDIUM: ${{ matrix.medium }}
       run: pytest tests/conformance -v --durations=10
