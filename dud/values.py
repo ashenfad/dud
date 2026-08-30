@@ -25,17 +25,71 @@ class NotRepresentable(DudError, ValueError):
     """Value has no codec form. Callers decide: skip+record, or raise."""
 
 
-def encode_value(v: Any) -> dict:
-    if isinstance(v, bytes):
-        return {"t": "bytes", "mime": "application/octet-stream",
-                "b64": base64.b64encode(v).decode()}
+class ValueTooLarge(NotRepresentable):
+    """Value has a codec form, but one too big to put on the wire.
+
+    A subclass of :class:`NotRepresentable` so that everything already
+    written to skip values that cannot cross also skips values that
+    should not — the harvest path records both in ``outputs_skipped``,
+    and neither is a reason to fail an exec. The distinct type is for
+    callers that want to tell "there is no encoding for this" from
+    "there is one, and it is enormous", which are different problems
+    with different fixes.
+    """
+
+
+def _mib(n: int) -> str:
+    return f"{n / (1 << 20):.1f} MiB"
+
+
+def _encode_sized(v: Any) -> tuple[dict, int]:
+    """``(tagged form, its size on the wire)``.
+
+    The size is taken from the representability probe rather than
+    measured separately: ``json.dumps`` has to run anyway to learn
+    whether a value *can* be encoded, and its length is then free. It
+    is an estimate — the tagged wrapper adds a few bytes and the real
+    serialization happens once this value is nested into a frame — but
+    it is exact where it matters, because the payload dominates
+    everything around it by orders of magnitude at any size worth
+    refusing.
+
+    (The probe's output is genuinely thrown away, and cannot be
+    reused: what goes on the wire is this value nested inside a larger
+    message, so ``_send_msg`` serializes it again. Dropping the probe
+    would mean one bad value failing a whole frame with nothing to say
+    which key caused it, which is worse than the second pass.)
+    """
     if isinstance(v, bytearray):
-        return encode_value(bytes(v))
+        v = bytes(v)
+    if isinstance(v, bytes):
+        b64 = base64.b64encode(v).decode()
+        return ({"t": "bytes", "mime": "application/octet-stream",
+                 "b64": b64}, len(b64))
     try:
-        json.dumps(v)
+        probe = json.dumps(v)
     except (TypeError, ValueError):
         raise NotRepresentable(type(v).__name__) from None
-    return {"t": "json", "v": v}
+    return {"t": "json", "v": v}, len(probe)
+
+
+def encode_value(v: Any, cap: int | None = None) -> dict:
+    """Tag a value for the wire, optionally refusing an oversized one.
+
+    ``cap`` is a ceiling in wire bytes; over it, :class:`ValueTooLarge`.
+    Guest-side callers pass one because everything they encode transits
+    the supervisor — PID 1 on a VM rung — which parses it whole. Left
+    unset the behavior is exactly as before, which is what the host
+    side wants: a value the *host* chose to send is not a payload
+    anyone needs protecting from.
+    """
+    tagged, size = _encode_sized(v)
+    if cap is not None and size > cap:
+        raise ValueTooLarge(
+            f"{type(v).__name__} is {_mib(size)} on the wire, over the "
+            f"{_mib(cap)} limit; write it to a workspace file instead"
+        )
+    return tagged
 
 
 def file_ref(path: str) -> dict:
@@ -56,16 +110,42 @@ def decode_value(tagged: dict) -> Any:
     raise NotRepresentable(f"unknown tag {t!r}")
 
 
-def encode_map(d: dict[str, Any]) -> tuple[dict[str, dict], dict[str, str]]:
-    """Encode a name->value dict. Returns (encoded, skipped) where
-    skipped maps names that had no codec form to their type names."""
+def encode_map(
+    d: dict[str, Any], cap: int | None = None, total: int | None = None
+) -> tuple[dict[str, dict], dict[str, str]]:
+    """Encode a name->value dict. Returns ``(encoded, skipped)``, where
+    ``skipped`` maps each name that could not cross to why.
+
+    ``cap`` bounds one value, ``total`` the sum of those kept. Both are
+    optional and both, when exceeded, skip rather than truncate: half a
+    JSON document is not a smaller answer, it is a wrong one, and the
+    name still appears in ``skipped`` saying what happened.
+
+    A value that does not fit the remaining total is skipped on its
+    own — the walk does not stop there. A 40 MiB array should not cost
+    the caller the three-element list defined after it, and the
+    alternative makes what you get back depend on the order bindings
+    happen to appear in.
+    """
     out: dict[str, dict] = {}
     skipped: dict[str, str] = {}
+    used = 0
     for k, v in d.items():
         try:
-            out[k] = encode_value(v)
+            tagged, size = _encode_sized(v)
         except NotRepresentable:
             skipped[k] = type(v).__name__
+            continue
+        if cap is not None and size > cap:
+            skipped[k] = (f"{type(v).__name__} ({_mib(size)} exceeds the "
+                          f"{_mib(cap)} per-value limit)")
+            continue
+        if total is not None and used + size > total:
+            skipped[k] = (f"{type(v).__name__} ({_mib(size)} would exceed "
+                          f"the {_mib(total)} total)")
+            continue
+        out[k] = tagged
+        used += size
     return out, skipped
 
 

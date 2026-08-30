@@ -320,3 +320,101 @@ def test_a_hook_that_rewrites_then_raises_changes_nothing(monkeypatch):
     harvest = {"a": 1, "b": 2}
     assert runner._offer_outputs(harvest, SPEC) == {"a": 1, "b": 2}
     assert harvest == {"a": 1, "b": 2}  # the caller's dict, untouched
+
+
+# ---- the hook runs before the size guard --------------------------------
+
+
+def test_a_hook_gets_first_refusal_on_an_oversized_binding(monkeypatch):
+    """Ordering, and it is load-bearing rather than incidental.
+
+    A 200 MiB DataFrame is precisely what an outputs hook exists to
+    turn into a workspace file. Capping first would refuse it before
+    the one thing that knows how to keep it ever saw it, which would
+    make the guard delete exactly the data the extension point was
+    added to preserve. What reaches the cap is what nobody claimed.
+    """
+    written = {}
+
+    def flatten(bindings, workspace):
+        written.update({k: len(v) for k, v in bindings.items()
+                        if isinstance(v, str) and len(v) > 1_000})
+        return set(written)
+
+    _install(monkeypatch, flatten)
+    offered = runner._offer_outputs({"huge": "z" * 50_000, "keep": 7}, SPEC)
+
+    assert written == {"huge": 50_000}  # the hook saw it whole
+    assert offered == {"keep": 7}  # and dud dropped it as handled
+
+    # And so the cap, which runs on what is left, never sees it.
+    from dud.values import encode_map
+
+    enc, skipped = encode_map(offered, cap=1_000)
+    assert sorted(enc) == ["keep"] and skipped == {}
+
+
+def test_what_a_hook_declines_still_meets_the_guard(monkeypatch):
+    """The other half: declining to claim a binding is not a way to
+    push an unbounded payload past the ceiling."""
+    _install(monkeypatch, lambda bindings, workspace: set())
+    offered = runner._offer_outputs({"huge": "z" * 50_000}, SPEC)
+
+    from dud.values import encode_map
+
+    enc, skipped = encode_map(offered, cap=1_000)
+    assert enc == {} and "per-value limit" in skipped["huge"]
+
+
+# ---- the real call site, not a composition of the pieces ---------------
+
+
+class _NoChannel:
+    """`run` builds a cache view, an emit and any host proxies eagerly,
+    but only touches the channel when the exec uses one. These execs
+    do not."""
+
+    def request(self, *a, **k):  # pragma: no cover - defensive
+        raise AssertionError("this exec should not have touched the wire")
+
+
+def _run(code: str, spec: str | None = None, **caps):
+    """Drive `runner.run` itself.
+
+    Composing `_offer_outputs` and `encode_map` by hand in a test
+    proves the two pieces fit together; it cannot prove that `run`
+    fits them together in that order, which is the property at issue.
+    Reversing the real call site left a hand-composed test passing.
+    """
+    return runner.run(
+        _NoChannel(), {"code": code, "outputs_hook": spec, "caps": caps}
+    )
+
+
+def test_run_offers_to_the_hook_before_it_applies_the_guard(monkeypatch):
+    seen = {}
+
+    def flatten(bindings, workspace):
+        seen.update({k: len(v) for k, v in bindings.items() if isinstance(v, str)})
+        return {"huge"}
+
+    _install(monkeypatch, flatten)
+    result = _run("huge = 'z' * 50_000\nkeep = 7", spec=SPEC, value=1_000)
+
+    assert seen == {"huge": 50_000}, "the hook never saw the oversized binding"
+    assert result["outputs_skipped"] == {}, "the guard ran first and ate it"
+    assert list(result["outputs"]) == ["keep"]
+
+
+def test_run_guards_what_the_hook_left_behind(monkeypatch):
+    _install(monkeypatch, lambda bindings, workspace: set())
+    result = _run("huge = 'z' * 50_000", spec=SPEC, value=1_000)
+
+    assert result["outputs"] == {}
+    assert "per-value limit" in result["outputs_skipped"]["huge"]
+
+
+def test_run_guards_bindings_with_no_hook_configured():
+    result = _run("huge = 'z' * 50_000\nkeep = 7", value=1_000)
+    assert list(result["outputs"]) == ["keep"]
+    assert "per-value limit" in result["outputs_skipped"]["huge"]

@@ -97,6 +97,38 @@ record for those.
   build. If you were relying on transcripts above 1 MiB, write the
   output to a workspace file and read it from the diff.
 
+- **Values crossing from the guest are now bounded.** A harvested
+  binding, an `emit` value and a hostcall argument each cap at 8 MiB
+  on the wire, and one exec's harvest caps at 32 MiB in total. Both
+  are `caps` keys — `value` and `outputs` — so a caller who means it
+  can raise them per exec, the same way the text guards work.
+
+  They refuse rather than truncate, because half a JSON document is a
+  wrong answer and not a smaller one. What happens next differs by how
+  the value was offered: a harvested binding is *implicit*, so it
+  lands in `outputs_skipped` with its size (`'str (57.2 MiB exceeds
+  the 8.0 MiB per-value limit)'`) and the exec succeeds; an `emit` or
+  a hostcall argument is an *explicit call the agent wrote*, so it
+  raises there — a dropped event the host can't distinguish from one
+  that never fired is the worst shape for an event.
+
+  An `outputs_hook` still gets first refusal, before any ceiling
+  applies. That ordering is the point: a 200 MiB DataFrame is exactly
+  what a hook exists to turn into a workspace file, and capping first
+  would refuse it before the thing that knows how to keep it ever saw
+  it.
+
+  Why they were needed: all three cross in the JSON body of a frame
+  the guest supervisor parses whole, and on a VM rung that supervisor
+  is PID 1 with the machine's RAM. One 60 MB assignment crossed in
+  0.5 s with nothing in the way. Cache writes are deliberately *not*
+  capped here — they ride raw binary frames rather than the JSON body,
+  and their size is a question about cache semantics rather than about
+  the wire (see ROADMAP, "cache-as-service semantics").
+
+  `dud.ValueTooLarge` is the new exception, a subclass of
+  `NotRepresentable` so existing handling keeps working.
+
 ### Fixed
 
 - **A background process no longer holds a `shell()` call open.**

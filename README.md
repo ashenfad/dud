@@ -130,8 +130,12 @@ transcript is never rendered — it keeps exactly what real Python
 printed.
 
 `caps` are the other knob and are **not** an observation budget: they
-bound what one exec can send back so a runaway print loop can't flood
-the channel, and they sit far above anything you'd show a model.
+bound what one exec can send back so a runaway exec can't flood the
+channel, and they sit far above anything you'd show a model. Text is
+capped by `stdout`, `entry`, `entries` and `total`; values by `value`
+(one binding, `emit`, or hostcall argument) and `outputs` (everything
+one exec harvests). The value guards refuse rather than truncate —
+half a JSON document is a wrong answer, not a smaller one.
 
 ### Rich values out
 
@@ -148,6 +152,16 @@ r.outputs_skipped  # {'pd': 'module', 'df': 'DataFrame'}
 (`pd` is in there because the harvest is *every* top-level binding,
 imports included. dud reports what it couldn't represent rather than
 quietly filtering — you decide what's noise.)
+
+A binding that's simply too big lands there too, with its size rather
+than just its type — `'str (57.2 MiB exceeds the 8.0 MiB per-value
+limit)'`. Everything harvested crosses in one frame the guest
+supervisor parses whole, and on a VM rung that supervisor is PID 1, so
+the ceiling is what keeps one assignment from taking the machine down.
+Raise it with `caps` if you mean it; the usual answer is to write the
+value to a workspace file and pick it up from the diff — which is what
+an `outputs_hook` is for, and hooks get first refusal before the
+ceiling applies.
 
 Nothing is lost — but nothing is delivered either. To get such values
 out, serialize them **guest-side** into workspace files, where they

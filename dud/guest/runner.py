@@ -54,6 +54,21 @@ _CAP_ENTRY = 1 << 14    # 16 KiB per print
 _CAP_ENTRIES = 2_000    # entries in the structured stream
 _CAP_TOTAL = 1 << 21    # 2 MiB across entries — bounds entry * count
 
+# The same guard applied to VALUES rather than to text. Every one of
+# these crosses in the JSON body of a frame the supervisor parses
+# whole, and the supervisor is PID 1 on a VM rung — so an uncapped one
+# is the same runaway as an uncapped print, reached by assigning a
+# variable instead of by looping. Set high enough to be invisible to
+# real work (a large DataFrame as JSON is single-digit MiB) and far
+# under what threatens a 2 GiB guest.
+#
+# Deliberately NOT applied to cache writes: those ride raw binary
+# frames rather than the JSON body — no parse, no base64 expansion —
+# and the cache is host-supplied state whose size is the consuming
+# layer's policy, not a wire question. See the CHANGELOG note.
+_CAP_VALUE = 8 << 20     # 8 MiB for one harvested binding, emit, or arg
+_CAP_OUTPUTS = 32 << 20  # 32 MiB across everything one exec harvests
+
 # Smallest render budget worth giving one print argument; below this a
 # value renders to punctuation. Always clamped to the budget that is
 # actually left, so it bounds legibility rather than the total.
@@ -178,23 +193,30 @@ class CacheView(MutableMapping):
 class HostProxy:
     """A name the guest can talk at, not an object it can reach into."""
 
-    def __init__(self, name: str, channel: Channel):
+    def __init__(self, name: str, channel: Channel, cap: int | None = None):
         object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_ch", channel)
+        # Per-argument wire ceiling. Refused at the call rather than
+        # dropped, because a hostcall is something agent code asked for
+        # by name: silently passing a truncated argument, or none, would
+        # make the host object do the wrong thing quietly.
+        object.__setattr__(self, "_cap", cap)
 
     def __getattr__(self, method: str):
         if method.startswith("_"):
             raise AttributeError(method)
-        name, ch = self._name, self._ch
+        name, ch, cap = self._name, self._ch, self._cap
 
         def call(*args, **kwargs):
-            enc_args, skipped_a = encode_map({str(i): a for i, a in enumerate(args)})
-            enc_kwargs, skipped_k = encode_map(kwargs)
+            enc_args, skipped_a = encode_map(
+                {str(i): a for i, a in enumerate(args)}, cap=cap
+            )
+            enc_kwargs, skipped_k = encode_map(kwargs, cap=cap)
             if skipped_a or skipped_k:
                 bad = list(skipped_a.values()) + list(skipped_k.values())
                 raise TypeError(
-                    f"{name}.{method}: arguments of type {bad} can't cross "
-                    "the boundary (json/bytes only)"
+                    f"{name}.{method}: arguments that can't cross the "
+                    f"boundary (json/bytes only, and bounded): {bad}"
                 )
             try:
                 body, _ = ch.request(
@@ -595,6 +617,8 @@ def run(channel: Channel, req: dict) -> dict:
     total_cap = int(caps.get("total", _CAP_TOTAL))
     render_budget = req.get("render_budget")
     render_budget = int(render_budget) if render_budget else None
+    value_cap = int(caps.get("value", _CAP_VALUE))
+    outputs_cap = int(caps.get("outputs", _CAP_OUTPUTS))
 
     # Workspace-root imports, cwd-independent: filesystem modules resolve
     # from the workspace root (`import app.api...` works after `cd app`),
@@ -617,12 +641,21 @@ def run(channel: Channel, req: dict) -> dict:
     g["cache"] = cache
 
     def emit(name: str, value: Any = None) -> None:
-        """Fire a structured output at the host (DESIGN.md: emits)."""
-        channel.request("emit", {"name": str(name), "value": encode_value(value)})
+        """Fire a structured output at the host (DESIGN.md: emits).
+
+        An oversized value raises here rather than being dropped: emit
+        is an explicit call, and an event that silently never arrived
+        is the worst shape for one — the host cannot tell it from an
+        event that was never fired.
+        """
+        channel.request(
+            "emit",
+            {"name": str(name), "value": encode_value(value, cap=value_cap)},
+        )
 
     g["emit"] = emit
     for name in req.get("host_objects", []):
-        g[name] = HostProxy(name, channel)
+        g[name] = HostProxy(name, channel, cap=value_cap)
         injected.add(name)
     inputs = decode_map(req.get("inputs", {}))
     g.update(inputs)
@@ -654,8 +687,15 @@ def run(channel: Channel, req: dict) -> dict:
             k: v for k, v in g.items()
             if not k.startswith("_") and k not in injected
         }
+        # The caps sit AFTER the hook, which is the whole point of the
+        # ordering: a 200 MiB DataFrame is exactly what an outputs hook
+        # exists to turn into a workspace file, and capping first would
+        # refuse it before the one thing that knows how to keep it ever
+        # saw it. What reaches the cap is what nobody claimed.
         outputs, skipped = encode_map(
-            _offer_outputs(harvest, req.get("outputs_hook"))
+            _offer_outputs(harvest, req.get("outputs_hook")),
+            cap=value_cap,
+            total=outputs_cap,
         )
 
     transcript = stdout_buf.getvalue()
