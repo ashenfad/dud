@@ -32,6 +32,10 @@ def is_symlink(mode: int) -> bool:
     return mode & _S_IFMT == S_IFLNK
 
 
+def is_reg(mode: int) -> bool:
+    return mode & _S_IFMT == S_IFREG
+
+
 @dataclass
 class Node:
     """One filesystem entry destined for the initramfs."""

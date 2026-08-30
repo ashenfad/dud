@@ -52,6 +52,7 @@ from ..errors import IsolationUnavailable
 from ..images import build as build_rootfs, dud_home
 from ..images.scratch import _clone_or_copy, promote_clone
 from ..proto import Channel
+from . import golden
 from .base import HostSession
 
 VSOCK_PORT = 1024
@@ -333,6 +334,14 @@ class VmSession(HostSession):
             packages=packages, debs=debs, medium=medium,
         )
         kernel_path = _resolve_kernel(kernel, arch, home)
+        self._kernel_path = kernel_path
+        if restore_from is not None:
+            # Before the rundir, the scratch clone or the VMM: a
+            # snapshot booted from other bits must be rejected here,
+            # where it costs nothing and the pool can still fall back
+            # to a cold boot. The resolution above is what makes this
+            # free — it has already happened by the time we look.
+            golden.verify(restore_from, self.build.rootfs_path, kernel_path)
 
         _sweep_once()
         # Short rundir: macOS AF_UNIX sun_path is capped at 104 chars, and

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import tempfile
+import types
 
 import pytest
 
@@ -599,16 +600,32 @@ class FrozenFakeVM(FakeVM):
     off ``inspect.signature(session_cls.__init__)``, exactly like the
     real session classes."""
 
+    #: What this fake "booted from". The real session resolves these
+    #: before it looks at restore_from; tests move them to stand for an
+    #: upgraded dud or an image tag that now resolves to new bytes.
+    rootfs = "/artifacts/rootfs-aaaaaaaa"
+    kernel_image = "/kernels/amd64/Image"
+
     def __init__(self, image="python:3.12-slim", arch=None,
                  workspace="/workspace", kernel=None, memory_mib=2048,
                  cpus=2, home=None, boot_timeout=30.0, packages=None,
                  host_objects=None, allow=None, cache=None, on_emit=None,
                  restore_from=None):
+        rootfs = pathlib.Path(type(self).rootfs)
+        kernel_path = pathlib.Path(type(self).kernel_image)
+        if restore_from is not None:
+            # Mirrors VmSession: refuse a snapshot booted from other
+            # bits BEFORE anything is spent, so a stale one costs no
+            # boot — which is why this runs ahead of super().__init__,
+            # where the boot counter lives.
+            goldenmod.verify(restore_from, rootfs, kernel_path)
         super().__init__(image=image, arch=arch, workspace=workspace,
                          kernel=kernel, memory_mib=memory_mib, cpus=cpus,
                          home=home, boot_timeout=boot_timeout,
                          packages=packages, host_objects=host_objects,
                          allow=allow, cache=cache, on_emit=on_emit)
+        self.build = types.SimpleNamespace(rootfs_path=rootfs)
+        self._kernel_path = kernel_path
         self.frozen = False
         self.freezes = 0
         self.thaws = 0
@@ -638,7 +655,8 @@ def _fc_pool(monkeypatch, **kw):
     # the race resolved the harmless way on a dev laptop and the other
     # way on CI. Tests about seeding pass auto_seed=True.
     kw.setdefault("auto_seed", False)
-    return poolmod.VmPool(session_cls=FrozenFakeVM, **kw)
+    kw.setdefault("session_cls", FrozenFakeVM)
+    return poolmod.VmPool(**kw)
 
 
 def test_an_affinity_park_is_kept_hot_not_frozen(monkeypatch, tmp_path):
@@ -1079,3 +1097,59 @@ def test_prewarm_also_leaves_a_template(monkeypatch, tmp_path):
     p.prewarm(1, background=False, image="x")
     assert goldenmod.usable(goldenmod.golden_dir(key))
     p.close()
+
+
+def test_a_scratch_config_neither_seeds_nor_clones(monkeypatch, tmp_path):
+    """Not a missed optimisation — a loop.
+
+    A snapshot records the seed's per-boot `<rundir>/scratch.img`, and
+    seeding then deletes that rundir. Every later restore would
+    reference a file that is gone, and because a failed restore
+    discards the snapshot and reseeds, each miss would pay a failed
+    restore, a cold boot AND a background boot-plus-freeze, forever.
+    """
+    _golden_home(monkeypatch, tmp_path)
+
+    class ScratchFake(FrozenFakeVM):
+        def __init__(self, scratch=None, **kw):
+            self.scratch = scratch
+            super().__init__(**kw)
+
+    p = _fc_pool(monkeypatch, session_cls=ScratchFake, auto_seed=True,
+                 max_idle=0)
+    real = p.seed
+    monkeypatch.setattr(p, "seed", lambda **kw: real(background=False, **kw))
+
+    s = p.acquire(image="x", scratch="/vol/cache.img")
+    s.close()
+    assert not (tmp_path / "golden").exists(), "seeded a scratch config"
+    assert FrozenFakeVM.booted == 1, "a scratch miss booted more than once"
+    p.close()
+
+
+def test_a_background_seed_answers_to_max_total(monkeypatch, tmp_path):
+    """A seed is a whole VM, and used to be built outside both _bound
+    and _idle — invisible to the cap and to _make_room. A sequential
+    acquire on max_total=1 could therefore run two full guests."""
+    _golden_home(monkeypatch, tmp_path)
+    p = _fc_pool(monkeypatch, auto_seed=True, max_total=1, max_idle=0)
+    real = p.seed
+    monkeypatch.setattr(p, "seed", lambda **kw: real(background=False, **kw))
+
+    s = p.acquire(image="x")  # the caller's own VM fills the cap
+    assert FrozenFakeVM.booted == 1, "a seed booted past max_total=1"
+    assert not (tmp_path / "golden").exists()
+    s.close()
+    p.close()
+
+
+def test_a_seed_reserves_its_slot_before_it_boots(monkeypatch, tmp_path):
+    """Counting the reservation rather than the constructed VM is the
+    point: two seeds must not both look at an empty pool and both
+    boot."""
+    _golden_home(monkeypatch, tmp_path)
+    p = _fc_pool(monkeypatch, auto_seed=False, max_total=1)
+    with p._lock:
+        p._seeding.add("some-other-key")
+        assert p._at_capacity_locked()
+        assert p._live_locked() == 1

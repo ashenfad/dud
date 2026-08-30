@@ -280,3 +280,88 @@ def test_bake_pyc_survives_an_unparseable_module(make_layer):
     })
     fs = rootfs.flatten_layers([l1])
     assert rootfs.bake_pyc(fs, site) >= 1  # the good one still baked
+
+
+def test_bake_pyc_skips_a_symlinked_module(make_layer):
+    """`Node.data` holds a symlink's TARGET, not its contents.
+
+    So `foo.py -> bar.py` would compile the string "bar.py" — perfectly
+    valid source for the expression `bar.py` — into a .pyc named for
+    foo. And because these are written UNCHECKED_HASH, importing foo
+    would run that without ever consulting the real module, raising
+    NameError instead of executing bar.
+    """
+    import sys
+
+    from dud.images.cpio import Node, S_IFLNK
+
+    host = f"{sys.version_info.major}.{sys.version_info.minor}"
+    tag = sys.implementation.cache_tag
+    lib = f"usr/local/lib/python{host}"
+    site = f"{lib}/site-packages"
+    l1 = make_layer("l1", dirs=[site],
+                    files={f"{lib}/bar.py": b"value = 1\n"})
+    fs = rootfs.flatten_layers([l1])
+    fs.nodes[f"{lib}/foo.py"] = Node(mode=S_IFLNK | 0o777, data=b"bar.py")
+
+    rootfs.bake_pyc(fs, site)
+    assert f"{lib}/__pycache__/bar.{tag}.pyc" in fs.nodes  # the real one
+    assert f"{lib}/__pycache__/foo.{tag}.pyc" not in fs.nodes
+
+
+def test_bake_pyc_ignores_a_directory_named_like_a_module(make_layer):
+    """Same filter, other shape: `.py` in a name proves nothing."""
+    import sys
+
+    host = f"{sys.version_info.major}.{sys.version_info.minor}"
+    tag = sys.implementation.cache_tag
+    lib = f"usr/local/lib/python{host}"
+    site = f"{lib}/site-packages"
+    l1 = make_layer("l1", dirs=[site, f"{lib}/weird.py"])
+    fs = rootfs.flatten_layers([l1])
+    rootfs.bake_pyc(fs, site)
+    assert f"{lib}/__pycache__/weird.{tag}.pyc" not in fs.nodes
+
+
+def test_bake_pyc_ignores_the_builders_own_optimization_level():
+    """Bytecode written as `module.<tag>.pyc` is what a normally started
+    guest loads, and that name promises asserts intact and `__debug__`
+    true. `dont_inherit` does not cover this — it governs __future__
+    flags, while `optimize` defaults to -1, meaning "whatever this
+    interpreter was started with". Building under `python -O` would
+    therefore bake assert-stripped bytecode under the un-optimized
+    name and silently change the guest's semantics.
+
+    Run in a real `-O` subprocess, because sys.flags.optimize cannot be
+    moved from inside the process it describes.
+    """
+    import subprocess
+    import sys
+    import textwrap
+
+    prog = textwrap.dedent("""
+        import sys
+        from dud.images import rootfs
+        from dud.images.cpio import FileSet
+
+        host = f"{sys.version_info.major}.{sys.version_info.minor}"
+        site = f"usr/local/lib/python{host}/site-packages"
+        fs = FileSet()
+        fs.add_file(f"{site}/m.py", b"d = __debug__\\n", 0o644)
+        assert sys.flags.optimize > 0, "the -O flag did not take"
+        rootfs.bake_pyc(fs, site)
+
+        tag = sys.implementation.cache_tag
+        pyc = fs.nodes[f"{site}/__pycache__/m.{tag}.pyc"].data
+        import marshal
+        code = marshal.loads(pyc[16:])
+        # __debug__ folds at compile time: True at optimize=0, False
+        # under -O. Identity, not equality -- False == 0 would match a
+        # stray integer constant.
+        print("DEBUG_TRUE" if any(c is True for c in code.co_consts)
+              else "DEBUG_FALSE")
+    """)
+    out = subprocess.run([sys.executable, "-O", "-c", prog],
+                         capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "DEBUG_TRUE", out.stdout

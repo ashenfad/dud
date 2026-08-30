@@ -212,11 +212,18 @@ class VmPool:
             if parked is None:
                 self._make_room()
                 self._maybe_refill(key)  # replace what we're about to boot
-                session = self._fresh(key, kwargs)
+                session, cold = self._fresh(key, kwargs)
                 session._pool = self  # close() -> release
                 session.resumed = False
                 with self._lock:
                     self._bound[id(session)] = session
+                if cold and self.auto_seed:
+                    # Seeded only after this session is bound, so the
+                    # caller's own VM is counted when the seed asks
+                    # whether max_total has room for one more. Seeding
+                    # from inside _fresh looked at a pool that did not
+                    # yet contain the very VM being booted.
+                    self.seed(**kwargs)
                 return session
             _, _, session = parked
             try:
@@ -273,12 +280,26 @@ class VmPool:
         """
         if not hasattr(self.session_cls, "freeze"):
             return
+        if not golden.eligible(kwargs):
+            return
         key = _fingerprint(kwargs, self.session_cls)
         if golden.usable(golden.golden_dir(key)):
             return
         with self._lock:
             if key in self._seeding:
                 return   # already being built; one boot is enough
+            # A seed is a whole VM, so it answers to max_total like any
+            # other. It used to be built outside both _bound and _idle,
+            # which made it invisible to the cap and to _make_room: a
+            # sequential acquire on max_total=1 could run two full
+            # guests, and a burst across fingerprints could run several
+            # more. Counting _seeding reserves the slot from here,
+            # before the VM exists, so two seeds cannot both pass.
+            if self._at_capacity_locked():
+                _log.debug("at max_total=%s; skipping the background seed "
+                           "(misses cold-boot until there is room)",
+                           self.max_total)
+                return
             self._seeding.add(key)
         boot_kwargs = {k: v for k, v in kwargs.items() if k not in _BINDING_KEYS}
         if background:
@@ -307,8 +328,11 @@ class VmPool:
                 self._seeding.discard(key)
 
     def _fresh(self, key: str, kwargs: dict[str, Any]):
-        """A machine for a miss: a golden clone if there is one, else a
-        cold boot — which then leaves a golden behind for next time.
+        """A machine for a miss, and whether it wants a template built.
+
+        Returns ``(session, cold)``: a golden clone if there is one,
+        else a cold boot — which then leaves a golden behind for next
+        time.
 
         The boot a miss used to pay is a pure function of the boot
         fingerprint, so it is worth paying once rather than per miss.
@@ -326,14 +350,19 @@ class VmPool:
         must cost speed and never a session.
         """
         if not hasattr(self.session_cls, "freeze"):
-            return self.session_cls(**kwargs)  # rung cannot snapshot
+            return self.session_cls(**kwargs), False  # rung cannot snapshot
+        if not golden.eligible(kwargs):
+            # Nothing to clone from and nothing worth seeding: a
+            # scratch-backed config would publish a snapshot that
+            # references a per-boot file already deleted.
+            return self.session_cls(**kwargs), False
 
         path = golden.golden_dir(key)
         if golden.usable(path):
             try:
                 session = self.session_cls(restore_from=path, **kwargs)
                 _log.debug("pool miss: cloned the golden snapshot")
-                return session
+                return session, False
             except Exception:  # noqa: BLE001 — a bad cache is not a bad session
                 _log.warning("golden snapshot would not restore; discarding "
                              "it and booting fresh", exc_info=True)
@@ -341,15 +370,37 @@ class VmPool:
 
         _log.debug("pool miss: booting a fresh %s (no golden snapshot yet)",
                    self.session_cls.__name__)
-        # Build the template behind them, on its own machine. The
-        # caller gets their boot and waits for nothing; every miss from
-        # here on is a clone. Deliberately not seeded from THIS session
-        # or from its release: both would put a ~3s freeze on somebody's
-        # critical path to save a later 40ms clone, which is the trade
-        # that made pooling slower than not pooling.
-        if self.auto_seed:
-            self.seed(**kwargs)
-        return self.session_cls(**kwargs)
+        # The caller gets a boot; `acquire` builds the template behind
+        # them, on its own machine, once this session is bound. They
+        # wait for nothing, and every miss from here on is a clone.
+        # Deliberately not seeded from THIS session or from its
+        # release: both would put a ~3s freeze on somebody's critical
+        # path to save a later 40ms clone, which is the trade that made
+        # pooling slower than not pooling.
+        return self.session_cls(**kwargs), True
+
+    def _live_locked(self) -> int:
+        """VMs holding RAM right now, which is what ``max_total`` caps.
+
+        Frozen parks are files, not processes: they consume no RAM or
+        CPU, so the cap neither counts them nor reclaims them (TTL is
+        their only expiry — disk GC).
+
+        In-flight seeds DO count. Each is a full guest, and counting
+        the reservation rather than the constructed object is the point:
+        the slot is claimed before the VM exists, so two seeds cannot
+        both look at an empty pool and both boot.
+        """
+        return (
+            len(self._bound)
+            + len(self._seeding)
+            + sum(1 for b in self._idle.values()
+                  for _, _, s in b if not getattr(s, "frozen", False))
+        )
+
+    def _at_capacity_locked(self) -> bool:
+        return (self.max_total is not None
+                and self._live_locked() >= self.max_total)
 
     def _make_room(self) -> None:
         """Demand-driven reclaim: called before booting a fresh VM when
@@ -367,16 +418,7 @@ class VmPool:
         while True:
             victim: Any = None
             with self._lock:
-                # Frozen parks are files, not processes: they consume
-                # no RAM/CPU, so the cap neither counts them nor
-                # reclaims them (TTL is their only expiry — disk GC).
-                total = len(self._bound) + sum(
-                    1
-                    for b in self._idle.values()
-                    for _, _, s in b
-                    if not getattr(s, "frozen", False)
-                )
-                if total < self.max_total:
+                if not self._at_capacity_locked():
                     return
                 oldest: tuple[float, str, int] | None = None
                 for key, bucket in self._idle.items():
