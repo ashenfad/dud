@@ -51,7 +51,12 @@ record for those.
   Emits arrive live, mid-exec, so a long build reports progress as it
   goes, and they survive a timeout — they are events, not results.
   Every child bash spawns inherits the channel, so `$(...)`,
-  pipelines and backgrounded jobs all work.
+  pipelines and background jobs all work. An emit still has to be
+  *written* before the script ends: `dud-emit x 1 &` with nothing
+  after it detaches the write from the script's lifetime, and dud
+  waits only briefly for stragglers, so add `wait` when it has to be
+  certain. Python has the same rule — an `emit()` from a thread that
+  outlives its exec does not arrive either.
 
   Why it exists at all: DESIGN names bash as the forcing function for
   the emit contract — no objects, no namespace, no pickle, so a

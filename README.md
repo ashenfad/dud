@@ -106,7 +106,14 @@ obvious thing. The one sharp edge: `dud-emit n 42` emits the *number*
 Emits arrive **live, mid-exec**, so a long build can report progress
 while it runs rather than at the end, and they survive a timeout —
 they're events, not results. Every child bash spawns inherits the
-channel, so it works inside `$(...)`, pipelines and backgrounded jobs.
+channel, so it works inside `$(...)`, pipelines and background jobs.
+
+One limit worth knowing: an emit has to be *written* before the script
+ends. `dud-emit x 1 &` with nothing after it detaches the write from
+the script's lifetime, and dud waits only briefly for stragglers — add
+`wait` when a backgrounded emit has to be certain. The Python side has
+the same rule for the same reason: an `emit()` from a thread that
+outlives its exec doesn't arrive either.
 
 This exists because bash is the honest test of whether the emit
 contract is language-neutral: no objects, no namespace, no pickle. It

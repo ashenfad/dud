@@ -352,3 +352,57 @@ def test_emit_drain_takes_what_is_left_in_the_pipe():
         os.close(w)
         os.close(r)
     assert [x["name"] for x in got] == ["last"]
+
+
+def test_emit_drain_waits_briefly_for_a_record_on_its_way():
+    """`dud-emit x 1 &` — the child is still starting when bash exits.
+
+    The drain has to WAIT, where the transcript's deliberately does
+    not: output arriving after the script exits belongs to whoever
+    inherited stdout, but a record here is a `dud-emit` the author
+    asked for by name, and short-lived by construction.
+
+    Without the wait this worked by luck — the child's write is itself
+    what wakes the select upstairs, so it usually lands before the exit
+    is noticed. Usually is not a contract, and the window widens with
+    anything that slows the child down.
+    """
+    import threading
+
+    from dud.guest.shell import _Emits
+
+    got = []
+    e = _Emits(got.append)
+    r, w = os.pipe()
+
+    def late_writer():
+        time.sleep(0.05)  # still starting when the drain begins
+        os.write(w, b'{"name":"late","value":{"t":"json","v":1}}\n')
+        os.close(w)
+
+    t = threading.Thread(target=late_writer, daemon=True)
+    t.start()
+    try:
+        e.drain(r, budget=2.0)
+    finally:
+        t.join(timeout=5)
+        os.close(r)
+    assert [x["name"] for x in got] == ["late"]
+
+
+def test_emit_drain_gives_up_on_a_holder_that_never_writes():
+    """The other half, and the reason the budget is small: `nohup
+    server &` inherits this pipe, so a script that leaves one pays the
+    wait in full on every exec. There is no signal that distinguishes
+    "about to write" from "never will"."""
+    from dud.guest.shell import _Emits
+
+    e = _Emits(lambda rec: None)
+    r, w = os.pipe()  # w held open, never written
+    try:
+        started = time.monotonic()
+        e.drain(r, budget=0.2)
+        assert 0.15 < time.monotonic() - started < 2.0
+    finally:
+        os.close(w)
+        os.close(r)
