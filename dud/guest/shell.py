@@ -138,14 +138,20 @@ def _killpg(proc: subprocess.Popen) -> None:
 
 
 def _drain(out: _Transcript, fd: int, budget: float = _DRAIN_BUDGET) -> None:
-    """Take whatever the pipe still holds now its writer has been killed.
+    """Take what the pipe still holds, now the script is no longer in it.
+
+    Used at both exits — the script was killed at its deadline, or it
+    ended on its own while something it started kept the fd. Either
+    way the script has written everything it is going to, so this reads
+    what is there and stops rather than waiting for an end that belongs
+    to somebody else.
 
     Bounded by a deadline as well as by EOF, exactly as the
     supervisor's ``_Spill.drain`` is and for exactly the same reason: a
-    process that survived the group kill holds the write end open, and
-    a timed-out exec must still answer. The absence of this bound is
-    what let one ``setsid`` background process wedge the supervisor —
-    single-threaded, PID 1 — for as long as that process lived.
+    process holding the write end can supply data indefinitely, and an
+    exec must still answer. The absence of this bound is what let one
+    ``setsid`` background process wedge the supervisor — single
+    threaded, PID 1 — for as long as that process lived.
     """
     deadline = time.monotonic() + budget
     while time.monotonic() < deadline:
@@ -169,6 +175,13 @@ def _pump(proc: subprocess.Popen, timeout: float) -> tuple[_Transcript, bool]:
     entire timeout and come back ``timed_out=True`` because of it.
     Anything the script itself wrote has already been read by then;
     what stays open is somebody else's fd.
+
+    Which makes the *placement* of the exit check load-bearing, not
+    incidental — see the comment on it below. A survivor that writes
+    without pause keeps the pipe readable forever, and the first cut of
+    this loop only looked at ``poll()`` on a pass that read nothing.
+    That worked for a silent ``sleep 30 &`` and failed for the logging
+    dev server that motivated the whole function.
     """
     fd = proc.stdout.fileno()
     out = _Transcript()
@@ -180,25 +193,37 @@ def _pump(proc: subprocess.Popen, timeout: float) -> tuple[_Transcript, bool]:
             _killpg(proc)
             _drain(out, fd)
             return out, True
+        # Every pass, and BEFORE the read rather than after it. A
+        # survivor that writes CONTINUOUSLY — `nohup npm run dev &`, a
+        # dev server logging as it boots — keeps select() readable with
+        # no gap, so a poll placed after a "did we read anything" branch
+        # is a poll that never runs, and the finished script times out
+        # anyway. The quiet survivor and the chatty one are the same
+        # bug; only the chatty one defeats a check that waits for
+        # silence to run.
+        if proc.poll() is not None:
+            if open_pipe:
+                # Bounded, by the same argument as the post-kill drain:
+                # the script has written everything it is going to, so
+                # whatever is still arriving belongs to whoever
+                # inherited the fd. Take what is there and stop.
+                _drain(out, fd)
+            return out, False
         if open_pipe:
             try:
                 ready, _, _ = select.select([fd], [], [], min(remaining, _POLL))
             except (OSError, ValueError):
                 # An fd we can no longer watch. Stop watching it and
                 # keep waiting on the process rather than returning: the
-                # only non-timeout exit below is one where poll() has
+                # only non-timeout exit above is one where poll() has
                 # answered, which is what keeps `returncode` a number.
                 ready, open_pipe = (), False
-            if ready:
-                if out.read(fd):
-                    continue
+            if ready and not out.read(fd):
                 open_pipe = False  # EOF: every writer has let go
         else:
             # The script closed its own stdout but is still running
             # (`exec >&-; work`). Nothing to select on, so poll it.
             time.sleep(min(remaining, _POLL))
-        if proc.poll() is not None:
-            return out, False
 
 
 def run_shell(
