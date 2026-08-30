@@ -277,13 +277,6 @@ record for those.
   so it is a straight win for any consumer using `pooled=True`, not
   only for tests.
 
-  Worth knowing if you are choosing a medium: **erofs boots about
-  twice as fast as initramfs** on firecracker (4.5 s vs 8.5 s,
-  measured). Initramfs has the kernel decompress the entire rootfs
-  into RAM before `/init` runs — ~3.3 s of a 4.2 s kernel boot —
-  where erofs is demand-paged from a block device. Firecracker
-  conformance now runs both in CI.
-
 - **A background process no longer holds a `shell()` call open.**
   `shell("nohup server &")` returned only when the *server* exited,
   because the call waited for end-of-pipe and the server had inherited
