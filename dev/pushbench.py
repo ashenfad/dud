@@ -7,26 +7,35 @@ now restores a golden clone in 32–52 ms rather than booting. So the
 question "is ``max_affinity=1`` a sensible default" reduces to "what is
 a push worth", and that number had never been measured.
 
-Measured on vfkit/arm64 (5 runs, median), against a 1 GiB guest:
+Measured on vfkit/arm64 (median of runs), against a 1-2 GiB guest:
 
-    shape                            bytes   push (ms)   reset+push
-    tiny     10 files x 1 KB          0.0M          3          25
-    small   100 files x 4 KB          0.5M          9          29
-    medium  500 files x 8 KB          4.4M         34          54
-    large  2000 files x 8 KB         17.4M        104         135
-    chunky  100 files x 256KB        26.3M         50          70
+    shape                            bytes   push (ms)   us/file
+    tiny      10 files x 1 KB         0.0M          3       300
+    small    100 files x 4 KB         0.5M          9        90
+    medium   500 files x 8 KB         4.4M         34        68
+    large   2000 files x 8 KB        17.4M        104        52
+    chunky   100 files x 256KB       26.3M         50       500
+    huge    5000 files x 4 KB        23.1M        196        39
+    huge   10000 files x 4 KB        46.1M        377        38
+    huge   20000 files x 2 KB        51.2M        690        35
 
-So a push is 3–104 ms over two orders of magnitude of tree, and it
-tracks file COUNT more than bytes: 2000 small files cost twice what 26
-MB in 100 files does. Against a ~40 ms clone, affinity saves roughly
-40–140 ms per hit.
+Two findings, and the second is the one that matters.
 
-That is modest, and it is why the default survives anyway: a release
-only parks when the owner stamped ``park_state``, so a caller who never
-tags never holds a VM. ``max_affinity=1`` costs nothing to those who
-don't use it and saves a push for those who do — and the callers who
-gain most are the ones with the largest trees, which is the right way
-round.
+A push tracks file COUNT far more than bytes: 2000 small files cost
+twice what 26 MB in 100 files does.
+
+And it scales LINEARLY out to 20k files — per-file cost drifts *down*
+(51 to 35 us) rather than degrading, so there is no cliff and no
+surprise waiting in a big workspace. That is what makes the number
+usable as a default-setting input: a push is ~40 us per file, all the
+way up. A 500-file scratch tree costs 26 ms; a 10k-file workspace with
+its dependencies installed costs 377 ms.
+
+The first cut of this bench stopped at 2000 files and reported "40-140
+ms, modest", which nearly argued the default to 0. Extrapolation would
+have been wrong in the other direction too (linear from the small end
+predicts ~1 s at 20k, against 690 ms actual). Measuring the tail was
+the whole point.
 
 Run against a rung that boots (macOS/vfkit here, or the Lima dev VM
 for firecracker — see dev/fc-test.sh):
@@ -47,11 +56,17 @@ import time
 #: because the two are separately interesting: tar overhead and guest
 #: extraction scale with entries, the socket write with bytes.
 SHAPES = [
-    ("tiny     10 files x 1 KB", 10, 1 << 10),
-    ("small   100 files x 4 KB", 100, 4 << 10),
-    ("medium  500 files x 8 KB", 500, 8 << 10),
-    ("large  2000 files x 8 KB", 2000, 8 << 10),
-    ("chunky  100 files x 256KB", 100, 256 << 10),
+    ("tiny      10 files x 1 KB", 10, 1 << 10),
+    ("small    100 files x 4 KB", 100, 4 << 10),
+    ("medium   500 files x 8 KB", 500, 8 << 10),
+    ("large   2000 files x 8 KB", 2000, 8 << 10),
+    ("chunky   100 files x 256KB", 100, 256 << 10),
+    # The tail is not optional. Stopping at 2000 made a push look like
+    # a rounding error next to a clone, which is the opposite of what
+    # it is for the workspaces this is actually for.
+    ("huge    5000 files x 4 KB", 5000, 4 << 10),
+    ("huge   10000 files x 4 KB", 10000, 4 << 10),
+    ("huge   20000 files x 2 KB", 20000, 2 << 10),
 ]
 
 

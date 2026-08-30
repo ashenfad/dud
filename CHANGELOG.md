@@ -43,6 +43,15 @@ record for those.
   three rungs' identical pooled/state handling collapsed to one copy
   while there.
 
+- **`max_affinity` on `VmPool`** (default 1, 0 disables): how many
+  tagged VMs to keep hot per boot fingerprint for a same-content
+  resume. An affinity park now buys exactly one thing — a skipped
+  `push_tree` — since a plain miss clones in ~40 ms instead of booting.
+  Measured at ~40 us per file, linearly, out to 20k files
+  (`dev/pushbench.py`): 26 ms for a 500-file tree, 377 ms for a
+  10k-file workspace. Kept on by default mainly so `park_state` is not
+  a silent no-op for callers who ask for it.
+
 - **`ping()` reports whether the image shipped precompiled bytecode.**
   Baking is skipped when the host interpreter's minor version differs
   from the image's, which is now the common case — the default image is
