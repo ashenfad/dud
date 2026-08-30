@@ -3,7 +3,7 @@
 Starts at 0.3.0. Earlier releases predate this file; `git log` is the
 record for those.
 
-## Unreleased
+## 0.4.0 - 2026-08-30
 
 The theme is that a session should cost what it does, and that when it
 doesn't, you can find out why.
