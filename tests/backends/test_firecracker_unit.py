@@ -106,7 +106,14 @@ def test_unix_http_connection_roundtrip():
 
     def serve_one():
         conn, _ = srv.accept()
-        Handler(conn, ("local", 0), None)
+        try:
+            Handler(conn, ("local", 0), None)
+        finally:
+            # BaseHTTPRequestHandler does not close the socket it was
+            # handed when driven directly like this, so without it the
+            # accepted connection leaks — a ResourceWarning that only
+            # surfaces on GC timing, and fails the suite under -W error.
+            conn.close()
 
     t = threading.Thread(target=serve_one)
     t.start()
