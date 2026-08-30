@@ -342,6 +342,49 @@ record for those.
 
 ### Fixed
 
+- **Golden snapshots could outlive the code that built them.** The
+  store was keyed by the pool's boot fingerprint, which serializes raw
+  constructor kwargs: `image` is a tag rather than a digest, and dud's
+  own guest code appears nowhere in it. That is fine for in-memory
+  pool buckets, which die before anything can drift — but the store
+  lives in `~/.dud`. Upgrading dud kept every snapshot and resumed
+  guests booted from the previous release's rootfs, which is exactly
+  the host/guest skew `proto.py` documents as impossible "through the
+  normal build" (and which `PROTO_VERSION` does not catch, since that
+  moves only when the framing changes).
+
+  The key now includes the guest-code identity, and a manifest beside
+  each snapshot records the resolved rootfs and kernel it was booted
+  from — checked before restore, which costs nothing because a session
+  resolves its build before it looks at the snapshot anyway. A
+  mismatch discards and cold-boots.
+
+- **Scratch-backed configs reseeded forever.** A snapshot records the
+  seed VM's per-boot `scratch.img`, which is deleted with its rundir
+  the moment seeding finishes, so every later restore referenced a
+  missing file. Since a failed restore discards and reseeds, each miss
+  paid a failed restore, a cold boot *and* a background boot-plus-
+  freeze — permanently. Configs with `scratch` no longer use golden
+  snapshots at all.
+
+- **Background seeding ignored `max_total`.** A seed VM was built
+  outside both `_bound` and `_idle`, invisible to the cap and to
+  reclaim, so a sequential acquire on `max_total=1` could run two full
+  guests. Seeds now reserve a slot before booting, and skip when there
+  is no room.
+
+- **Baked bytecode trusted the filename.** `bake_pyc` compiled
+  anything ending in `.py`, but `Node.data` holds a symlink's *target*
+  — so `foo.py -> bar.py` baked well-formed bytecode for the
+  expression `bar.py` under foo's name, and being UNCHECKED_HASH it
+  would run without consulting the real module. Regular files only.
+
+- **Baked bytecode inherited the builder's `-O`.** `dont_inherit`
+  governs `__future__` flags, not the optimization level, which
+  defaults to the host interpreter's. Building under `python -O` wrote
+  assert-stripped, `__debug__`-false bytecode under the name a
+  normally started guest loads. Pinned to `optimize=0`.
+
 - **On x86_64 the guest never actually stopped the machine.** PID 1
   asked for a power-off, which works on aarch64 because PSCI turns it
   into a `SYSTEM_OFF` the VMM handles. Firecracker on x86_64 implements

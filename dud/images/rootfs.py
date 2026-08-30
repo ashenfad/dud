@@ -17,7 +17,8 @@ import tarfile
 from pathlib import Path
 
 from . import registry
-from .cpio import FileSet, Node, S_IFDIR, S_IFLNK, S_IFREG, is_dir, is_symlink
+from .cpio import (FileSet, Node, S_IFDIR, S_IFLNK, S_IFREG, is_dir,
+                   is_reg, is_symlink)
 
 _log = logging.getLogger(__name__)
 
@@ -291,9 +292,27 @@ def bake_pyc(fs: FileSet, site: str) -> int:
     tag = sys.implementation.cache_tag
     baked = 0
     for path in [k for k in list(fs.nodes) if k.endswith(".py")]:
-        src = fs.nodes[path].data
+        node = fs.nodes[path]
+        # Regular files only. `Node.data` holds the symlink TARGET for a
+        # symlink, so a `foo.py -> bar.py` would compile the string
+        # "bar.py" into perfectly well-formed bytecode for the
+        # expression `bar.py` — and since these are written
+        # UNCHECKED_HASH, importing foo would run it without ever
+        # consulting the real source, raising NameError instead. A
+        # directory named `*.py` lands here too.
+        if not is_reg(node.mode):
+            continue
+        src = node.data
         try:
-            code = compile(src, "/" + path, "exec", dont_inherit=True)
+            # optimize=0 pins what the plain `module.<tag>.pyc` name
+            # promises. `dont_inherit` covers __future__ flags but NOT
+            # the optimization level, which defaults to -1: inherited
+            # from the builder's own interpreter. Under `python -O` or
+            # PYTHONOPTIMIZE we would bake assert-stripped, __debug__
+            # False bytecode under the name a normally-started guest
+            # loads, silently changing its runtime semantics.
+            code = compile(src, "/" + path, "exec",
+                           dont_inherit=True, optimize=0)
         except (SyntaxError, ValueError):
             # Test fixtures and py2 leftovers live in the stdlib tree;
             # one unparseable file must not fail an image build.
