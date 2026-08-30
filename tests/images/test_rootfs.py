@@ -402,3 +402,40 @@ def test_every_injected_module_could_actually_run_in_the_guest():
     assert not offenders, (
         f"injected guest modules import host-only dud.images: {offenders}"
     )
+
+
+def test_bytecode_status_names_the_silent_tax():
+    """The failure this reports is invisible by construction: nothing
+    raises, behavior is identical, and CI cannot catch it because CI
+    pins the matching interpreter precisely so that baking happens.
+    The default image is 3.12 while the tested host is increasingly
+    3.13/3.14, so the common developer case is *no* baked bytecode."""
+    import sys
+
+    host = f"{sys.version_info.major}.{sys.version_info.minor}"
+    assert rootfs.bytecode_status(
+        f"usr/local/lib/python{host}/site-packages") == "baked"
+
+    other = "3.7"  # a real layout shape, just not this host's
+    status = rootfs.bytecode_status(
+        f"usr/local/lib/python{other}/site-packages")
+    assert status.startswith("skipped:")
+    assert host in status and other in status  # both halves, or it is a riddle
+
+    assert rootfs.bytecode_status("opt/dud").startswith("skipped:")
+
+
+def test_bake_pyc_and_bytecode_status_cannot_disagree(make_layer):
+    """Two reports of one fact. If the status says baked, the bake must
+    have produced something, and vice versa — otherwise `ping()` would
+    confidently describe an image that is not what shipped."""
+    import sys
+
+    host = f"{sys.version_info.major}.{sys.version_info.minor}"
+    for py in (host, "3.7"):
+        site = f"usr/local/lib/python{py}/site-packages"
+        l1 = make_layer("l1", dirs=[site],
+                        files={f"usr/local/lib/python{py}/m.py": b"x = 1\n"})
+        fs = rootfs.flatten_layers([l1])
+        baked = rootfs.bake_pyc(fs, site)
+        assert (baked > 0) == (rootfs.bytecode_status(site) == "baked")

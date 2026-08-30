@@ -94,3 +94,63 @@ def test_scratch_master_keys_are_stable_and_collision_free(tmp_path, monkeypatch
     assert b != a
     with pytest.raises(scratch.ScratchError):
         scratch.scratch_master("", home=tmp_path)
+
+
+def test_session_names_its_extension_points():
+    """The seam has to be discoverable from the seam.
+
+    Everything a consumer configures used to live in `**kwargs: Any` —
+    invisible to `help()`, to autocomplete and to a type checker. For a
+    library whose current job is finding the right API seams, the one
+    blessed entry point teaching nothing was the weakest of them, and
+    `outputs_hook` was moved onto the session precisely so the
+    mechanism would show up in a signature.
+    """
+    import inspect
+    import typing
+
+    params = inspect.signature(dud.session).parameters
+    for name in ("host_objects", "allow", "cache", "on_emit",
+                 "outputs_hook", "render_hook",
+                 "image", "packages", "memory_mib"):
+        assert name in params, f"{name} is still hidden in **kwargs"
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
+
+    # And the annotations must actually resolve — `Callable` was
+    # referenced before it was imported, which `from __future__ import
+    # annotations` hides until something asks.
+    hints = typing.get_type_hints(dud.session)
+    assert hints["on_emit"] is not None
+    assert "kwargs" in params  # the long tail still passes through
+
+
+def test_session_forwards_only_what_the_caller_named(monkeypatch):
+    """`image=None` means "unspecified", not "no image".
+
+    Naming a kwarg whose backend default is a real value makes this a
+    live hazard: forwarding the None would override
+    `python:3.12-slim` with nothing.
+    """
+    seen = {}
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr("dud.backends.vfkit.VfkitSession", FakeSession)
+    dud.session("vfkit", outputs_hook="pkg:fn")
+    assert seen == {"outputs_hook": "pkg:fn"}, seen
+    assert "image" not in seen and "memory_mib" not in seen
+
+
+def test_session_still_passes_the_long_tail_through(monkeypatch):
+    """Naming the discoverable ones must not amputate the rest."""
+    seen = {}
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr("dud.backends.vfkit.VfkitSession", FakeSession)
+    dud.session("vfkit", medium="erofs", cpus=4, image="node:22")
+    assert seen == {"medium": "erofs", "cpus": 4, "image": "node:22"}

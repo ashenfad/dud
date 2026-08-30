@@ -267,6 +267,32 @@ def _guest_py_version(site: str) -> str | None:
     return None
 
 
+def bytecode_status(site: str) -> str:
+    """Whether this image ships precompiled bytecode, and if not, why.
+
+    One fact decides it for both bakes — the stdlib and dud runtime
+    here, and the layered wheels in ``builder._bytecompile`` — because
+    bytecode is minor-version scoped: neither can emit a ``.pyc`` the
+    guest will load unless the host interpreter matches the image's.
+
+    Worth naming rather than leaving implicit in two ``if`` statements,
+    because the failure is silent and expensive. The default image is
+    ``python:3.12-slim`` while the tested host is increasingly 3.13 or
+    3.14, so a developer on a current Python gets *no* baked bytecode
+    at all and pays a recompile of the stdlib on every exec — with
+    nothing raised, nothing logged at the seam that matters, and no way
+    for CI to notice, since CI pins the matching version precisely so
+    that it does bake.
+    """
+    py = _guest_py_version(site)
+    host = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if py is None:
+        return "skipped: no python version in the image layout"
+    if py != host:
+        return f"skipped: host python {host} != guest {py}"
+    return "baked"
+
+
 def bake_pyc(fs: FileSet, site: str) -> int:
     """Compile every module in the rootfs to bytecode, ahead of boot.
 
@@ -291,11 +317,10 @@ def bake_pyc(fs: FileSet, site: str) -> int:
     import importlib.util
     from importlib._bootstrap_external import _code_to_hash_pyc
 
-    py = _guest_py_version(site)
-    host = f"{sys.version_info.major}.{sys.version_info.minor}"
-    if py is None or py != host:
-        _log.info("guest python %s != host %s; shipping without bytecode "
-                  "(slower guest imports, same behavior)", py, host)
+    status = bytecode_status(site)
+    if status != "baked":
+        _log.info("shipping without bytecode (%s): guest imports recompile "
+                  "from source on every exec, same behavior", status)
         return 0
 
     tag = sys.implementation.cache_tag

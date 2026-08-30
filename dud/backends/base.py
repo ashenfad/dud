@@ -588,9 +588,22 @@ class HostSession:
         the whole reason to name it here: a hook that failed to import
         behaves exactly like no hook at all, so the difference has to
         be visible somewhere. Here.
+
+        ``bytecode`` is here for the same reason and is the sharper
+        case, because nothing about it is even wrong: an image that
+        shipped without baked bytecode behaves identically and is
+        merely slower, forever, with no error and no failed test. The
+        guest cannot answer it — on a writable root it will have
+        written its own ``.pyc`` by the second import and would report
+        cache it did not ship with — so it is read from the build
+        metadata, which describes the artifact. Absent on rung 1, which
+        has no image.
         """
         body, _ = self._request("ping", {"outputs_hook": self.outputs_hook,
                                          "render_hook": self.render_hook})
+        build = getattr(self, "build", None)
+        if build is not None:
+            body["bytecode"] = build.bytecode
         return body
 
     def close(self) -> None:  # pragma: no cover - overridden

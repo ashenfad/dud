@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import logging
 import os
 import sys
@@ -83,6 +84,28 @@ class RootfsBuild:
     @property
     def meta_path(self) -> Path:
         return self.rootfs_path.with_name("meta.json")
+
+    @property
+    def bytecode(self) -> str:
+        """Whether this artifact shipped precompiled (see
+        ``rootfs.bytecode_status``).
+
+        Read from the metadata rather than recomputed, because it
+        describes the ARTIFACT and not the current host. A rootfs baked
+        on 3.12 is still baked when a 3.13 host reuses it -- and a cache
+        hit has to report as accurately as a fresh build, since a cache
+        hit is the common case.
+
+        Note this is deliberately not part of the spec hash: whether
+        bytecode was baked is a performance property, not an identity
+        one, so two hosts on different interpreters share one cache
+        entry and whichever built it first decides what is in it. This
+        field is how you find out which you got.
+        """
+        try:
+            return json.loads(self.meta_path.read_text())["bytecode"]
+        except (OSError, ValueError, KeyError):
+            return "unknown"
 
 
 def _dud_code_hash() -> str:
@@ -182,6 +205,7 @@ def build(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     fileset = rootfs.build_fileset(image, workspace=workspace)
+    bytecode = rootfs.bytecode_status(rootfs._site_packages(fileset))
     if pkgs:
         _layer_packages(fileset, list(pkgs), resolved_arch)
     if deb_names:
@@ -205,6 +229,7 @@ def build(
         "env": result.env,
         "workdir": result.workdir,
         "pipeline_version": PIPELINE_VERSION,
+        "bytecode": bytecode,
         "entries": len(fileset.nodes),
         "size": len(data),
     }, indent=2)
@@ -245,6 +270,13 @@ def _bytecompile(root: Path, py: str) -> None:
 
     host_py = f"{sys.version_info.major}.{sys.version_info.minor}"
     if host_py != py:
+        # Said out loud rather than returning quietly. This is the same
+        # gate rootfs.bake_pyc reports through bytecode_status, and it
+        # is the one that costs the pandas-shaped images the most --
+        # the docstring below measures it at ~1 s per view GET.
+        _log.info("layered wheels ship without bytecode (host python %s != "
+                  "guest %s); their imports recompile on every exec",
+                  host_py, py)
         return
     # workers=1 = sequential in-process: parallel workers use
     # multiprocessing spawn, which re-imports the caller's __main__ —
