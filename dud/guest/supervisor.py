@@ -152,6 +152,32 @@ class _WorkerChild:
         return self.returncode
 
 
+def _is_kernel_thread(pid: str, proc: str = "/proc") -> bool:
+    """Is this /proc entry a kernel thread rather than a process?
+
+    Load-bearing for the reset sweep, which kills every non-PID-1
+    process and then waits for the machine to be ours again. Kernel
+    threads are unkillable by design — SIGKILL to one is discarded —
+    and a minimal guest has dozens (kworker, ksoftirqd, the virtio
+    threads). Counting them made "only PID 1 remains" a condition that
+    could never be true, so the sweep ran its whole 2 s budget on every
+    single reset, measurably costing more than booting a fresh VM.
+
+    Told apart by an empty ``cmdline``, which is how ps and top do it.
+    A zombie reads empty too, and skipping one is right: it is already
+    dead, and the waitpid pass beside this reaps it.
+
+    ``proc`` is injectable only so this is testable off a VM rung: the
+    sweep runs solely as guest PID 1, so the host suite has no /proc
+    with kernel threads in it to check against.
+    """
+    try:
+        with open(f"{proc}/{pid}/cmdline", "rb") as f:
+            return not f.read(1)
+    except OSError:
+        return True  # vanished mid-scan, or not ours to read
+
+
 class Supervisor:
     def __init__(self, channel: Channel, root: Path):
         self.channel = channel
@@ -479,7 +505,8 @@ class Supervisor:
             deadline = time.monotonic() + 2.0
             while time.monotonic() < deadline:
                 others = [e for e in os.listdir("/proc")
-                          if e.isdigit() and e != "1"]
+                          if e.isdigit() and e != "1"
+                          and not _is_kernel_thread(e)]
                 for entry in others:
                     try:
                         os.kill(int(entry), signal.SIGKILL)

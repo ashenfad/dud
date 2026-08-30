@@ -261,6 +261,22 @@ record for those.
 
 ### Fixed
 
+- **Pooled reuse was slower than booting a fresh VM.** `reset_guest`
+  took a flat 2.01 s, against a 0.94 s cold boot on vfkit — so the
+  pool was a pessimization on that rung, and on firecracker it gave
+  back most of what parking saves.
+
+  The reset kills every non-PID-1 process and then waits for the
+  machine to be idle again, bounded at 2 s. It counted **kernel
+  threads**, which are unkillable by design and which a guest has
+  dozens of — so "only PID 1 remains" could never become true and the
+  sweep always ran its whole budget. It now skips them the way `ps`
+  and `top` do, by an empty `cmdline`.
+
+  Measured after: **2.01 s → 0.02 s.** Every pooled release pays this,
+  so it is a straight win for any consumer using `pooled=True`, not
+  only for tests.
+
 - **A background process no longer holds a `shell()` call open.**
   `shell("nohup server &")` returned only when the *server* exited,
   because the call waited for end-of-pipe and the server had inherited
