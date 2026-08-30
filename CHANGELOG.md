@@ -34,6 +34,60 @@ record for those.
 
 ### Added
 
+- **Golden snapshots: a pool miss clones a machine instead of booting
+  one.** Measured on amd64 CI: **32-52 ms to a serving VM, against
+  1276 ms cold.**
+
+  A cold boot is a pure function of the boot fingerprint — the same
+  kernel running the same `/init` against the same rootfs, to reach a
+  state nothing per-session went into. So it is done once per
+  fingerprint and cloned afterwards. Sessions are still disposable;
+  what is reused is a file, not a machine.
+
+  This is **orthogonal to parking**, and the two solve different
+  costs: an affinity park skips `push_tree` because the tree is
+  already on that VM; a golden clone skips the boot because the
+  machine is already booted. Parking is unchanged.
+
+  The template costs nothing to make. `release` already freezes on the
+  frozen posture, so seeding it is a file copy of a snapshot that
+  existed anyway — no caller waits for one, and a session that runs
+  once and leaves pays nothing extra. `prewarm` seeds it too.
+
+  `VmPool.seed(**kwargs)` builds one ahead of time, which is
+  pre-warming without the cost of staying warm: a template holds no
+  VM, no RAM and no process, and any number of sessions can start from
+  it at once — so unlike `prewarm` there is no warm level to choose
+  and nothing to shed.
+
+  Safe because of two firecracker properties, both verified rather
+  than assumed (`dev/goldenspike.py`): the memory file maps
+  `MAP_PRIVATE`, so clones get copy-on-write and the golden file
+  hashes identically after N concurrent clones; and `vsock_override`
+  re-points each clone's socket, which is the documented mechanism for
+  restoring one snapshot into several VMs. Randomness does not
+  collide across clones either — `os.urandom`, `uuid4` and `random`
+  all measured distinct, since virtio-rng reseeds on resume.
+
+  **Releases no longer freeze.** Parking a VM on this rung meant
+  snapshotting it — ~3 s for a 1 GiB guest — to save what is now a
+  40 ms clone, which made pooling *slower* than not pooling. A plain
+  release now tears the machine down; the next miss clones a fresh
+  one, which comes up just as warm and cleaner. The template is built
+  on its own machine in the background, so no caller ever waits for a
+  freeze. `VmPool(auto_seed=False)` turns that off.
+
+  An **affinity park** — a release carrying `state=` — is the one
+  thing a clone cannot reproduce, because it holds a workspace. Those
+  are kept, and kept *running*: `VmPool(max_affinity=1)` bounds how
+  many, and 0 disables them. Freezing them would put three seconds on
+  every release that took the path, to save RAM on a VM you are
+  parking precisely because you expect to come straight back to it.
+
+  Every failure falls back to booting. A golden snapshot is a cache:
+  not having one, or having one that will not restore, costs speed and
+  never a session.
+
 - **The firecracker rung runs on x86-64 Linux.** It was described as a
   disposable Linux/KVM microVM but pinned only arm64 assets, so on the
   architecture most Linux servers are it raised
@@ -102,6 +156,33 @@ record for those.
   module (and not its function) exists.
 
 ### Changed behavior
+
+- **Guests boot faster.** Two changes, measured back to back on
+  firecracker under nested virt:
+
+  The rootfs now ships **baked bytecode**. It never had any:
+  `python:*-slim` deletes every `.pyc` at image-build time, and dud's
+  bytecompile step only ever covered layered wheels — so a guest
+  compiled ~1100 stdlib modules on the way up, and on a read-only
+  erofs root could never cache the result, paying it again on every
+  exec. Verified against a real cached rootfs: 1116 stdlib `.py`, zero
+  `.pyc`. Baking them cut boot from **5.61 s to 4.85 s** and removes a
+  recurring per-exec cost on erofs entirely. Bytecode is
+  minor-version-scoped, so this bakes only when the host interpreter
+  matches the guest's and otherwise skips silently, exactly as the
+  wheels path already did.
+
+  The kernel cmdline also suppresses probes for devices a microVM does
+  not have (`i8042.*`, `nomodule`, `swiotlb=noforce`,
+  `cryptomgr.notests`), from firecracker's own boot-time test. No
+  measurable gain on aarch64 — those are x86 devices — but they cost
+  nothing and should help on x86-64.
+
+  The serial console stays on deliberately, though firecracker's test
+  drops it: it is how a boot failure gets explained, and it is what
+  identified an amd64 poweroff bug that no host-side error described.
+
+  Rootfs artifacts rebuild once (`PIPELINE_VERSION` 5).
 
 - **A wedged guest now fails instead of hanging.** Every host→guest
   request carries a wall-clock deadline, so a guest that stops
@@ -260,6 +341,22 @@ record for those.
   channel stays usable.
 
 ### Fixed
+
+- **On x86_64 the guest never actually stopped the machine.** PID 1
+  asked for a power-off, which works on aarch64 because PSCI turns it
+  into a `SYSTEM_OFF` the VMM handles. Firecracker on x86_64 implements
+  no ACPI, so nothing claims `pm_power_off` and Linux's power-off path
+  ends in a halted CPU: the guest was idle forever rather than gone.
+
+  Nothing failed loudly. The host's `shutdown` request succeeded, and
+  the cost showed up only as wall-clock — the full VMM-exit timeout, on
+  every teardown, which a pool that discards rather than freezes pays
+  on every release. It also silently disabled scratch promotion on
+  amd64, since a volume is only promotable after a clean exit.
+
+  The guest now asks for a *reboot* on x86_64, which `reboot=k` (long
+  present on the cmdline) routes to the i8042 reset line that
+  firecracker traps and exits on. aarch64 keeps the honest power-off.
 
 - **Pooled reuse was slower than booting a fresh VM.** `reset_guest`
   took a flat 2.01 s, against a 0.94 s cold boot on vfkit — so the

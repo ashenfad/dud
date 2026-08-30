@@ -2,7 +2,26 @@
 
 from __future__ import annotations
 
+import pathlib
+import tempfile
+
+import pytest
+
+from dud.backends import golden as goldenmod
 from dud.backends import pool as poolmod
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_golden_store(monkeypatch, tmp_path):
+    """No test in this file may see the developer's real ~/.dud.
+
+    Not hygiene for its own sake — it was a live source of
+    local-passes/CI-fails. A machine that already holds a golden takes
+    the clone branch where a bare CI runner takes the boot-and-seed
+    branch, so the same test counts different boots depending on whose
+    laptop it runs on.
+    """
+    monkeypatch.setattr(goldenmod, "dud_home", lambda: tmp_path)
 
 
 class FakeVM:
@@ -81,6 +100,11 @@ def _pool(monkeypatch, **kw):
     # fake stands in for whichever that is.
     monkeypatch.setattr(poolmod, "_default_cls", lambda: FakeVM)
     FakeVM.booted = 0
+    # Off by default here so boot counts are deterministic: automatic
+    # seeding boots a second machine on a background thread, which
+    # would race every `booted ==` assertion in this file. Tests about
+    # seeding pass auto_seed=True.
+    kw.setdefault("auto_seed", False)
     return poolmod.VmPool(**kw)
 
 
@@ -578,7 +602,8 @@ class FrozenFakeVM(FakeVM):
     def __init__(self, image="python:3.12-slim", arch=None,
                  workspace="/workspace", kernel=None, memory_mib=2048,
                  cpus=2, home=None, boot_timeout=30.0, packages=None,
-                 host_objects=None, allow=None, cache=None, on_emit=None):
+                 host_objects=None, allow=None, cache=None, on_emit=None,
+                 restore_from=None):
         super().__init__(image=image, arch=arch, workspace=workspace,
                          kernel=kernel, memory_mib=memory_mib, cpus=cpus,
                          home=home, boot_timeout=boot_timeout,
@@ -588,6 +613,12 @@ class FrozenFakeVM(FakeVM):
         self.freezes = 0
         self.thaws = 0
         self.thaw_fails = False
+        # A real session's snapshot lands in its rundir; the pool copies
+        # from there when it seeds a golden.
+        self.restored_from = restore_from
+        self._rundir = tempfile.mkdtemp(prefix="fakevm-")
+        for name in ("vmstate", "mem"):
+            pathlib.Path(self._rundir, name).write_bytes(b"snapshot")
 
     def freeze(self):
         self.frozen = True
@@ -602,18 +633,42 @@ class FrozenFakeVM(FakeVM):
 
 def _fc_pool(monkeypatch, **kw):
     FakeVM.booted = 0  # the counter lives on the base class
+    # Same reason as _pool: a background seed boots a second machine and
+    # races every `booted ==` assertion. This helper was missing it, and
+    # the race resolved the harmless way on a dev laptop and the other
+    # way on CI. Tests about seeding pass auto_seed=True.
+    kw.setdefault("auto_seed", False)
     return poolmod.VmPool(session_cls=FrozenFakeVM, **kw)
 
 
-def test_release_freezes_and_acquire_thaws(monkeypatch):
+def test_an_affinity_park_is_kept_hot_not_frozen(monkeypatch, tmp_path):
+    """The one thing a clone cannot reproduce is a WORKSPACE, so a
+    tagged park is kept — but kept running. Freezing it would cost ~3s
+    of every release that took this path, to save RAM on a VM you are
+    parking precisely because you expect to come back to it."""
+    _golden_home(monkeypatch, tmp_path)
+    p = _fc_pool(monkeypatch)
+    s = p.acquire()
+    s.park_state = "commit-abc"
+    s.close()
+    assert not s.frozen and s.freezes == 0, "froze an affinity park"
+    assert not s.torn_down
+    assert s.requests == ["reset_guest"]  # hygiene still runs
+
+    booted = FakeVM.booted
+    s2 = p.acquire(state="commit-abc")
+    assert s2 is s and s2.resumed and s2.thaws == 0
+    assert FakeVM.booted == booted  # reuse, not a boot
+
+
+def test_a_plain_release_keeps_nothing(monkeypatch, tmp_path):
+    """Parking an untagged VM on a cloning rung buys nothing a 40ms
+    clone does not, and used to cost a ~3s freeze to do it."""
+    _golden_home(monkeypatch, tmp_path)
     p = _fc_pool(monkeypatch)
     s = p.acquire()
     s.close()
-    assert s.frozen and s.freezes == 1
-    assert s.requests == ["reset_guest"]  # hygiene BEFORE the freeze
-    s2 = p.acquire()
-    assert s2 is s and not s2.frozen and s2.thaws == 1
-    assert FakeVM.booted == 1  # reuse, not a boot
+    assert s.freezes == 0 and s.torn_down
 
 
 def test_frozen_idles_are_invisible_to_max_total(monkeypatch):
@@ -621,11 +676,13 @@ def test_frozen_idles_are_invisible_to_max_total(monkeypatch):
     sacrifice it, and it must not count against the cap."""
     p = _fc_pool(monkeypatch, max_total=1)
     a = p.acquire(image="a")
-    a.close()  # parked frozen under image=a
+    a.park_state = "commit-a"
+    a.close()      # hot affinity park
+    a.freeze()     # frozen by hand: releases never freeze now
     b = p.acquire(image="b")  # boots; cap=1 must NOT reclaim the frozen park
     assert not a.torn_down
     assert FakeVM.booted == 2
-    c = p.acquire(image="a")  # thaw the park, no boot
+    c = p.acquire(image="a", state="commit-a")  # thaw the park, no boot
     assert c is a and c.thaws == 1
     b.close()
     c.close()
@@ -665,7 +722,9 @@ def test_make_room_never_victimizes_frozen_parks(monkeypatch):
     when the scan runs at-cap, or the early total check hides it."""
     p = _fc_pool(monkeypatch, max_total=1)
     parked = p.acquire(image="parked")
-    parked.close()                     # frozen idle: invisible, total 0
+    parked.park_state = "commit-p"
+    parked.close()                     # hot affinity park
+    parked.freeze()                    # frozen by hand: total 0
     held = p.acquire(image="held")     # bound, running: total = 1
     fresh = p.acquire(image="fresh")   # at cap -> scan runs, skips the
     assert held.torn_down              # frozen park, reclaims the LRU
@@ -867,3 +926,156 @@ def test_pool_close_tears_down_bound_sessions_too(monkeypatch):
     p.close()
     assert p._bound == {}
     assert bound.torn_down
+
+
+# ---- golden snapshots on the miss path ---------------------------------
+
+
+def _golden_home(monkeypatch, tmp_path):
+    """Point the golden store at a temp dir, not the real dud home."""
+    monkeypatch.setattr(goldenmod, "dud_home", lambda: tmp_path)
+    return tmp_path
+
+
+def test_a_miss_seeds_the_template_in_the_background(monkeypatch, tmp_path):
+    """Seeded off the critical path entirely: the caller who misses
+    gets their boot and waits for nothing, and the template is built on
+    its own machine. Seeding from their session, or from its release,
+    would put a ~3s freeze on somebody's path to save a later 40ms
+    clone — the trade that made pooling slower than not pooling."""
+    _golden_home(monkeypatch, tmp_path)
+    p = _pool(monkeypatch, session_cls=FrozenFakeVM, max_idle=0)
+    key = poolmod._fingerprint({"image": "x"}, FrozenFakeVM)
+
+    p.auto_seed = True
+    real = p.seed  # run the background seed inline so the test can see it
+    monkeypatch.setattr(p, "seed", lambda **kw: real(background=False, **kw))
+    s = p.acquire(image="x")
+    s.close()
+    assert s.freezes == 0, "the caller's own session was frozen"
+    assert goldenmod.usable(goldenmod.golden_dir(key))
+
+
+def test_a_miss_clones_the_golden_instead_of_booting(monkeypatch, tmp_path):
+    _golden_home(monkeypatch, tmp_path)
+    p = _pool(monkeypatch, session_cls=FrozenFakeVM, max_idle=0)
+    p.seed(background=False, image="x")
+    booted = FrozenFakeVM.booted
+
+    s = p.acquire(image="x")
+    assert s.restored_from is not None, "miss cold-booted despite a golden"
+    assert FrozenFakeVM.booted == booted + 1
+    s.close()
+    p.close()
+
+
+def test_an_affinity_park_does_not_become_the_template(monkeypatch, tmp_path):
+    """A park with `state` keeps one session's workspace on the VM.
+    That is the opposite of what a template should carry — a clone of
+    it would hand every later session somebody else's tree."""
+    _golden_home(monkeypatch, tmp_path)
+    p = _pool(monkeypatch, session_cls=FrozenFakeVM)
+    s = p.acquire(image="x")
+    key = poolmod._fingerprint(s._pool_kwargs, FrozenFakeVM)
+    s.park_state = "commit-abc"  # what close(park_state=...) stamps
+    s.close()
+    assert not goldenmod.usable(goldenmod.golden_dir(key))
+    p.close()
+
+
+def test_an_unrestorable_golden_falls_back_to_booting(monkeypatch, tmp_path):
+    """A golden snapshot is a cache. One that will not restore must
+    cost speed, never a session — and must not be tried again."""
+    _golden_home(monkeypatch, tmp_path)
+
+    class Refuses(FrozenFakeVM):
+        def __init__(self, **kw):
+            if kw.get("restore_from") is not None:
+                raise RuntimeError("snapshot from an older firecracker")
+            super().__init__(**kw)
+
+    p = _pool(monkeypatch, session_cls=Refuses, max_idle=0)
+    p.seed(background=False, image="x")
+    key = poolmod._fingerprint({"image": "x"}, Refuses)
+    assert goldenmod.usable(goldenmod.golden_dir(key))
+
+    s = p.acquire(image="x")           # must not raise
+    assert s.restored_from is None     # booted instead
+    assert not goldenmod.usable(goldenmod.golden_dir(key))  # and dropped
+    s.close()
+    p.close()
+
+
+def test_a_rung_that_cannot_snapshot_is_untouched(monkeypatch, tmp_path):
+    """vfkit has no freeze/thaw at all; it must keep cold-booting on a
+    miss rather than reaching for a store it can never fill."""
+    _golden_home(monkeypatch, tmp_path)
+    p = _pool(monkeypatch)  # plain FakeVM: no freeze
+    s = p.acquire(image="x")
+    assert not hasattr(s, "restored_from") or s.restored_from is None
+    s.close()
+    assert not (tmp_path / "golden").exists()
+    p.close()
+
+
+def test_seed_builds_the_template_before_anyone_asks(monkeypatch, tmp_path):
+    """Pre-warming without the cost of staying warm. On the frozen
+    posture a template is a file — no VM, no RAM — and any number of
+    sessions can start from it, so there is no warm level to pick."""
+    _golden_home(monkeypatch, tmp_path)
+    p = _pool(monkeypatch, session_cls=FrozenFakeVM, max_idle=0)
+    key = poolmod._fingerprint({"image": "x"}, FrozenFakeVM)
+
+    p.seed(background=False, image="x")
+    assert goldenmod.usable(goldenmod.golden_dir(key))
+    assert FrozenFakeVM.booted == 1  # exactly one boot, and it is gone
+
+    s = p.acquire(image="x")
+    assert s.restored_from is not None, "first session still cold-booted"
+    s.close()
+    p.close()
+
+
+def test_seed_is_idempotent(monkeypatch, tmp_path):
+    _golden_home(monkeypatch, tmp_path)
+    p = _pool(monkeypatch, session_cls=FrozenFakeVM)
+    p.seed(background=False, image="x")
+    booted = FrozenFakeVM.booted
+    p.seed(background=False, image="x")
+    assert FrozenFakeVM.booted == booted  # no second boot for a template we have
+    p.close()
+
+
+def test_seed_does_nothing_on_a_rung_without_snapshots(monkeypatch, tmp_path):
+    _golden_home(monkeypatch, tmp_path)
+    p = _pool(monkeypatch)  # plain FakeVM: no freeze
+    p.seed(background=False, image="x")
+    assert FrozenFakeVM.booted == 0 or not (tmp_path / "golden").exists()
+    p.close()
+
+
+def test_seed_survives_an_environment_that_cannot_boot(monkeypatch, tmp_path):
+    """Requesting an optimisation must never raise: no kernel, no KVM,
+    no vfkit are all ordinary reasons a template cannot be built."""
+    _golden_home(monkeypatch, tmp_path)
+
+    class CannotBoot(FrozenFakeVM):
+        def __init__(self, **kw):
+            raise OSError("no /dev/kvm here")
+
+    p = _pool(monkeypatch, session_cls=CannotBoot)
+    p.seed(background=False, image="x")  # must not raise
+    assert not (tmp_path / "golden").exists()
+    p.close()
+
+
+def test_prewarm_also_leaves_a_template(monkeypatch, tmp_path):
+    """prewarm freezes and parks directly rather than going through
+    release, so it used to warm the pool and still leave the first miss
+    past the warm level cold-booting."""
+    _golden_home(monkeypatch, tmp_path)
+    p = _pool(monkeypatch, session_cls=FrozenFakeVM)
+    key = poolmod._fingerprint({"image": "x"}, FrozenFakeVM)
+    p.prewarm(1, background=False, image="x")
+    assert goldenmod.usable(goldenmod.golden_dir(key))
+    p.close()

@@ -88,8 +88,24 @@ class FirecrackerSession(VmSession):
         self._vsock_uds = os.path.join(self._rundir, "vsock")
         return f"{self._vsock_uds}_{VSOCK_PORT}"
 
+    #: Probe suppression, from firecracker's own boot-time test
+    #: (tests/integration_tests/performance/test_boottime.py). These
+    #: are devices a microVM does not have and drivers it will never
+    #: load, and each probe is emulated MMIO — which is exactly the
+    #: work nested virtualisation multiplies, since every access traps
+    #: through two hypervisors instead of one.
+    #:
+    #: The serial console is deliberately NOT disabled here, though
+    #: firecracker's own test drops it too. It is how a boot failure
+    #: gets explained — `_abandon` returns its tail, and it is what
+    #: identified an amd64 poweroff bug that no host-side error
+    #: described. Buying back its cost by going blind on the failure
+    #: path would be a bad trade at any price.
+    _QUIET_PROBES = ("nomodule i8042.noaux i8042.nomux i8042.nopnp "
+                     "i8042.dumbkbd swiotlb=noforce cryptomgr.notests")
+
     def _console_arg(self) -> str:
-        return "console=ttyS0 reboot=k panic=-1"
+        return f"console=ttyS0 reboot=k panic=-1 {self._QUIET_PROBES}"
 
     def _vmm_log_path(self, spec: BootSpec) -> str:
         # The guest's serial console rides firecracker's own stdout, so
@@ -141,11 +157,54 @@ class FirecrackerSession(VmSession):
                     raise
                 time.sleep(0.02)
 
+    def _restore(self, spec: BootSpec) -> None:
+        """Resume a clone of a golden snapshot instead of booting one.
+
+        Nothing here configures a machine: the snapshot already carries
+        the vCPU count, memory size, drives and vsock device, so the
+        only thing that must differ per clone is where its vsock lands.
+        `vsock_override` exists for exactly that — its API description
+        is about restoring one snapshot into several VMs.
+
+        The memory file is shared, not copied. Firecracker maps it
+        MAP_PRIVATE, so every clone gets copy-on-write over the same
+        golden bytes and none can write through; verified by hashing
+        the file before and after N concurrent clones.
+
+        The rootfs is NOT part of the snapshot — it is referenced by
+        the path recorded at freeze time. That is safe only because
+        image artifacts are content-addressed under the dud home and
+        so outlive any one session, which is also why a golden
+        snapshot is keyed by the same boot fingerprint the artifact is.
+        """
+        if os.environ.get("DUD_FC_METRICS"):
+            self._api("PUT", "/metrics",
+                      {"metrics_path": os.path.join(self._rundir, "metrics")})
+        self._api("PUT", "/snapshot/load", {
+            "snapshot_path": str(Path(spec.restore_from, "vmstate")),
+            "mem_backend": {"backend_type": "File",
+                            "backend_path": str(Path(spec.restore_from, "mem"))},
+            "vsock_override": {"uds_path": self._vsock_uds},
+            "resume_vm": True,
+        })
+
     def _configure(self, spec: BootSpec) -> None:
         self._await_api()
+        if spec.restore_from is not None:
+            return self._restore(spec)
         self._api("PUT", "/machine-config",
                   {"vcpu_count": spec.cpus, "mem_size_mib": spec.memory_mib,
                    "smt": False})
+        if os.environ.get("DUD_FC_METRICS"):
+            # Firecracker's own timings, in its own units. Worth having
+            # for one specific reason: `latencies_us.load_snapshot` is
+            # what AWS's published restore baselines report, so it is
+            # the only number of ours that can be compared to theirs —
+            # our HTTP wall time around /snapshot/load measures the API
+            # round trip too. Opt-in because it is a diagnostic, and
+            # writing metrics costs the VMM I/O on every flush.
+            self._api("PUT", "/metrics",
+                      {"metrics_path": os.path.join(self._rundir, "metrics")})
         boot: dict[str, Any] = {
             "kernel_image_path": str(spec.kernel),
             "boot_args": spec.cmdline,
@@ -277,6 +336,15 @@ class FirecrackerSession(VmSession):
         Path(self._rundir, "pid").write_text(str(self._proc.pid))
         try:
             self._await_api()
+            if os.environ.get("DUD_FC_METRICS"):
+                # Re-applied here, not just in _configure: a thawed VM
+                # is a FRESH firecracker process built from the
+                # snapshot, and metrics config does not travel in one.
+                # Without this the restore — the operation most worth
+                # measuring — was the one with no metrics at all.
+                self._api("PUT", "/metrics",
+                          {"metrics_path": os.path.join(self._rundir,
+                                                        "metrics")})
             self._api("PUT", "/snapshot/load", {
                 "snapshot_path": os.path.join(self._rundir, "vmstate"),
                 "mem_backend": {

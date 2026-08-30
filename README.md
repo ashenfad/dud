@@ -294,6 +294,34 @@ How a park is stored differs by backend, but the contract doesn't: on
 macOS the VM stays running, on firecracker it's snapshotted to disk —
 zero RAM, files that outlive the process that made them.
 
+On firecracker, a pool **miss** doesn't boot either. The first session
+for a given config cold-boots; releasing it leaves a *golden snapshot*
+behind, and every later miss restores a clone of that instead —
+measured at **32–52 ms to a serving VM, against 1276 ms cold**. It
+costs nothing to create (releasing already snapshots the VM) and holds
+no machine: a template is a file, and any number of sessions can start
+from one at once.
+
+That leaves only the very first session paying a boot, and the pool
+can't avoid it on its own — one pool serves *many* configs, keyed by
+boot fingerprint, so at construction there is no config to prepare.
+If you know yours up front, say so and even the first session is a
+clone:
+
+```python
+from dud.backends.firecracker import FirecrackerSession
+from dud.backends.pool import shared_pool
+
+shared_pool(FirecrackerSession).seed(image="python:3.12-slim",
+                                     packages=["pandas"])
+```
+
+`seed()` is pre-warming without the cost of staying warm — unlike
+`prewarm(n)`, there's no warm level to choose and nothing to shed,
+because what it leaves behind is a file rather than a running VM.
+Both are optional: skip them and the second session onward is fast
+anyway.
+
 Host objects cross the boundary as *names*, not references — guest
 code gets a proxy whose only power is making allowlisted calls:
 

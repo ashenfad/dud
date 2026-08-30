@@ -31,6 +31,7 @@ from pathlib import Path
 AF_VSOCK = getattr(socket, "AF_VSOCK", 40)
 VMADDR_CID_HOST = 2
 _RB_POWER_OFF = 0x4321FEDC
+_RB_AUTOBOOT = 0x01234567
 
 _libc = ctypes.CDLL(None, use_errno=True)
 
@@ -124,10 +125,34 @@ def _listen_vsock(port: int) -> socket.socket:
     return conn
 
 
+def _halt_cmd(machine: str) -> int:
+    """The reboot(2) command that actually makes *this* VMM exit.
+
+    Not the same call on both arches, and getting it wrong costs the
+    host real time rather than failing loudly:
+
+    aarch64 has PSCI, so ``RB_POWER_OFF`` becomes a ``SYSTEM_OFF`` the
+    VMM handles, and the machine goes away.
+
+    x86_64 does not. Firecracker implements no ACPI, so nothing claims
+    ``pm_power_off`` and Linux's power-off path ends in a halted CPU —
+    a VM that is idle forever rather than gone. What firecracker *does*
+    emulate is the i8042 controller, and it exits when the guest pulses
+    its reset line; ``reboot=k`` (which every VM cmdline already
+    carries) is what points Linux's *restart* path at that line. So on
+    x86_64 the way to stop the machine is to ask for a reboot.
+
+    Left unfixed this was invisible in one sense and expensive in
+    another: the host's shutdown request succeeded, then it waited out
+    its full VMM-exit timeout on every single teardown.
+    """
+    return _RB_AUTOBOOT if machine == "x86_64" else _RB_POWER_OFF
+
+
 def _power_off() -> None:
     sys.stderr.flush()
     _libc.sync()
-    _libc.reboot(_RB_POWER_OFF)
+    _libc.reboot(_halt_cmd(os.uname().machine))
 
 
 def main(default_root: str = "/workspace") -> None:

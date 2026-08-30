@@ -252,6 +252,13 @@ class BootSpec:
     listen_path: str
     cpus: int
     memory_mib: int
+    #: A golden snapshot directory to restore from instead of booting.
+    #: When set, the rung skips its boot configuration entirely and
+    #: resumes a clone of that snapshot — same machine, ~30x cheaper
+    #: (measured 32-52 ms against a 1276 ms cold boot on amd64 CI).
+    #: The snapshot is shared: several sessions restore the same files
+    #: concurrently, and none can write through to them.
+    restore_from: Path | None = None
 
 
 class VmSession(HostSession):
@@ -285,6 +292,7 @@ class VmSession(HostSession):
         on_emit: Callable[[str, Any], None] | None = None,
         outputs_hook: str | None = None,
         render_hook: str | None = None,
+        restore_from: Path | None = None,
     ):
         super().__init__(host_objects, allow, cache, on_emit, outputs_hook,
                          render_hook)
@@ -351,7 +359,11 @@ class VmSession(HostSession):
         self._sock_path = self._listen_path()
         self._srv = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
         self._srv.bind(self._sock_path)
-        self._srv.listen(1)
+        # Not 1: firecracker's vsock muxer does a BLOCKING connect() on
+        # its own event loop, so a full backlog stalls the whole VMM —
+        # past the guest's dial timeout — rather than just delaying one
+        # connection. The cost of a deeper queue is nothing.
+        self._srv.listen(128)
 
         spec = BootSpec(
             kernel=kernel_path,
@@ -365,6 +377,7 @@ class VmSession(HostSession):
             listen_path=self._sock_path,
             cpus=cpus,
             memory_mib=memory_mib,
+            restore_from=restore_from,
         )
         self._vmm_log = open(self._vmm_log_path(spec), "wb")
         try:
@@ -392,6 +405,14 @@ class VmSession(HostSession):
             ) from e
         self._ch = Channel(conn, handler=self._handle)
         self._ch.hello_recv()
+        if restore_from is not None:
+            # A restored guest woke with the clock stopped at freeze
+            # time and a fork template that predates the snapshot —
+            # which, across clones of ONE golden snapshot, would be the
+            # same template in every one of them. Same fixup thaw()
+            # sends, for the same reason; `do_resync`'s docstring names
+            # this hazard explicitly.
+            self._request("resync", {"epoch": time.time()})
 
     # ---- subclass hooks -------------------------------------------------
 
