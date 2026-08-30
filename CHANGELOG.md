@@ -103,6 +103,25 @@ record for those.
   what the two flavors of loss mean, and why re-acquiring plus
   re-pushing is a complete recovery rather than a best effort.
 
+- **The pool no longer holds VMs nobody can reach.** Two ways it did:
+
+  A lost session that its owner rebound rather than closed stayed in
+  the pool's bound set forever. Dropping your reference frees nothing,
+  because the pool holds one too — so a wedged VM kept its memory for
+  the life of the process. `acquire` now reaps bound sessions the wire
+  has already failed on. This is not the `max_total` reclaim, which
+  interrupts a *live* session deliberately: a lost one can never be
+  used again, so collecting it takes nothing from anybody.
+
+  And `VmPool.close()` only ever tore down *idle* VMs, which meant the
+  `atexit` path left every checked-out session untouched. It now takes
+  both. The leak had an alibi — the process-exit cascade powers guests
+  off regardless, so no VM outlived the run — but the bookkeeping and
+  the rundirs did, until the next boot's stale sweep.
+
+  Closing a dead session before replacing it is still the right thing
+  to do, and README's recovery example now shows it.
+
 - **`shell()` transcripts are capped**, at the same 1 MiB the Python
   runner has always applied to its own transcript. Past the cap the
   head is kept and the transcript ends with a line saying how much was
