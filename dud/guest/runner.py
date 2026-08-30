@@ -33,7 +33,13 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
 
 from ..proto import Channel, FrameTooLarge, RemoteError
-from ..values import ValueTooLarge, decode_map, encode_map, encode_value
+from ..values import (
+    ValueTooLarge,
+    _mib,
+    decode_map,
+    encode_map,
+    encode_value,
+)
 
 _RUNNER_FILE = "<session>"
 
@@ -62,12 +68,25 @@ _CAP_TOTAL = 1 << 21    # 2 MiB across entries — bounds entry * count
 # real work (a large DataFrame as JSON is single-digit MiB) and far
 # under what threatens a 2 GiB guest.
 #
-# Deliberately NOT applied to cache writes: those ride raw binary
-# frames rather than the JSON body — no parse, no base64 expansion —
-# and the cache is host-supplied state whose size is the consuming
-# layer's policy, not a wire question. See the CHANGELOG note.
+# Cache writes have their own, much larger budget just below rather
+# than sharing this one: an observation and a stash are different jobs
+# and want different numbers.
 _CAP_VALUE = 8 << 20     # 8 MiB for one harvested binding, emit, or arg
 _CAP_OUTPUTS = 32 << 20  # 32 MiB across everything one exec harvests
+
+# Cache writes get their own, far larger budget. They ride binary
+# frames rather than the JSON body — no parse, no base64 — so they are
+# cheaper per byte, and more to the point stashing data between execs
+# is what the cache is FOR. An 8 MiB ceiling here would be a guard
+# aimed at the wrong thing: outputs are an observation, the cache is
+# working storage. Still bounded, because the bytes land whole in a
+# supervisor that is PID 1 on a VM rung.
+#
+# These bound one TRANSIT. How large the cache may grow across a
+# session is the consuming layer's policy and stays open (ROADMAP,
+# "cache-as-service semantics").
+_CAP_CACHE = 64 << 20         # one cache write
+_CAP_CACHE_TOTAL = 128 << 20  # everything one exec stashes
 
 # Headroom over the sum of the parts, for names and framing. The frame
 # ceiling is DERIVED from the other caps rather than fixed, so raising
@@ -178,7 +197,9 @@ class CacheView(MutableMapping):
     def __len__(self) -> int:
         return sum(1 for _ in self)
 
-    def flush(self) -> tuple[dict[str, bytes], list[str]]:
+    def flush(
+        self, cap: int | None = None, total: int | None = None
+    ) -> tuple[dict[str, bytes], list[str]]:
         """(writes as raw pickles, deletes) for the result payload.
 
         Raw bytes, not base64: these ride binary frames beside the
@@ -188,12 +209,42 @@ class CacheView(MutableMapping):
         bytes differ from what was fetched — that keeps in-place
         mutation capture (``cache["x"].append(...)``) without turning
         every read into a spurious write upstream.
+
+        ``cap`` bounds one write and ``total`` the exec's writes
+        together; over either, :class:`~dud.values.ValueTooLarge`
+        naming the key. Checked HERE rather than at ``__setitem__``
+        because in-place mutation is a supported way to write — the
+        size at assignment is not the size that ships, and a guard on
+        the assignment would miss the case immediately above it.
+
+        Riding a binary frame makes these cheaper per byte than the
+        JSON-body paths (no parse, no base64) but not free: the bytes
+        still land whole in a supervisor that is PID 1 on a VM rung.
+        The ceiling is generous by default because stashing data
+        between execs is what the cache is *for* — this bounds one
+        transit, and how large the cache may grow overall stays the
+        consuming layer's question (ROADMAP, "cache-as-service
+        semantics").
         """
         writes = {}
+        used = 0
         for k, v in self._local.items():
             raw = pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
-            if self._fetched.get(k) != raw:
-                writes[k] = raw
+            if self._fetched.get(k) == raw:
+                continue
+            if cap is not None and len(raw) > cap:
+                raise ValueTooLarge(
+                    f"cache[{k!r}] pickles to {_mib(len(raw))}, over the "
+                    f"{_mib(cap)} per-write limit; write it to a "
+                    f"workspace file instead"
+                )
+            used += len(raw)
+            if total is not None and used > total:
+                raise ValueTooLarge(
+                    f"cache writes total {_mib(used)} this exec, over the "
+                    f"{_mib(total)} limit (at cache[{k!r}])"
+                )
+            writes[k] = raw
         return writes, sorted(self._deleted)
 
 
@@ -638,6 +689,8 @@ def run(channel: Channel, req: dict) -> dict:
     render_budget = int(render_budget) if render_budget else None
     value_cap = int(caps.get("value", _CAP_VALUE))
     outputs_cap = int(caps.get("outputs", _CAP_OUTPUTS))
+    cache_cap = int(caps.get("cache", _CAP_CACHE))
+    cache_total = int(caps.get("cache_total", _CAP_CACHE_TOTAL))
     # Everything this exec can legitimately put in one body, plus slack.
     channel.send_cap = int(caps.get(
         "frame", outputs_cap + stdout_cap + total_cap + _FRAME_SLACK
@@ -742,17 +795,33 @@ def run(channel: Channel, req: dict) -> dict:
     if error:
         result["error"] = error
     if ok:
-        writes, deletes = cache.flush()
-        # Keys in the body, blobs in binary frames, matched by ORDER.
-        # `_bins` is an out-of-band slot the transport pops before the
-        # body is serialized — carrying them this way instead of
-        # widening every return between here and the host keeps the
-        # supervisor's timeout, crash and fork-retry paths untouched,
-        # which is the code least worth disturbing for a payload
-        # optimization.
-        result["cache_writes"] = list(writes)
-        result["cache_deletes"] = deletes
-        result[_BINS] = list(writes.values())
+        try:
+            writes, deletes = cache.flush(cap=cache_cap, total=cache_total)
+        except ValueTooLarge as e:
+            # Failing the exec, not dropping the write: `cache[k] = v`
+            # is something the agent asked for by name, and a stash
+            # that silently did not happen is discovered next session
+            # as a cache miss with no explanation.
+            #
+            # Reported here rather than raised out of run(), so the
+            # transcript and prints survive. Letting it escape would
+            # take the err path, which answers with an empty transcript
+            # — losing the output of an exec whose only fault was the
+            # size of its last statement.
+            result["ok"] = False
+            result["error"] = {"etype": "ValueTooLarge", "message": str(e),
+                               "traceback": ""}
+        else:
+            # Keys in the body, blobs in binary frames, matched by ORDER.
+            # `_bins` is an out-of-band slot the transport pops before the
+            # body is serialized — carrying them this way instead of
+            # widening every return between here and the host keeps the
+            # supervisor's timeout, crash and fork-retry paths untouched,
+            # which is the code least worth disturbing for a payload
+            # optimization.
+            result["cache_writes"] = list(writes)
+            result["cache_deletes"] = deletes
+            result[_BINS] = list(writes.values())
     return result
 
 
