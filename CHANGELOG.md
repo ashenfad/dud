@@ -56,7 +56,12 @@ record for those.
   Setting it to 0 would otherwise make `park_state` silently do
   nothing, so a tagged release with affinity off now logs a warning
   once per pool naming the mismatch, rather than leaving a caller to
-  infer it from `resumed=False` forever.
+  infer it from `resumed=False` forever. `$DUD_VM_MAX_AFFINITY` turns
+  it on for the shared pool, since `dud.session(pooled=True, state=...)`
+  builds its pool there and would otherwise be asking for something it
+  had no way to enable. Deliberately not inferred from a caller passing
+  `state=`: a consumer who tags every session is exactly the one who
+  would end up holding a VM per fingerprint without choosing to.
 
 - **`ping()` reports whether the image shipped precompiled bytecode.**
   Baking is skipped when the host interpreter's minor version differs

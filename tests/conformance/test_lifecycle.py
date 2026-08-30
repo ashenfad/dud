@@ -28,14 +28,14 @@ def _vm_kwargs():
             "memory_mib": 1024}
 
 
-def _pool():
+def _pool(**kw):
     from dud.backends.pool import VmPool
 
     if _BACKEND == "firecracker":
         from dud.backends.firecracker import FirecrackerSession
 
-        return VmPool(session_cls=FirecrackerSession)
-    return VmPool()
+        return VmPool(session_cls=FirecrackerSession, **kw)
+    return VmPool(**kw)
 
 
 def test_dead_vm_raises_session_lost_and_reacquire_recovers():
@@ -131,8 +131,15 @@ def test_state_affinity_across_park():
     """park_state tags the parked tree; a matching acquire resumes
     without a push. The workspace is the one thing a golden clone
     cannot reproduce, so this is the park that is still worth keeping —
-    and it is kept hot on every rung."""
-    pool = _pool()
+    and it is kept hot on every rung.
+
+    Asks for affinity explicitly, because it is off by default: an
+    affinity park holds a whole VM to skip a push_tree, and a push on
+    the trees this actually serves is single-digit milliseconds. Note
+    the default only bites on a rung that can clone -- vfkit parks hot
+    regardless -- so this is a firecracker-only behavior that a vfkit
+    run cannot exercise."""
+    pool = _pool(max_affinity=1)
     try:
         s = pool.acquire(**_vm_kwargs())
         s.shell("echo precious > /workspace/state.txt")

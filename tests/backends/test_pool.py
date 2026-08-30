@@ -1207,3 +1207,43 @@ def test_no_tag_no_warning(monkeypatch, tmp_path, caplog):
         p.acquire(image="x").close()
     assert not [r for r in caplog.records if "max_affinity" in r.getMessage()]
     p.close()
+
+
+def test_shared_pool_can_turn_affinity_on(monkeypatch):
+    """Affinity has to be reachable from the front door.
+
+    `dud.session(pooled=True, state=...)` builds its pool through
+    shared_pool(), so with no knob here `state=` would be an API that
+    documents itself and then cannot work — which is exactly what
+    defaulting max_affinity to 0 created.
+    """
+    monkeypatch.setattr(poolmod, "_default_cls", lambda: FakeVM)
+    monkeypatch.setattr(poolmod, "_shared", {})
+    monkeypatch.setenv("DUD_VM_MAX_AFFINITY", "2")
+    assert poolmod.shared_pool().max_affinity == 2
+
+
+def test_shared_pool_leaves_affinity_off_by_default(monkeypatch):
+    monkeypatch.setattr(poolmod, "_default_cls", lambda: FakeVM)
+    monkeypatch.setattr(poolmod, "_shared", {})
+    monkeypatch.delenv("DUD_VM_MAX_AFFINITY", raising=False)
+    assert poolmod.shared_pool().max_affinity == 0
+
+
+def test_shared_pool_does_not_infer_affinity_from_a_tag(monkeypatch, tmp_path):
+    """Turning it on because someone passed `state=` would read as
+    helpful and would quietly restore the cost the default exists to
+    avoid: a consumer who tags every session is precisely the one who
+    would end up holding a VM per fingerprint without choosing to."""
+    _golden_home(monkeypatch, tmp_path)
+    monkeypatch.setattr(poolmod, "_default_cls", lambda: FrozenFakeVM)
+    monkeypatch.setattr(poolmod, "_shared", {})
+    monkeypatch.delenv("DUD_VM_MAX_AFFINITY", raising=False)
+    FakeVM.booted = 0
+    pool = poolmod.shared_pool()
+    pool.auto_seed = False
+    s = pool.acquire(state="commit-abc", image="x")
+    assert pool.max_affinity == 0
+    s.close(park_state="commit-abc")
+    assert s.torn_down
+    pool.close()
