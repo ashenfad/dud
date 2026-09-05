@@ -329,6 +329,30 @@ def test_slow_relay_does_not_spend_the_script_timeout(tmp_path):
     assert "late" in out.transcript and "done" in out.transcript
 
 
+def test_unread_answers_do_not_renew_the_timeout(tmp_path):
+    """Response backpressure spends the script's timeout: a caller that
+    writes requests without reading answers stalls each write to the
+    deadline, and only relay time is reimbursed — so the exec is
+    killed on schedule instead of renewing its budget per frame."""
+
+    def relay(frame):
+        return _ok({"t": "json", "v": "z" * 200000})
+
+    # Stays alive past the timeout, writing requests nobody reads the
+    # answers to: each answer stalls its write to the deadline, and
+    # only relay time may come back.
+    script = (
+        "i=0; while [ $i -lt 50 ]; do "
+        "printf '{\"obj\":\"db\",\"method\":\"big\",\"args\":[]}\\n' "
+        f">&${hostcall.REQ_VAR}; "
+        "i=$((i + 1)); sleep 0.1; "
+        "done; echo done"
+    )
+    out = _run(tmp_path, script, relay, timeout=1.0)
+    assert out.timed_out
+    assert "done" not in out.transcript
+
+
 def test_answer_survives_a_relay_longer_than_the_timeout(tmp_path):
     """The answer's write deadline must already exclude the relay: a
     relay that consumes the remaining script budget used to drop its
