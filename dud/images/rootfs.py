@@ -374,6 +374,16 @@ from dud.guest.emit import main
 sys.exit(main())
 """
 
+#: ``dud-hostcall`` on the guest's PATH. Same shim discipline as emit:
+#: the logic lives in the injected ``dud.guest.hostcall``, and the
+#: script generated here does not move the code hash (see the v6
+#: pipeline note in ``builder.py``).
+_HOSTCALL_SHIM = b"""#!/usr/local/bin/python3
+import sys
+from dud.guest.hostcall import main
+sys.exit(main())
+"""
+
 
 def build_fileset(
     image: registry.PulledImage, workspace: str = "/workspace"
@@ -392,6 +402,7 @@ def build_fileset(
     # After injection, so dud's own modules are covered too.
     bake_pyc(fs, site)
     fs.add_file("usr/local/bin/dud-emit", _EMIT_SHIM, 0o755)
+    fs.add_file("usr/local/bin/dud-hostcall", _HOSTCALL_SHIM, 0o755)
     fs.add_file(
         "init", _init_script(site, workspace, _image_env(image.env)), 0o755
     )

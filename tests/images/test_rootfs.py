@@ -153,6 +153,12 @@ def test_build_fileset_adds_init_and_workspace(make_layer):
     assert shim.data.startswith(b"#!/usr/local/bin/python3")
     assert b"from dud.guest.emit import main" in shim.data
 
+    # dud-hostcall rides the same discipline for the same reason.
+    hc_shim = fs.nodes["usr/local/bin/dud-hostcall"]
+    assert hc_shim.mode & 0o111
+    assert hc_shim.data.startswith(b"#!/usr/local/bin/python3")
+    assert b"from dud.guest.hostcall import main" in hc_shim.data
+
 
 def test_the_emit_module_is_injected_for_its_shim(make_layer):
     """The shim is two lines onto `dud.guest.emit`, so shipping one
@@ -162,6 +168,7 @@ def test_the_emit_module_is_injected_for_its_shim(make_layer):
     fs = rootfs.flatten_layers([l1])
     site = rootfs.inject_dud(fs)
     assert f"{site}/dud/guest/emit.py" in fs.nodes
+    assert f"{site}/dud/guest/hostcall.py" in fs.nodes
 
 
 # ---- image ENV into /init ----------------------------------------------
