@@ -3,6 +3,16 @@
 Starts at 0.3.0. Earlier releases predate this file; `git log` is the
 record for those.
 
+## Unreleased
+
+Shell execs gain a synchronous guest→host path: `dud-hostcall OBJ
+METHOD [ARGS...]`, the round-trip sibling of `dud-emit`. Same shape —
+NDJSON frames over inherited per-exec fds, no new wire verb (the
+supervisor answers through the existing `hostcall` request), args as
+verbatim strings, every request answered exactly once with relay time
+excluded from the script timeout. Motivating consumer: workspace verbs
+(`ws-git`) as guest shell functions on the dud rungs.
+
 ## 0.4.0 - 2026-08-30
 
 The theme is that a session should cost what it does, and that when it

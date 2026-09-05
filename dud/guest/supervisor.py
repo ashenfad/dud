@@ -459,6 +459,32 @@ class Supervisor:
         """
         self.channel.request("emit", record)
 
+    def _relay_hostcall(self, frame: dict) -> dict:
+        """Answer one ``dud-hostcall`` frame as the existing ``hostcall``
+        verb — the synchronous sibling of :meth:`_relay_emit`.
+
+        Same indistinguishability property: the body the CLI writes is
+        already ``{"obj", "method", "args"}`` with codec-tagged args,
+        so the host cannot tell a call from bash from one from the
+        Python runner's proxies. Denial (or any failure) is an answer
+        frame, never a raise: the guest side has a caller blocked on
+        exactly one response, and leaving it hanging would wedge the
+        exec on something that is our round trip, not its work.
+        """
+        try:
+            body, _ = self.channel.request(
+                "hostcall",
+                {
+                    "obj": frame["obj"],
+                    "method": frame["method"],
+                    "args": frame["args"],
+                    "kwargs": {},
+                },
+            )
+        except Exception as e:  # noqa: BLE001 — denial is an answer
+            return {"ok": False, "error": str(e) or type(e).__name__}
+        return {"ok": True, "value": body.get("result", {"t": "json", "v": None})}
+
     def do_exec_shell(self, body, bins):
         outcome: ShellOutcome = run_shell(
             self.shell,
@@ -466,6 +492,7 @@ class Supervisor:
             float(body.get("timeout", _SHELL_DEFAULT_TIMEOUT)),
             workspace=str(self.work),
             on_emit=self._relay_emit,
+            on_hostcall=self._relay_hostcall,
         )
         return {
             "transcript": outcome.transcript,
