@@ -319,6 +319,19 @@ class _Hostcalls:
         self._buf = bytearray()
         self.dispatched = 0
         self.dropped = 0
+        self.relay_elapsed = 0.0
+
+    def take_relay_elapsed(self) -> float:
+        """Relay time since the last take, resetting the clock.
+
+        The pump reimburses exactly this: invoking the host is our
+        round trip, but everything else in a read (pipe waits, response
+        backpressure) is the script's time. Reimbursing the whole read
+        would let a caller that never reads its answers renew its own
+        budget by stalling the response write, defeating the timeout.
+        """
+        elapsed, self.relay_elapsed = self.relay_elapsed, 0.0
+        return elapsed
 
     def read(self, fd: int, deadline: float) -> bool:
         """One read; False at EOF or on a dead pipe.
@@ -373,7 +386,9 @@ class _Hostcalls:
                 response = {"ok": False, "error": "hostcall relay misbehaved"}
         except Exception as e:  # noqa: BLE001 — denial is an answer, not a crash
             response = {"ok": False, "error": str(e) or type(e).__name__}
-        self._respond(response, deadline + (time.monotonic() - started))
+        relay = time.monotonic() - started
+        self.relay_elapsed += relay
+        self._respond(response, deadline + relay)
 
     def _respond(self, response: dict, deadline: float) -> None:
         frame = json.dumps(response, separators=(",", ":")).encode() + b"\n"
@@ -412,6 +427,12 @@ class _Hostcalls:
                 return
             try:
                 written = os.write(self._resp_fd, view)
+            except BlockingIOError:
+                # Raced the reader: loop back to poll, still bounded by
+                # the deadline below. (The fd is non-blocking — a plain
+                # blocking write here is what wedged past the deadline
+                # when poll reported room for some but not all.)
+                continue
             except (OSError, ValueError):
                 self.dropped += 1
                 return
@@ -505,14 +526,16 @@ def _pump(proc: subprocess.Popen, timeout: float,
                     emits = None  # EOF on the emit side; the script may run on
                 deadline += time.monotonic() - started
             if hostcalls is not None and hc_req in ready:
-                # Same timeout rule: answering is our round trip, not
-                # the script's work. The deadline extends for the relay
-                # but _Hostcalls still bounds its own response write by
-                # it, so a reader that never reads cannot wedge the exec.
-                started = time.monotonic()
-                if not hostcalls.read(hc_req, deadline):
+                # Reimburse the relay only: invoking the host is our
+                # round trip, but response backpressure is the script's
+                # time — a caller that never reads its answers must not
+                # renew its budget by stalling the response write.
+                # _Hostcalls still bounds that write by the deadline, so
+                # such a caller is dropped, then killed, on schedule.
+                alive = hostcalls.read(hc_req, deadline)
+                deadline += hostcalls.take_relay_elapsed()
+                if not alive:
                     hostcalls = None  # EOF: no caller left to answer
-                deadline += time.monotonic() - started
         else:
             # The script closed its own stdout but is still running
             # (`exec >&-; work`). Nothing to select on, so poll it.
@@ -570,6 +593,11 @@ def run_shell(
             hc_resp_r, hc_resp_w = os.pipe()
             os.set_inheritable(hc_req_w, True)
             os.set_inheritable(hc_resp_r, True)
+            # Non-blocking: poll may report space for some but not all
+            # of an answer, and a blocking write for the rest would
+            # wedge past the deadline below. Read-end behavior (the
+            # guest's side) is untouched.
+            os.set_blocking(hc_resp_w, False)
             hc_lock = Path(td) / "hostcall.lock"
             hc_lock.touch()
             env[hostcall_mod.REQ_VAR] = str(hc_req_w)
