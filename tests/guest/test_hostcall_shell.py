@@ -329,6 +329,20 @@ def test_slow_relay_does_not_spend_the_script_timeout(tmp_path):
     assert "late" in out.transcript and "done" in out.transcript
 
 
+def test_answer_survives_a_relay_longer_than_the_timeout(tmp_path):
+    """The answer's write deadline must already exclude the relay: a
+    relay that consumes the remaining script budget used to drop its
+    own answer (exit 124) before the pump's extension landed."""
+
+    def relay(frame):
+        time.sleep(0.6)
+        return _ok({"t": "json", "v": "late"})
+
+    out = _run(tmp_path, f'{_cli()} db query; echo done', relay, timeout=0.3)
+    assert not out.timed_out
+    assert "late" in out.transcript and "done" in out.transcript
+
+
 # ---- supervisor relay -------------------------------------------------------
 
 

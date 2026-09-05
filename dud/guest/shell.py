@@ -361,13 +361,19 @@ class _Hostcalls:
         ):
             self._respond({"ok": False, "error": "malformed hostcall frame"}, deadline)
             return
+        # The relay is our round trip, not the script's work: extend the
+        # answer's deadline by exactly its duration, mirroring the
+        # exclusion _pump applies to the exec deadline. Without this a
+        # relay that consumes the remaining budget would drop its own
+        # answer before the extension lands.
+        started = time.monotonic()
         try:
             response = self._on_hostcall(body)
             if not isinstance(response, dict):
                 response = {"ok": False, "error": "hostcall relay misbehaved"}
         except Exception as e:  # noqa: BLE001 — denial is an answer, not a crash
             response = {"ok": False, "error": str(e) or type(e).__name__}
-        self._respond(response, deadline)
+        self._respond(response, deadline + (time.monotonic() - started))
 
     def _respond(self, response: dict, deadline: float) -> None:
         frame = json.dumps(response, separators=(",", ":")).encode() + b"\n"
