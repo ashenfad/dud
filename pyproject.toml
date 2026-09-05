@@ -30,6 +30,7 @@ dependencies = []
 # corpus covers the command on every rung instead of two.
 [project.scripts]
 dud-emit = "dud.guest.emit:main"
+dud-hostcall = "dud.guest.hostcall:main"
 
 [project.urls]
 "Homepage" = "https://github.com/ashenfad/dud"
