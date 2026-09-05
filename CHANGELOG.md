@@ -3,7 +3,7 @@
 Starts at 0.3.0. Earlier releases predate this file; `git log` is the
 record for those.
 
-## Unreleased
+## 0.4.1 - 2026-09-05
 
 Shell execs gain a synchronous guest→host path: `dud-hostcall OBJ
 METHOD [ARGS...]`, the round-trip sibling of `dud-emit`. Same shape —
