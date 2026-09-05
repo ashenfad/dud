@@ -358,11 +358,15 @@ def test_answer_survives_a_relay_longer_than_the_timeout(tmp_path):
     relay that consumes the remaining script budget used to drop its
     own answer (exit 124) before the pump's extension landed."""
 
+    # Wide margins deliberately: on loaded CI runners interpreter
+    # startup alone approaches the old 0.3 s budget, killing the script
+    # before the relay even starts. The relay still exceeds the timeout
+    # 2x, which is what proves the exclusion.
     def relay(frame):
-        time.sleep(0.6)
+        time.sleep(2.0)
         return _ok({"t": "json", "v": "late"})
 
-    out = _run(tmp_path, f'{_cli()} db query; echo done', relay, timeout=0.3)
+    out = _run(tmp_path, f'{_cli()} db query; echo done', relay, timeout=1.0)
     assert not out.timed_out
     assert "late" in out.transcript and "done" in out.transcript
 
