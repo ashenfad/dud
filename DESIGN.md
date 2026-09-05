@@ -283,6 +283,18 @@ ergonomic from bash, it's language-neutral by construction.
 Embedders who need rich values back use `file` refs and deserialize
 host-side as an explicit, trust-aware act — never an ambient one.
 
+**Shell hostcalls**: emit is fire-and-forget, which covers events but
+not verbs — a shell function that needs its answer (a `ws-git status`
+whose output the agent reads next) gets `dud-hostcall OBJ METHOD
+[ARGS...]`, the synchronous sibling of `dud-emit`. Same shape on
+purpose: NDJSON frames over inherited fds, per-exec scoping, no new
+wire verb (the supervisor answers through the existing `hostcall`
+request). Args cross as verbatim strings — no JSON coercion, so a
+shell word the host will act on can never silently change type. Every
+request earns exactly one response frame (denials included), and the
+CLI holds the request lock for its whole round trip, so concurrent
+callers serialize instead of interleaving.
+
 ### The Python runner
 
 sandtrap did two jobs; only one needed its machinery. **Policy** (AST

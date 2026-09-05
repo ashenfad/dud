@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import emit as emit_mod
+from . import hostcall as hostcall_mod
 from .runner import _CAP_STDOUT
 
 # The env dump uses only builtins (compgen/printf): the external `env`
@@ -48,9 +49,12 @@ _TRAP = (
 
 # The emit plumbing is per-exec: an fd number and a lock path from
 # one call are meaningless (and misleading) in the next, so they
-# must never survive into the persisted environment.
+# must never survive into the persisted environment. The hostcall
+# plumbing is per-exec for the same reason.
 _DROP_VARS = {"__DUD_CWD__", "__DUD_ENV__", "_", "SHLVL", "OLDPWD",
-              emit_mod.FD_VAR, emit_mod.LOCK_VAR}
+              emit_mod.FD_VAR, emit_mod.LOCK_VAR,
+              hostcall_mod.REQ_VAR, hostcall_mod.RESP_VAR,
+              hostcall_mod.LOCK_VAR}
 _MAX_ENV_ENTRY = 96 * 1024  # comfortably under Linux MAX_ARG_STRLEN
 
 # The transcript ceiling, imported rather than restated: this is the
@@ -175,6 +179,14 @@ def _drain(out: _Transcript, fd: int, budget: float = _DRAIN_BUDGET) -> None:
             return
 
 
+#: A guest frame no legitimate writer could produce: both CLIs cap
+#: themselves well below this, so passing it means somebody is writing
+#: to the fd directly and the buffer would otherwise grow forever.
+#: Shared by the emit and hostcall readers (and bounding the hostcall
+#: answers, which transit supervisor memory — PID 1 on a VM rung).
+_FRAME_CAP = (1 << 20) + (1 << 16)
+
+
 class _Emits:
     """Newline-delimited emit records, dispatched as they arrive.
 
@@ -190,10 +202,7 @@ class _Emits:
     the host.
     """
 
-    #: A record no writer could legitimately produce: `dud-emit` caps
-    #: itself well below this, so passing it means somebody is writing
-    #: to the fd directly and the buffer would otherwise grow forever.
-    _CAP = (1 << 20) + (1 << 16)
+    _CAP = _FRAME_CAP
 
     def __init__(self, on_emit):
         self._on_emit = on_emit
@@ -286,8 +295,128 @@ class _Emits:
                 return  # EOF: every writer has let go
 
 
+class _Hostcalls:
+    """Newline-delimited hostcall requests, answered as they arrive.
+
+    The synchronous sibling of :class:`_Emits`: records come from
+    ``dud-hostcall`` (see :mod:`dud.guest.hostcall`), are relayed
+    upstream through ``on_hostcall``, and the answer is written back
+    to the response pipe — every request earns exactly one response
+    frame, malformed ones included, so a caller can never block
+    forever on an answer that is not coming.
+
+    The CLI holds the request lock for its whole round trip, so at
+    most one request is outstanding per exec and frames need no ids.
+    The response write is bounded by the exec deadline rather than
+    blocking: the only writer that is not draining is one that will
+    never read, and wedging the supervisor on it would turn a rogue
+    fd write into a hung exec.
+    """
+
+    def __init__(self, on_hostcall, resp_fd: int):
+        self._on_hostcall = on_hostcall
+        self._resp_fd = resp_fd
+        self._buf = bytearray()
+        self.dispatched = 0
+        self.dropped = 0
+
+    def read(self, fd: int, deadline: float) -> bool:
+        """One read; False at EOF or on a dead pipe.
+
+        ``deadline`` is the exec's *current* deadline — relay time is
+        excluded from the script's timeout, so a bound captured at
+        construction would expire early on exactly the slow answers
+        the exclusion exists for.
+        """
+        try:
+            chunk = os.read(fd, 65536)
+        except (OSError, ValueError):
+            return False
+        if not chunk:
+            return False
+        self._buf += chunk
+        self._flush(deadline)
+        if len(self._buf) > _FRAME_CAP:
+            self._buf.clear()
+            self.dropped += 1
+        return True
+
+    def _flush(self, deadline: float) -> None:
+        while b"\n" in self._buf:
+            line, _, rest = self._buf.partition(b"\n")
+            self._buf = bytearray(rest)
+            if line.strip():
+                self._answer(bytes(line), deadline)
+
+    def _answer(self, line: bytes, deadline: float) -> None:
+        try:
+            body = json.loads(line.decode())
+        except (ValueError, UnicodeDecodeError):
+            body = None
+        if (
+            not isinstance(body, dict)
+            or not isinstance(body.get("obj"), str)
+            or not isinstance(body.get("method"), str)
+            or not isinstance(body.get("args"), list)
+        ):
+            self._respond({"ok": False, "error": "malformed hostcall frame"}, deadline)
+            return
+        try:
+            response = self._on_hostcall(body)
+            if not isinstance(response, dict):
+                response = {"ok": False, "error": "hostcall relay misbehaved"}
+        except Exception as e:  # noqa: BLE001 — denial is an answer, not a crash
+            response = {"ok": False, "error": str(e) or type(e).__name__}
+        self._respond(response, deadline)
+
+    def _respond(self, response: dict, deadline: float) -> None:
+        frame = json.dumps(response, separators=(",", ":")).encode() + b"\n"
+        if len(frame) > _FRAME_CAP:
+            frame = (
+                json.dumps(
+                    {"ok": False, "error": "host answer exceeds the frame cap"},
+                    separators=(",", ":"),
+                ).encode()
+                + b"\n"
+            )
+        view = memoryview(frame)
+        # poll, not select: select with an empty read list never reports
+        # writability on macOS, which reads as "no reader" and drops
+        # every answer on that platform. poll has no such quirk.
+        poller = select.poll()
+        try:
+            poller.register(self._resp_fd, select.POLLOUT)
+        except (OSError, ValueError):
+            self.dropped += 1
+            return
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.dropped += 1
+                return
+            try:
+                ready = poller.poll(max(0, int(remaining * 1000)))
+            except (OSError, ValueError):
+                self.dropped += 1
+                return
+            if not ready or not (ready[0][1] & select.POLLOUT):
+                # Reader gone (or rogue and past the deadline).
+                # Drop rather than wedge the exec.
+                self.dropped += 1
+                return
+            try:
+                written = os.write(self._resp_fd, view)
+            except (OSError, ValueError):
+                self.dropped += 1
+                return
+            view = view[written:]
+        self.dispatched += 1
+
+
 def _pump(proc: subprocess.Popen, timeout: float,
-          emit_fd: int | None = None, on_emit=None) -> tuple[_Transcript, bool]:
+          emit_fd: int | None = None, on_emit=None,
+          hc_req: int | None = None, on_hostcall=None,
+          hc_resp: int | None = None) -> tuple[_Transcript, bool]:
     """Read the script's output until it is done, or kill it at the
     deadline. Returns ``(transcript, timed_out)``.
 
@@ -312,6 +441,11 @@ def _pump(proc: subprocess.Popen, timeout: float,
     emits = _Emits(on_emit) if (emit_fd is not None and on_emit) else None
     open_pipe = True
     deadline = time.monotonic() + timeout
+    hostcalls = (
+        _Hostcalls(on_hostcall, hc_resp)
+        if (hc_req is not None and on_hostcall is not None and hc_resp is not None)
+        else None
+    )
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -341,6 +475,8 @@ def _pump(proc: subprocess.Popen, timeout: float,
         watch = [fd] if open_pipe else []
         if emits is not None:
             watch.append(emit_fd)
+        if hostcalls is not None:
+            watch.append(hc_req)
         if watch:
             try:
                 ready, _, _ = select.select(watch, [], [], min(remaining, _POLL))
@@ -349,7 +485,7 @@ def _pump(proc: subprocess.Popen, timeout: float,
                 # keep waiting on the process rather than returning: the
                 # only non-timeout exit above is one where poll() has
                 # answered, which is what keeps `returncode` a number.
-                ready, open_pipe, emits = (), False, None
+                ready, open_pipe, emits, hostcalls = (), False, None, None
             if open_pipe and fd in ready and not out.read(fd):
                 open_pipe = False  # EOF: every writer has let go
             if emits is not None and emit_fd in ready:
@@ -362,6 +498,15 @@ def _pump(proc: subprocess.Popen, timeout: float,
                 if not emits.read(emit_fd):
                     emits = None  # EOF on the emit side; the script may run on
                 deadline += time.monotonic() - started
+            if hostcalls is not None and hc_req in ready:
+                # Same timeout rule: answering is our round trip, not
+                # the script's work. The deadline extends for the relay
+                # but _Hostcalls still bounds its own response write by
+                # it, so a reader that never reads cannot wedge the exec.
+                started = time.monotonic()
+                if not hostcalls.read(hc_req, deadline):
+                    hostcalls = None  # EOF: no caller left to answer
+                deadline += time.monotonic() - started
         else:
             # The script closed its own stdout but is still running
             # (`exec >&-; work`). Nothing to select on, so poll it.
@@ -370,11 +515,15 @@ def _pump(proc: subprocess.Popen, timeout: float,
 
 def run_shell(
     state: ShellState, script: str, timeout: float, workspace: str,
-    on_emit=None,
+    on_emit=None, on_hostcall=None,
 ) -> ShellOutcome:
     """Run one script. ``on_emit`` receives each ``dud-emit`` record as
     it arrives, already validated, for relay upstream; without it the
-    emit channel is simply not offered and ``dud-emit`` says so."""
+    emit channel is simply not offered and ``dud-emit`` says so.
+    ``on_hostcall`` answers each ``dud-hostcall`` frame with exactly
+    one response dict (``{"ok": true, "value": tagged}`` or
+    ``{"ok": false, "error": message}``); without it the hostcall
+    channel is not offered either."""
     with tempfile.TemporaryDirectory(prefix="dud-sh-") as td:
         cwd_file = Path(td) / "cwd"
         env_file = Path(td) / "env"
@@ -404,6 +553,24 @@ def run_shell(
             env[emit_mod.LOCK_VAR] = str(lock)
             pass_fds = (emit_w,)
 
+        # The hostcall channel, offered only when somebody is answering.
+        # Two pipes: requests guest→supervisor (lock-serialized whole
+        # round trips, so frames need no ids), answers supervisor→guest.
+        # Same inherited-fd reasoning as the emit pipe above.
+        hc_req_r = hc_req_w = hc_resp_r = hc_resp_w = None
+        pass_hc: tuple[int, ...] = ()
+        if on_hostcall is not None:
+            hc_req_r, hc_req_w = os.pipe()
+            hc_resp_r, hc_resp_w = os.pipe()
+            os.set_inheritable(hc_req_w, True)
+            os.set_inheritable(hc_resp_r, True)
+            hc_lock = Path(td) / "hostcall.lock"
+            hc_lock.touch()
+            env[hostcall_mod.REQ_VAR] = str(hc_req_w)
+            env[hostcall_mod.RESP_VAR] = str(hc_resp_r)
+            env[hostcall_mod.LOCK_VAR] = str(hc_lock)
+            pass_hc = (hc_req_w, hc_resp_r)
+
         proc = subprocess.Popen(
             ["bash", "--noprofile", "--norc", str(script_file)],
             cwd=state.cwd,
@@ -411,7 +578,7 @@ def run_shell(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            pass_fds=pass_fds,
+            pass_fds=pass_fds + pass_hc,
         )
         try:
             if emit_w is not None:
@@ -420,10 +587,22 @@ def run_shell(
                 # writer that is us.
                 os.close(emit_w)
                 emit_w = None
-            out, timed_out = _pump(proc, timeout, emit_r, on_emit)
+            if hc_req_w is not None:
+                # Our copies of the guest's ends: the request write end
+                # (else its EOF never comes) and the answer read end
+                # (else a late answer has nowhere to go but our table).
+                os.close(hc_req_w)
+                hc_req_w = None
+                os.close(hc_resp_r)
+                hc_resp_r = None
+            out, timed_out = _pump(
+                proc, timeout, emit_r, on_emit,
+                hc_req_r, on_hostcall, hc_resp_w,
+            )
         finally:
             proc.stdout.close()
-            for fd in (emit_w, emit_r):
+            for fd in (emit_w, emit_r, hc_req_w, hc_req_r,
+                       hc_resp_w, hc_resp_r):
                 if fd is not None:
                     try:
                         os.close(fd)
