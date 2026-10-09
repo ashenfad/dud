@@ -698,18 +698,23 @@ class Supervisor:
                 return self._crash_result(proc, spill, tap)
             kind = msg.get("kind")
             if kind == "req":
+                # The relay upstream (a hostcall, a cache read, an emit)
+                # is our round trip, not the code's work, so it comes
+                # off the timeout: a caller is not charged for a slow
+                # host object. Only the relay: the answer back to the
+                # runner stays on the code's clock.
+                started = time.monotonic()
                 try:
                     rbody, rbins = self.channel.request(
                         msg["verb"], msg.get("body", {}), mbins
                     )
-                    rchan._send_msg(
-                        {"id": msg["id"], "kind": "resp", "body": rbody}, rbins
-                    )
+                    reply = {"id": msg["id"], "kind": "resp", "body": rbody}
                 except RemoteError as e:
-                    rchan._send_msg(
-                        {"id": msg["id"], "kind": "err", "etype": e.etype,
-                         "message": e.message}, []
-                    )
+                    reply = {"id": msg["id"], "kind": "err",
+                             "etype": e.etype, "message": e.message}
+                    rbins = []
+                deadline += time.monotonic() - started
+                rchan._send_msg(reply, rbins)
             elif kind in ("resp", "err") and msg.get("id") == rid:
                 if kind == "resp" and mbins:
                     # Binary payloads travelling with the result (cache
