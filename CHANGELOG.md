@@ -10,6 +10,10 @@ record for those.
 string annotation, `typing.get_type_hints` and pickling by reference
 work (#40).
 
+**A slow host call no longer times out Python code.** Time relayed
+upstream comes off the exec's timeout, as it already did for
+`dud-hostcall` in shell execs.
+
 ## 0.4.1 - 2026-09-05
 
 Shell execs gain a synchronous guest→host path: `dud-hostcall OBJ

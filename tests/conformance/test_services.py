@@ -205,6 +205,32 @@ def test_hostcall_roundtrip(make_session):
         assert db.log == [("query", "x")]
 
 
+class SlowHost:
+    def wait(self, seconds):
+        import time
+
+        time.sleep(seconds)
+        return "done"
+
+
+def test_a_slow_hostcall_is_not_the_codes_time(make_session):
+    """The timeout bounds the code, not the host it calls: a caller is
+    not charged for a slow host object. The shell's dud-hostcall keeps
+    the same rule."""
+    with make_session(host_objects={"h": SlowHost()}, allow={"h": {"wait"}}) as s:
+        r = s.python("a = h.wait(1.0)\nb = h.wait(1.0)", timeout=1.5)
+        assert r.ok, r.error
+        assert r.outputs["a"] == r.outputs["b"] == "done"
+
+
+def test_the_code_after_a_slow_hostcall_is_still_timed(make_session):
+    with make_session(host_objects={"h": SlowHost()}, allow={"h": {"wait"}}) as s:
+        r = s.python(
+            "h.wait(1.0)\nimport time\ntime.sleep(30)", timeout=1.5
+        )
+        assert not r.ok and r.error.etype == "Timeout"
+
+
 def test_hostcall_denied_method(make_session):
     db = FakeDb()
     with make_session(host_objects={"db": db}, allow={"db": {"query"}}) as s:
