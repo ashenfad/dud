@@ -428,3 +428,27 @@ def test_render_budget_holds_across_many_arguments(session):
     text = r.prints[0]["text"]
     assert len(text) < 60 * 2  # bounded by the budget, not by arg count
     assert "more" in text  # the remainder is counted, not silently cut
+
+
+def test_a_dataclass_defined_in_the_session_works(session):
+    """Code runs as a module that ``sys.modules`` knows, so what looks
+    a class's module up there finds it: ``dataclasses`` resolving a
+    string annotation, ``typing.get_type_hints``, pickling by
+    reference."""
+    r = session.python(
+        "from __future__ import annotations\n"
+        "import dataclasses, pickle, typing\n"
+        "@dataclasses.dataclass\n"
+        "class P:\n"
+        "    x: float\n"
+        "    y: float = 0.0\n"
+        "p = repr(P(1.0))\n"
+        "hints = sorted(typing.get_type_hints(P))\n"
+        "back = repr(pickle.loads(pickle.dumps(P(2.0))))\n"
+        "name = __name__"
+    )
+    assert r.ok, r.error
+    assert r.outputs["p"] == "P(x=1.0, y=0.0)"
+    assert r.outputs["hints"] == ["x", "y"]
+    assert r.outputs["back"] == "P(x=2.0, y=0.0)"
+    assert r.outputs["name"] == "__dud__"

@@ -3,6 +3,13 @@
 Starts at 0.3.0. Earlier releases predate this file; `git log` is the
 record for those.
 
+## Unreleased
+
+**Classes defined in guest code resolve their module.** Code runs as a
+`__dud__` module registered in `sys.modules`, so a dataclass with a
+string annotation, `typing.get_type_hints` and pickling by reference
+work (#40).
+
 ## 0.4.1 - 2026-09-05
 
 Shell execs gain a synchronous guest→host path: `dud-hostcall OBJ

@@ -28,6 +28,7 @@ import os
 import pickle
 import sys
 import traceback
+import types
 from collections.abc import MutableMapping
 from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
@@ -710,7 +711,14 @@ def run(channel: Channel, req: dict) -> dict:
     prints = PrintCapture(stdout_buf, entry_cap, max_entries, total_cap,
                           render_budget, req.get("render_hook"))
 
-    g: dict[str, Any] = {"__name__": "__dud__", "__builtins__": __builtins__}
+    # The code runs as a module sys.modules knows, so what looks a
+    # class's module up there finds it: dataclasses resolving a string
+    # annotation, typing.get_type_hints, pickling by reference. Each
+    # exec gets a fresh one, as it gets fresh globals.
+    module = types.ModuleType("__dud__")
+    sys.modules["__dud__"] = module
+    g: dict[str, Any] = module.__dict__
+    g["__builtins__"] = __builtins__
     injected = {"__name__", "__builtins__", "print", "cache", "emit"}
     g["print"] = prints.print_fn
     cache = CacheView(channel, readonly=bool(req.get("cache_readonly")))
