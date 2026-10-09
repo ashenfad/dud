@@ -43,6 +43,7 @@ from ..values import (
 )
 
 _RUNNER_FILE = "<session>"
+_SESSION_MODULE = "__dud__"
 
 # Out-of-band slot for binary payloads travelling with a result dict.
 # Popped by whoever hands the dict to the wire, so it never reaches a
@@ -231,6 +232,8 @@ class CacheView(MutableMapping):
         used = 0
         for k, v in self._local.items():
             raw = pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
+            if _SESSION_MODULE.encode() in raw:
+                _refuse_session_locals(k, v)
             if self._fetched.get(k) == raw:
                 continue
             if cap is not None and len(raw) > cap:
@@ -247,6 +250,38 @@ class CacheView(MutableMapping):
                 )
             writes[k] = raw
         return writes, sorted(self._deleted)
+
+
+class _SessionLocals(pickle.Pickler):
+    """Refuses a class or function the exec's own code defined."""
+
+    def __init__(self, key: str):
+        super().__init__(io.BytesIO(), protocol=pickle.HIGHEST_PROTOCOL)
+        self._key = key
+
+    def reducer_override(self, obj: Any) -> Any:
+        if (
+            isinstance(obj, (type, types.FunctionType))
+            and getattr(obj, "__module__", None) == _SESSION_MODULE
+        ):
+            raise pickle.PicklingError(
+                f"cache[{self._key!r}] holds {obj.__qualname__}, which "
+                f"this session's code defined; a later exec can't "
+                f"rebuild it from the cache. Store its fields as plain "
+                f"data instead"
+            )
+        return NotImplemented
+
+
+def _refuse_session_locals(key: str, value: Any) -> None:
+    """Raise if ``value`` pickles by reference to the exec's module.
+
+    Such a pickle succeeds, since the module is in sys.modules while
+    the exec runs, but each exec gets a fresh module, so the next one
+    to read the key fails to load it. Refused at the write, where the
+    agent can still act on it. Only reached when the bytes mention the
+    module, so ordinary writes pay nothing for the check."""
+    _SessionLocals(key).dump(value)
 
 
 class HostProxy:
@@ -715,8 +750,8 @@ def run(channel: Channel, req: dict) -> dict:
     # class's module up there finds it: dataclasses resolving a string
     # annotation, typing.get_type_hints, pickling by reference. Each
     # exec gets a fresh one, as it gets fresh globals.
-    module = types.ModuleType("__dud__")
-    sys.modules["__dud__"] = module
+    module = types.ModuleType(_SESSION_MODULE)
+    sys.modules[_SESSION_MODULE] = module
     g: dict[str, Any] = module.__dict__
     g["__builtins__"] = __builtins__
     injected = {"__name__", "__builtins__", "print", "cache", "emit"}
@@ -805,7 +840,7 @@ def run(channel: Channel, req: dict) -> dict:
     if ok:
         try:
             writes, deletes = cache.flush(cap=cache_cap, total=cache_total)
-        except ValueTooLarge as e:
+        except (ValueTooLarge, pickle.PicklingError) as e:
             # Failing the exec, not dropping the write: `cache[k] = v`
             # is something the agent asked for by name, and a stash
             # that silently did not happen is discovered next session
@@ -814,10 +849,10 @@ def run(channel: Channel, req: dict) -> dict:
             # Reported here rather than raised out of run(), so the
             # transcript and prints survive. Letting it escape would
             # take the err path, which answers with an empty transcript
-            # — losing the output of an exec whose only fault was the
-            # size of its last statement.
+            # — losing the output of an exec whose only fault was what
+            # its last statement stashed.
             result["ok"] = False
-            result["error"] = {"etype": "ValueTooLarge", "message": str(e),
+            result["error"] = {"etype": type(e).__name__, "message": str(e),
                                "traceback": ""}
         else:
             # Keys in the body, blobs in binary frames, matched by ORDER.
