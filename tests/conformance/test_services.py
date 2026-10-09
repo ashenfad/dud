@@ -69,6 +69,34 @@ def test_the_stash_ceiling_is_the_callers_to_raise(session):
     assert r2.outputs["n"] == 4_000_000
 
 
+def test_a_class_defined_in_the_session_is_refused_at_the_stash(session):
+    """Each exec runs in a fresh module, so a pickle naming a class the
+    last exec defined can't be loaded by the next. Refused at the write,
+    with the transcript kept, rather than committed and found unreadable
+    later."""
+    r = session.python(
+        "from dataclasses import dataclass\n"
+        "@dataclass\n"
+        "class P:\n"
+        "    x: int\n"
+        "print('work happened')\n"
+        "cache['p'] = [P(1)]"
+    )
+    assert not r.ok
+    assert r.error.etype == "PicklingError"
+    assert "cache['p']" in r.error.message and "P" in r.error.message
+    assert r.transcript.strip() == "work happened"
+    r2 = session.python("hit = 'p' in cache")
+    assert r2.outputs["hit"] is False
+
+
+def test_the_module_name_as_data_is_not_refused(session):
+    r = session.python("cache['s'] = {'__dud__': '__dud__'}")
+    assert r.ok, r.error
+    r2 = session.python("v = cache['s']")
+    assert r2.outputs["v"] == {"__dud__": "__dud__"}
+
+
 def test_cache_delete(session):
     session.python("cache['gone'] = 1")
     session.python("del cache['gone']")
