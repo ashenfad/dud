@@ -3,7 +3,7 @@
 Starts at 0.3.0. Earlier releases predate this file; `git log` is the
 record for those.
 
-## Unreleased
+## 0.4.3 - 2026-10-10
 
 **Guest code's annotations are postponed only by its own future
 import.** The runner compiled code inheriting its own `from __future__
