@@ -452,3 +452,16 @@ def test_a_dataclass_defined_in_the_session_works(session):
     assert r.outputs["hints"] == ["x", "y"]
     assert r.outputs["back"] == "P(x=2.0, y=0.0)"
     assert r.outputs["name"] == "__dud__"
+
+
+def test_annotations_are_postponed_only_by_the_codes_own_future_import(session):
+    """The runner's own future imports don't reach the code: without
+    ``from __future__ import annotations`` an annotation is the type,
+    and with it, the text."""
+    probe = "def f(a: int): pass\nkind = type(f.__annotations__['a']).__name__"
+    r = session.python(probe)
+    assert r.ok, r.error
+    assert r.outputs["kind"] == "type"
+    r = session.python("from __future__ import annotations\n" + probe)
+    assert r.ok, r.error
+    assert r.outputs["kind"] == "str"

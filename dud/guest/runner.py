@@ -801,9 +801,12 @@ def run(channel: Channel, req: dict) -> dict:
     if ok:
         try:
             with redirect_stdout(stdout_buf), redirect_stderr(stdout_buf):
-                exec(compile(body, _RUNNER_FILE, "exec"), g)  # noqa: S102
+                # dont_inherit: the code's future imports are its own,
+                # not this module's (its annotations aren't postponed)
+                exec(compile(body, _RUNNER_FILE, "exec", dont_inherit=True), g)  # noqa: S102
                 if last is not None:
-                    prints.echo(eval(compile(last, _RUNNER_FILE, "eval"), g))  # noqa: S307
+                    echoed = compile(last, _RUNNER_FILE, "eval", dont_inherit=True)
+                    prints.echo(eval(echoed, g))  # noqa: S307
         except BaseException as e:  # noqa: BLE001 — report to host, don't die silently
             ok = False
             error = {"etype": type(e).__name__, "message": str(e),

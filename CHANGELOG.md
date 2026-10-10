@@ -3,6 +3,13 @@
 Starts at 0.3.0. Earlier releases predate this file; `git log` is the
 record for those.
 
+## Unreleased
+
+**Guest code's annotations are postponed only by its own future
+import.** The runner compiled code inheriting its own `from __future__
+import annotations`, so on dud an annotation was text where everywhere
+else it is the type.
+
 ## 0.4.2 - 2026-10-09
 
 **Classes defined in guest code resolve their module.** Code runs as a
