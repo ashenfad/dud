@@ -9,6 +9,7 @@ from __future__ import annotations
 import socket
 import struct
 import threading
+import time
 
 import pytest
 
@@ -254,9 +255,10 @@ def test_no_send_cap_by_default():
 # ---- cancel ---------------------------------------------------------------
 
 
-def _serving_until_cancelled():
+def _serving_until_cancelled(gate: threading.Event | None = None):
     """A peer whose ``work`` verb waits for the frame a cancel sends and
-    answers with whether it counted as a cancel of ``work``."""
+    answers with whether it counted as a cancel of ``work``. With
+    ``gate``, it reads nothing until the gate opens."""
     a, b = socket.socketpair()
     server = Channel(b)
 
@@ -268,8 +270,13 @@ def _serving_until_cancelled():
             return dict(body, cancelled=server.cancel_requested()), []
         shutdown_served()
 
+    def serve():
+        if gate is not None:
+            gate.wait()
+        server.serve()
+
     server.handler = handler
-    threading.Thread(target=server.serve, daemon=True).start()
+    threading.Thread(target=serve, daemon=True).start()
     return Channel(a)
 
 
@@ -325,3 +332,30 @@ def test_cancel_with_nothing_awaited_sends_nothing():
     finally:
         a.close()
         b.close()
+
+
+def test_a_cancel_during_the_requests_send_is_not_missed():
+    """A request too big for the socket's buffer is still being sent
+    when the cancel comes, and the peer may already be serving it: the
+    cancel finds it, and goes out after it rather than before."""
+    gate = threading.Event()
+    client = _serving_until_cancelled(gate)
+    box = {}
+    pad = "x" * 4_000_000  # far past the buffer: the send blocks
+    sender = threading.Thread(
+        target=lambda: box.update(r=client.request("work", {"pad": pad}, timeout=10)),
+        daemon=True,
+    )
+    sender.start()
+    time.sleep(0.3)  # the send is blocked on a peer not reading yet
+    canceller = threading.Thread(
+        target=lambda: box.update(sent=client.cancel()), daemon=True
+    )
+    canceller.start()
+    time.sleep(0.1)
+    gate.set()
+    canceller.join(timeout=10)
+    sender.join(timeout=10)
+    assert box["sent"] is True
+    assert box["r"][0] == {"cancelled": True}
+    client.request("shutdown")
