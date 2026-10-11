@@ -3,6 +3,13 @@
 Starts at 0.3.0. Earlier releases predate this file; `git log` is the
 record for those.
 
+## Unreleased
+
+**`session.cancel()` stops the exec in flight.** Called from another
+thread, it kills the running Python or shell exec as a timeout would,
+and the call returns at once with a `Cancelled` error or a
+`cancelled` shell result.
+
 ## 0.4.3 - 2026-10-10
 
 **Guest code's annotations are postponed only by its own future

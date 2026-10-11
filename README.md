@@ -120,6 +120,15 @@ contract is language-neutral: no objects, no namespace, no pickle. It
 needed no new wire verb and no host-side code — which is the actual
 evidence, rather than the ergonomics.
 
+### Stopping an exec
+
+`s.cancel()`, from another thread, stops the exec in flight. The guest
+kills it as it would at its timeout, and the call returns at once with
+what it had: a Python exec fails with error type `Cancelled`, and a
+shell result has `cancelled` set and exit code 130. A cancel that
+arrives during a host call takes effect when that call returns. It
+returns whether anything was in flight, and the session carries on.
+
 ### Where the files live
 
 The guest mounts its workspace at **`/workspace`** (`session(...,

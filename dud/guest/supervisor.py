@@ -178,6 +178,23 @@ def _is_kernel_thread(pid: str, proc: str = "/proc") -> bool:
         return True  # vanished mid-scan, or not ours to read
 
 
+class _HostCancel:
+    """The host's channel as a shell :class:`~dud.guest.shell.Interrupt`:
+    readable when the host cancels the request being served."""
+
+    def __init__(self, channel: Channel):
+        self.channel = channel
+
+    def fileno(self) -> int:
+        return self.channel._sock.fileno()
+
+    def read(self) -> None:
+        self.channel.read_cancel()
+
+    def requested(self) -> bool:
+        return self.channel.cancel_requested()
+
+
 class Supervisor:
     def __init__(self, channel: Channel, root: Path):
         self.channel = channel
@@ -493,11 +510,13 @@ class Supervisor:
             workspace=str(self.work),
             on_emit=self._relay_emit,
             on_hostcall=self._relay_hostcall,
+            interrupt=_HostCancel(self.channel),
         )
         return {
             "transcript": outcome.transcript,
             "exit_code": outcome.exit_code,
             "timed_out": outcome.timed_out,
+            "cancelled": outcome.cancelled,
             "cwd": self.shell.cwd,
         }, []
 
@@ -673,21 +692,33 @@ class Supervisor:
         # only if the exec dies without answering.
         tap = getattr(proc, "stdout", None)  # spawned or forked, both have one
         spill = _Spill()
-        watch = [sock] + ([tap] if tap is not None else [])
+        # The host's channel too: a cancel from the host arrives on it
+        # while the runner works, and is the one frame it can send then.
+        host = self.channel._sock
+        watch = [sock, host] + ([tap] if tap is not None else [])
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            cancelled = self.channel.cancel_requested()
+            if remaining <= 0 or cancelled:
                 self._kill(proc)
                 spill.drain(tap)
                 return {
                     "ok": False, "transcript": spill.text(), "prints": [],
                     "outputs": {}, "outputs_skipped": {},
-                    "error": {"etype": "Timeout",
-                              "message": f"exceeded {timeout}s (killed)"},
+                    "error": (
+                        {"etype": "Cancelled",
+                         "message": "cancelled by the host (killed)"}
+                        if cancelled else
+                        {"etype": "Timeout",
+                         "message": f"exceeded {timeout}s (killed)"}
+                    ),
                 }
             ready, _, _ = select.select(watch, [], [], min(remaining, 0.25))
             if tap is not None and tap in ready and not spill.read(tap):
                 watch.remove(tap)  # EOF: stop selecting on a dead pipe
+            if host in ready:
+                self.channel.read_cancel()
+                continue  # acted on at the top of the loop
             if sock not in ready:
                 if proc.poll() is not None:
                     return self._crash_result(proc, spill, tap)

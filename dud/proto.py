@@ -19,6 +19,13 @@ answering guest requests until its own response arrives. Requests and
 responses from the two directions cannot collide: each side matches
 responses only against ids it issued.
 
+One frame is neither: ``cancel``, one way and answered by nothing,
+names a request its sender is awaiting (``target``) and asks the peer
+to stop serving it. The peer answers that request as it would any
+other, sooner; a cancel for a request already answered is dropped. It
+is the only frame a sender writes from a second thread, while the
+first waits in ``request()``, so every write goes through one lock.
+
 The protocol is versioned via the ``hello`` exchange (see
 ``PROTO_VERSION``); mismatches fail loud at connect, not weird later.
 """
@@ -28,6 +35,7 @@ from __future__ import annotations
 import json
 import socket
 import struct
+import threading
 import time
 
 from .errors import DudError
@@ -148,6 +156,14 @@ class Channel:
         # size is a question about cache semantics (see ROADMAP,
         # "cache-as-service semantics").
         self.send_cap = send_cap
+        # cancel() writes from another thread while request() waits.
+        self._send_lock = threading.Lock()
+        #: The request this end awaits an answer to, for cancel().
+        self.awaiting: int | None = None
+        #: The peer's request this end is serving now.
+        self.serving: int | None = None
+        # The peer cancelled `serving` (see cancel_requested).
+        self._cancelled = False
 
     # ---- framing ----------------------------------------------------
 
@@ -168,8 +184,9 @@ class Channel:
         out = bytearray(_LEN.pack(len(data)) + data)
         for b in bins:
             out += _LEN.pack(len(b)) + b
-        _arm(self._sock, deadline)
-        self._sock.sendall(out)
+        with self._send_lock:
+            _arm(self._sock, deadline)
+            self._sock.sendall(out)
 
     def _recv_msg(
         self, deadline: float | None = None
@@ -222,6 +239,7 @@ class Channel:
         slow host object.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
+        awaiting = self.awaiting
         try:
             self._next_id += 1
             rid = self._next_id
@@ -229,10 +247,16 @@ class Channel:
                 {"id": rid, "kind": "req", "verb": verb, "body": body or {}},
                 bins or [], deadline,
             )
+            self.awaiting = rid
             while True:
                 msg, mbins = self._recv_msg(deadline)
                 kind = msg.get("kind")
-                if kind == "req":
+                if kind == "cancel":
+                    # The peer cancels what this end serves, while this
+                    # end relays part of it upstream: noted, and the
+                    # server sees it once the relay returns.
+                    self._note_cancel(msg)
+                elif kind == "req":
                     served_at = time.monotonic()
                     self._serve_one(msg, mbins)
                     if deadline is not None:
@@ -249,6 +273,7 @@ class Channel:
                         f"unexpected frame: {kind!r} id={msg.get('id')}"
                     )
         finally:
+            self.awaiting = awaiting
             if deadline is not None:
                 # Hand the socket back blocking. A timeout is per
                 # request, and leaving the last one armed would apply an
@@ -259,8 +284,55 @@ class Channel:
                 except OSError:
                     pass
 
+    # ---- cancel ------------------------------------------------------
+
+    def cancel(self) -> bool:
+        """Ask the peer to stop serving the request this end awaits.
+
+        Safe to call from any thread: the point is to reach a
+        ``request()`` another thread is blocked in. That request still
+        ends the usual way, with the peer's answer, which says the work
+        was cut short. Returns whether there was a request to cancel;
+        one answered meanwhile makes the cancel a no-op on the peer.
+        """
+        rid = self.awaiting
+        if rid is None:
+            return False
+        self._send_msg({"kind": "cancel", "target": rid}, [])
+        return True
+
+    def cancel_requested(self) -> bool:
+        """Whether the peer cancelled the request this end serves."""
+        return self.serving is not None and self._cancelled
+
+    def read_cancel(self) -> None:
+        """Read the frame the peer sent while this end serves a
+        request. The peer is waiting on the answer, so the only frame
+        it can send is a cancel; anything else is a protocol error."""
+        msg, _ = self._recv_msg()
+        if msg.get("kind") != "cancel":
+            raise ProtocolError(
+                f"unexpected frame while serving: {msg.get('kind')!r}"
+            )
+        self._note_cancel(msg)
+
+    def _note_cancel(self, msg: dict) -> None:
+        # One for a request already answered names an older id: dropped.
+        if self.serving is not None and msg.get("target") == self.serving:
+            self._cancelled = True
+
     def _serve_one(self, msg: dict, bins: list[bytes]) -> None:
         rid, verb = msg.get("id"), msg.get("verb", "")
+        outer = self.serving, self._cancelled
+        self.serving, self._cancelled = rid, False
+        try:
+            self._serve_handled(rid, verb, msg, bins)
+        finally:
+            self.serving, self._cancelled = outer
+
+    def _serve_handled(
+        self, rid: int | None, verb: str, msg: dict, bins: list[bytes]
+    ) -> None:
         if self.handler is None:
             self._send_msg(
                 {"id": rid, "kind": "err", "etype": "ProtocolError",
@@ -274,6 +346,8 @@ class Channel:
         except (_Shutdown, _Freeze):
             self._send_msg({"id": rid, "kind": "resp", "body": {}}, [])
             raise
+        except ChannelClosed:
+            raise  # the peer went while we served it: nobody to answer
         except Exception as e:  # noqa: BLE001 — boundary: report, don't die
             self._send_msg(
                 {"id": rid, "kind": "err", "etype": type(e).__name__,
@@ -292,6 +366,8 @@ class Channel:
         try:
             while True:
                 msg, bins = self._recv_msg()
+                if msg.get("kind") == "cancel":
+                    continue  # its request was answered before it came
                 if msg.get("kind") != "req":
                     raise ProtocolError(f"server got {msg.get('kind')!r}")
                 self._serve_one(msg, bins)
