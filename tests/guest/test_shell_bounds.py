@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 
 import pytest
@@ -102,9 +103,9 @@ def test_pump_returns_when_the_script_exits_though_output_is_held():
     proc = _spawn("sleep 30 & echo started")
     try:
         started = time.monotonic()
-        out, timed_out = _pump(proc, timeout=20.0)
+        out, stopped = _pump(proc, timeout=20.0)
         elapsed = time.monotonic() - started
-        assert not timed_out
+        assert stopped is None
         assert "started" in out.text()
         assert elapsed < 10.0, "waited on the survivor's fd, not the script"
     finally:
@@ -127,9 +128,9 @@ def test_pump_returns_when_the_survivor_never_stops_writing():
     proc = _spawn("(while :; do echo daemon-log; done) & echo script-done")
     try:
         started = time.monotonic()
-        out, timed_out = _pump(proc, timeout=10.0)
+        out, stopped = _pump(proc, timeout=10.0)
         elapsed = time.monotonic() - started
-        assert not timed_out, "a chatty survivor held the call to its deadline"
+        assert stopped is None, "a chatty survivor held the call to its deadline"
         assert "script-done" in out.text()
         assert elapsed < 5.0
     finally:
@@ -143,12 +144,48 @@ def test_pump_waits_for_a_script_that_closed_its_own_stdout():
     either. `exec 1>&-` must not be read as an early exit."""
     proc = _spawn("echo pre; exec 1>&-; sleep 0.5; exit 5")
     try:
-        out, timed_out = _pump(proc, timeout=20.0)
-        assert not timed_out
+        out, stopped = _pump(proc, timeout=20.0)
+        assert stopped is None
         assert out.text() == "pre\n"
         assert proc.returncode == 5  # we waited for the real answer
     finally:
         proc.stdout.close()
+
+
+class _Interrupt:
+    """A cancel arriving on a pipe, as the host's arrives on its socket."""
+
+    def __init__(self):
+        self.r, self.w = os.pipe()
+        self.cancelled = False
+
+    def fileno(self):
+        return self.r
+
+    def read(self):
+        os.read(self.r, 1)
+        self.cancelled = True
+
+    def requested(self):
+        return self.cancelled
+
+
+def test_pump_kills_the_script_when_interrupted():
+    proc = _spawn("echo started; sleep 30")
+    interrupt = _Interrupt()
+    try:
+        threading.Timer(0.5, os.write, (interrupt.w, b"x")).start()
+        started = time.monotonic()
+        out, stopped = _pump(proc, timeout=20.0, interrupt=interrupt)
+        assert stopped == "cancel"
+        assert "started" in out.text()  # what it said before the kill
+        assert time.monotonic() - started < 10.0
+    finally:
+        _killpg(proc)
+        proc.stdout.close()
+        proc.wait(timeout=5)
+        os.close(interrupt.r)
+        os.close(interrupt.w)
 
 
 def test_timeout_is_not_held_open_by_a_silent_survivor():
@@ -164,9 +201,9 @@ def test_timeout_is_not_held_open_by_a_silent_survivor():
     )
     try:
         started = time.monotonic()
-        out, timed_out = _pump(proc, timeout=1.0)
+        out, stopped = _pump(proc, timeout=1.0)
         elapsed = time.monotonic() - started
-        assert timed_out
+        assert stopped == "timeout"
         # 1s deadline + a 0.5s drain budget, with room for a loaded runner.
         assert elapsed < 6.0, f"drain was not bounded ({elapsed:.1f}s)"
     finally:

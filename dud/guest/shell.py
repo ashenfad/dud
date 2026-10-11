@@ -30,6 +30,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Protocol
 
 from . import emit as emit_mod
 from . import hostcall as hostcall_mod
@@ -86,6 +87,19 @@ class ShellOutcome:
     transcript: str
     exit_code: int
     timed_out: bool = False
+    cancelled: bool = False
+
+
+class Interrupt(Protocol):
+    """A way for whoever asked for the script to stop it early: watched
+    beside the script's own pipes, :meth:`read` when readable, and the
+    script is killed once :meth:`requested` says so."""
+
+    def fileno(self) -> int: ...
+
+    def read(self) -> None: ...
+
+    def requested(self) -> bool: ...
 
 
 class _Transcript:
@@ -443,9 +457,12 @@ class _Hostcalls:
 def _pump(proc: subprocess.Popen, timeout: float,
           emit_fd: int | None = None, on_emit=None,
           hc_req: int | None = None, on_hostcall=None,
-          hc_resp: int | None = None) -> tuple[_Transcript, bool]:
+          hc_resp: int | None = None,
+          interrupt: Interrupt | None = None) -> tuple[_Transcript, str | None]:
     """Read the script's output until it is done, or kill it at the
-    deadline. Returns ``(transcript, timed_out)``.
+    deadline or when ``interrupt`` asks. Returns ``(transcript,
+    stopped)``, where ``stopped`` is ``None`` for a script that ended on
+    its own, ``"timeout"`` or ``"cancel"`` for one that was killed.
 
     "Done" is the script's own exit, NOT end-of-pipe. Those differ
     whenever the script leaves something running that inherited its
@@ -475,12 +492,13 @@ def _pump(proc: subprocess.Popen, timeout: float,
     )
     while True:
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        cancelled = interrupt is not None and interrupt.requested()
+        if remaining <= 0 or cancelled:
             _killpg(proc)
             _drain(out, fd)
             if emits is not None:
                 emits.drain(emit_fd)
-            return out, True
+            return out, "cancel" if cancelled else "timeout"
         # Every pass, and BEFORE the read rather than after it. A
         # survivor that writes CONTINUOUSLY — `nohup npm run dev &`, a
         # dev server logging as it boots — keeps select() readable with
@@ -498,12 +516,14 @@ def _pump(proc: subprocess.Popen, timeout: float,
                 _drain(out, fd)
             if emits is not None:
                 emits.drain(emit_fd)
-            return out, False
+            return out, None
         watch = [fd] if open_pipe else []
         if emits is not None:
             watch.append(emit_fd)
         if hostcalls is not None:
             watch.append(hc_req)
+        if interrupt is not None:
+            watch.append(interrupt)
         if watch:
             try:
                 ready, _, _ = select.select(watch, [], [], min(remaining, _POLL))
@@ -513,6 +533,9 @@ def _pump(proc: subprocess.Popen, timeout: float,
                 # only non-timeout exit above is one where poll() has
                 # answered, which is what keeps `returncode` a number.
                 ready, open_pipe, emits, hostcalls = (), False, None, None
+                interrupt = None
+            if interrupt is not None and interrupt in ready:
+                interrupt.read()  # acted on at the top of the next pass
             if open_pipe and fd in ready and not out.read(fd):
                 open_pipe = False  # EOF: every writer has let go
             if emits is not None and emit_fd in ready:
@@ -544,7 +567,7 @@ def _pump(proc: subprocess.Popen, timeout: float,
 
 def run_shell(
     state: ShellState, script: str, timeout: float, workspace: str,
-    on_emit=None, on_hostcall=None,
+    on_emit=None, on_hostcall=None, interrupt: Interrupt | None = None,
 ) -> ShellOutcome:
     """Run one script. ``on_emit`` receives each ``dud-emit`` record as
     it arrives, already validated, for relay upstream; without it the
@@ -552,7 +575,8 @@ def run_shell(
     ``on_hostcall`` answers each ``dud-hostcall`` frame with exactly
     one response dict (``{"ok": true, "value": tagged}`` or
     ``{"ok": false, "error": message}``); without it the hostcall
-    channel is not offered either."""
+    channel is not offered either. ``interrupt`` stops the script
+    early, killed as a timeout kills it (exit code 130)."""
     with tempfile.TemporaryDirectory(prefix="dud-sh-") as td:
         cwd_file = Path(td) / "cwd"
         env_file = Path(td) / "env"
@@ -629,9 +653,9 @@ def run_shell(
                 hc_req_w = None
                 os.close(hc_resp_r)
                 hc_resp_r = None
-            out, timed_out = _pump(
+            out, stopped = _pump(
                 proc, timeout, emit_r, on_emit,
-                hc_req_r, on_hostcall, hc_resp_w,
+                hc_req_r, on_hostcall, hc_resp_w, interrupt,
             )
         finally:
             proc.stdout.close()
@@ -651,18 +675,20 @@ def run_shell(
         except subprocess.TimeoutExpired:
             _killpg(proc)
 
-        if not timed_out:
-            # Only after a clean exit. A timeout is SIGKILL, so the EXIT
-            # trap never ran, and it can be killed BETWEEN its two
-            # writes — replaying then would take a cwd with no env and
-            # call the pair a session state. Nothing to restore is the
-            # honest reading of a script that was shot.
+        if stopped is None:
+            # Only after a clean exit. A timeout or a cancel is SIGKILL,
+            # so the EXIT trap never ran, and it can be killed BETWEEN
+            # its two writes — replaying then would take a cwd with no
+            # env and call the pair a session state. Nothing to restore
+            # is the honest reading of a script that was shot.
             _replay(state, cwd_file, env_file)
 
         return ShellOutcome(
             transcript=out.text(),
-            exit_code=(proc.returncode if not timed_out else 124),
-            timed_out=timed_out,
+            exit_code={None: proc.returncode, "timeout": 124,
+                       "cancel": 130}[stopped],
+            timed_out=stopped == "timeout",
+            cancelled=stopped == "cancel",
         )
 
 

@@ -460,6 +460,7 @@ class HostSession:
         return ShellResult(
             transcript=body["transcript"], exit_code=body["exit_code"],
             cwd=body["cwd"], timed_out=body.get("timed_out", False),
+            cancelled=body.get("cancelled", False),
         )
 
     def python(
@@ -552,6 +553,24 @@ class HostSession:
             outputs_skipped=body.get("outputs_skipped", {}),
             error=ExecError(**err) if err else None,
         )
+
+    def cancel(self) -> bool:
+        """Stop the exec in flight, from any thread.
+
+        The guest kills it as a timeout would, and the call returns as
+        usual with what it had so far: a python exec fails with error
+        type ``Cancelled``, a shell's result has ``cancelled`` set (exit
+        code 130). Returns whether a request was in flight; a cancel
+        that loses the race with its answer does nothing.
+        """
+        if self._closed or self._lost is not None or getattr(
+            self, "frozen", False
+        ):
+            return False
+        try:
+            return self._ch.cancel()
+        except OSError:
+            return False
 
     def diff(self, rebase: bool = False) -> Diff:
         body, bins = self._request("pull_diff", {"rebase": rebase})

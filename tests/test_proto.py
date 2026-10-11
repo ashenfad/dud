@@ -249,3 +249,79 @@ def test_no_send_cap_by_default():
     finally:
         a.close()
         b.close()
+
+
+# ---- cancel ---------------------------------------------------------------
+
+
+def _serving_until_cancelled():
+    """A peer whose ``work`` verb waits for the frame a cancel sends and
+    answers with whether it counted as a cancel of ``work``."""
+    a, b = socket.socketpair()
+    server = Channel(b)
+
+    def handler(verb, body, bins):
+        if verb == "work":
+            server.read_cancel()
+            return {"cancelled": server.cancel_requested()}, []
+        if verb == "echo":
+            return dict(body, cancelled=server.cancel_requested()), []
+        shutdown_served()
+
+    server.handler = handler
+    threading.Thread(target=server.serve, daemon=True).start()
+    return Channel(a)
+
+
+def test_a_cancel_reaches_the_request_being_served():
+    client = _serving_until_cancelled()
+    box = {}
+    t = threading.Thread(
+        target=lambda: box.update(r=client.request("work", timeout=10))
+    )
+    t.start()
+    while client.awaiting is None:
+        pass
+    assert client.cancel()
+    t.join(timeout=10)
+    assert box["r"][0] == {"cancelled": True}
+    assert client.awaiting is None
+    client.request("shutdown")
+
+
+def test_a_cancel_naming_another_request_is_not_this_ones():
+    """A cancel that loses the race with its answer names an older
+    request, and must not stop the one served now."""
+    client = _serving_until_cancelled()
+    box = {}
+    t = threading.Thread(
+        target=lambda: box.update(r=client.request("work", timeout=10))
+    )
+    t.start()
+    while client.awaiting is None:
+        pass
+    client._send_msg({"kind": "cancel", "target": client.awaiting - 1}, [])
+    t.join(timeout=10)
+    assert box["r"][0] == {"cancelled": False}
+    client.request("shutdown")
+
+
+def test_a_late_cancel_is_dropped_by_an_idle_server():
+    client = _serving_until_cancelled()
+    client._send_msg({"kind": "cancel", "target": 1}, [])
+    assert client.request("echo", {"v": 1}, timeout=10)[0] == {
+        "v": 1, "cancelled": False
+    }
+    client.request("shutdown")
+
+
+def test_cancel_with_nothing_awaited_sends_nothing():
+    a, b = socket.socketpair()
+    try:
+        assert Channel(a).cancel() is False
+        b.settimeout(0.1)
+        with pytest.raises((TimeoutError, OSError)):
+            b.recv(1)
+    finally:
+        a.close()
+        b.close()

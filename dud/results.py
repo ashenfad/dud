@@ -12,6 +12,7 @@ class ShellResult:
     exit_code: int
     cwd: str
     timed_out: bool = False
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
