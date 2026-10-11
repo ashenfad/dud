@@ -157,7 +157,9 @@ class Channel:
         # "cache-as-service semantics").
         self.send_cap = send_cap
         # cancel() writes from another thread while request() waits.
-        self._send_lock = threading.Lock()
+        # Reentrant: request() holds it across publishing `awaiting` and
+        # the send that _send_msg locks for itself.
+        self._send_lock = threading.RLock()
         #: The request this end awaits an answer to, for cancel().
         self.awaiting: int | None = None
         #: The peer's request this end is serving now.
@@ -243,11 +245,15 @@ class Channel:
         try:
             self._next_id += 1
             rid = self._next_id
-            self._send_msg(
-                {"id": rid, "kind": "req", "verb": verb, "body": body or {}},
-                bins or [], deadline,
-            )
-            self.awaiting = rid
+            with self._send_lock:
+                # Published as the send starts, under the lock a cancel
+                # sends under: a cancel that sees it follows the request
+                # on the wire, however long the request takes to send.
+                self.awaiting = rid
+                self._send_msg(
+                    {"id": rid, "kind": "req", "verb": verb, "body": body or {}},
+                    bins or [], deadline,
+                )
             while True:
                 msg, mbins = self._recv_msg(deadline)
                 kind = msg.get("kind")
